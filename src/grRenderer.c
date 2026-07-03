@@ -1,0 +1,1015 @@
+#include "grInternal.h"
+#include "grShaders.h"
+
+#include <webgpu/wgpu.h> // wgpu-native extensions (wgpuDevicePoll)
+
+#include <GLFW/glfw3.h>
+
+#include <assert.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define GR_LOG(...) fprintf(stderr, "[grender] " __VA_ARGS__)
+
+// ------------------------------------------------------------------------------
+// Defaults
+// ------------------------------------------------------------------------------
+
+void grRendererDescInit(grRendererDesc *desc) {
+  memset(desc, 0, sizeof(*desc));
+  desc->title = "grender";
+  desc->width = 1280;
+  desc->height = 800;
+  desc->clearColor = GR_COLOR(0.07f, 0.07f, 0.09f, 1.0f);
+  desc->nodeStyle = (grNodeStyle){
+      .fillColor = GR_COLOR(0.95f, 0.95f, 0.98f, 1.0f),
+      .strokeColor = GR_COLOR(0.10f, 0.10f, 0.12f, 1.0f),
+      .radius = 3.0f,
+      .strokeWidth = 0.0f,
+      .sizeMode = GR_SIZE_PIXELS,
+  };
+  desc->edgeStyle = (grEdgeStyle){
+      .color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.55f),
+      .width = 1.0f,
+      .sizeMode = GR_SIZE_PIXELS,
+  };
+  desc->vsync = true;
+}
+
+// ------------------------------------------------------------------------------
+// WebGPU setup helpers
+// ------------------------------------------------------------------------------
+
+static void onAdapterRequest(WGPURequestAdapterStatus status,
+                             WGPUAdapter adapter, WGPUStringView message,
+                             void *userdata1, void *userdata2) {
+  (void)userdata2;
+  if (status == WGPURequestAdapterStatus_Success)
+    *(WGPUAdapter *)userdata1 = adapter;
+  else
+    GR_LOG("adapter request failed: %.*s\n", (int)message.length, message.data);
+}
+
+static void onDeviceRequest(WGPURequestDeviceStatus status, WGPUDevice device,
+                            WGPUStringView message, void *userdata1,
+                            void *userdata2) {
+  (void)userdata2;
+  if (status == WGPURequestDeviceStatus_Success)
+    *(WGPUDevice *)userdata1 = device;
+  else
+    GR_LOG("device request failed: %.*s\n", (int)message.length, message.data);
+}
+
+static void onUncapturedError(WGPUDevice const *device, WGPUErrorType type,
+                              WGPUStringView message, void *userdata1,
+                              void *userdata2) {
+  (void)device, (void)userdata1, (void)userdata2;
+  GR_LOG("GPU error (type %d): %.*s\n", (int)type, (int)message.length,
+         message.data);
+}
+
+static WGPUBuffer createBuffer(grRenderer *r, size_t size, WGPUBufferUsage usage,
+                               const char *label) {
+  if (size < 4)
+    size = 4;
+  size = (size + 3) & ~(size_t)3;
+  return wgpuDeviceCreateBuffer(r->device,
+                                &(const WGPUBufferDescriptor){
+                                    .label = {label, WGPU_STRLEN},
+                                    .size = size,
+                                    .usage = usage,
+                                });
+}
+
+// ------------------------------------------------------------------------------
+// Pipelines
+// ------------------------------------------------------------------------------
+
+static int createPipelines(grRenderer *r) {
+  r->shaderModule = wgpuDeviceCreateShaderModule(
+      r->device,
+      &(const WGPUShaderModuleDescriptor){
+          .label = {"grender shaders", WGPU_STRLEN},
+          .nextInChain =
+              (WGPUChainedStruct *)&(WGPUShaderSourceWGSL){
+                  .chain = {.sType = WGPUSType_ShaderSourceWGSL},
+                  .code = {GR_WGSL_SOURCE, WGPU_STRLEN},
+              },
+      });
+  if (!r->shaderModule)
+    return -1;
+
+  WGPUBindGroupLayoutEntry entries[7] = {0};
+  entries[0] = (WGPUBindGroupLayoutEntry){
+      .binding = 0,
+      .visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
+      .buffer = {.type = WGPUBufferBindingType_Uniform},
+  };
+  for (int i = 1; i < 7; i++) {
+    entries[i] = (WGPUBindGroupLayoutEntry){
+        .binding = (uint32_t)i,
+        .visibility = WGPUShaderStage_Vertex,
+        .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage},
+    };
+  }
+
+  r->bindGroupLayout = wgpuDeviceCreateBindGroupLayout(
+      r->device, &(const WGPUBindGroupLayoutDescriptor){
+                     .label = {"grender bgl", WGPU_STRLEN},
+                     .entryCount = 7,
+                     .entries = entries,
+                 });
+  r->pipelineLayout = wgpuDeviceCreatePipelineLayout(
+      r->device, &(const WGPUPipelineLayoutDescriptor){
+                     .label = {"grender layout", WGPU_STRLEN},
+                     .bindGroupLayoutCount = 1,
+                     .bindGroupLayouts =
+                         (const WGPUBindGroupLayout[]){r->bindGroupLayout},
+                 });
+  if (!r->bindGroupLayout || !r->pipelineLayout)
+    return -1;
+
+  const WGPUBlendState blend = {
+      .color = {.operation = WGPUBlendOperation_Add,
+                .srcFactor = WGPUBlendFactor_SrcAlpha,
+                .dstFactor = WGPUBlendFactor_OneMinusSrcAlpha},
+      .alpha = {.operation = WGPUBlendOperation_Add,
+                .srcFactor = WGPUBlendFactor_One,
+                .dstFactor = WGPUBlendFactor_OneMinusSrcAlpha},
+  };
+  const WGPUColorTargetState colorTarget = {
+      .format = r->surfaceFormat,
+      .blend = &blend,
+      .writeMask = WGPUColorWriteMask_All,
+  };
+
+  const char *vsEntries[2] = {"vsNode", "vsEdge"};
+  const char *fsEntries[2] = {"fsNode", "fsEdge"};
+  WGPURenderPipeline pipelines[2] = {0};
+
+  for (int i = 0; i < 2; i++) {
+    const WGPUDepthStencilState depthState = {
+        .format = WGPUTextureFormat_Depth24Plus,
+        // Nodes write depth so edges/nodes behind them are occluded in 3D;
+        // edges only test.
+        .depthWriteEnabled =
+            (i == 0) ? WGPUOptionalBool_True : WGPUOptionalBool_False,
+        .depthCompare = WGPUCompareFunction_LessEqual,
+        .stencilFront = {.compare = WGPUCompareFunction_Always},
+        .stencilBack = {.compare = WGPUCompareFunction_Always},
+        .stencilReadMask = 0xFFFFFFFF,
+        .stencilWriteMask = 0xFFFFFFFF,
+    };
+
+    pipelines[i] = wgpuDeviceCreateRenderPipeline(
+        r->device,
+        &(const WGPURenderPipelineDescriptor){
+            .label = {i == 0 ? "grender nodes" : "grender edges", WGPU_STRLEN},
+            .layout = r->pipelineLayout,
+            .vertex = {.module = r->shaderModule,
+                       .entryPoint = {vsEntries[i], WGPU_STRLEN}},
+            .fragment =
+                &(const WGPUFragmentState){
+                    .module = r->shaderModule,
+                    .entryPoint = {fsEntries[i], WGPU_STRLEN},
+                    .targetCount = 1,
+                    .targets = &colorTarget,
+                },
+            .primitive = {.topology = WGPUPrimitiveTopology_TriangleList,
+                          .cullMode = WGPUCullMode_None},
+            .depthStencil = &depthState,
+            .multisample = {.count = 1, .mask = 0xFFFFFFFF},
+        });
+    if (!pipelines[i])
+      return -1;
+  }
+
+  r->nodePipeline = pipelines[0];
+  r->edgePipeline = pipelines[1];
+  return 0;
+}
+
+static void recreateDepthTexture(grRenderer *r) {
+  if (r->depthView)
+    wgpuTextureViewRelease(r->depthView);
+  if (r->depthTexture) {
+    wgpuTextureDestroy(r->depthTexture);
+    wgpuTextureRelease(r->depthTexture);
+  }
+  r->depthTexture = wgpuDeviceCreateTexture(
+      r->device, &(const WGPUTextureDescriptor){
+                     .label = {"grender depth", WGPU_STRLEN},
+                     .usage = WGPUTextureUsage_RenderAttachment,
+                     .dimension = WGPUTextureDimension_2D,
+                     .size = {r->surfaceConfig.width, r->surfaceConfig.height, 1},
+                     .format = WGPUTextureFormat_Depth24Plus,
+                     .mipLevelCount = 1,
+                     .sampleCount = 1,
+                 });
+  r->depthView = wgpuTextureCreateView(r->depthTexture, NULL);
+}
+
+// ------------------------------------------------------------------------------
+// GLFW callbacks
+// ------------------------------------------------------------------------------
+
+static void onFramebufferSize(GLFWwindow *window, int width, int height) {
+  (void)width, (void)height;
+  grRenderer *r = glfwGetWindowUserPointer(window);
+  if (r)
+    r->surfaceDirty = true;
+}
+
+static void onScroll(GLFWwindow *window, double dx, double dy) {
+  (void)dx;
+  grRenderer *r = glfwGetWindowUserPointer(window);
+  if (r)
+    r->scrollAccum += dy;
+}
+
+static void onKey(GLFWwindow *window, int key, int scancode, int action,
+                  int mods) {
+  (void)scancode;
+  grRenderer *r = glfwGetWindowUserPointer(window);
+  if (!r || (action != GLFW_PRESS && action != GLFW_REPEAT))
+    return;
+
+  if (r->pendingKeyCount == r->pendingKeyCapacity) {
+    size_t cap = r->pendingKeyCapacity ? r->pendingKeyCapacity * 2 : 16;
+    void *grown = realloc(r->pendingKeys, cap * sizeof(*r->pendingKeys));
+    if (!grown)
+      return;
+    r->pendingKeys = grown;
+    r->pendingKeyCapacity = cap;
+  }
+  r->pendingKeys[r->pendingKeyCount].key = key;
+  r->pendingKeys[r->pendingKeyCount].mods = mods;
+  r->pendingKeyCount++;
+}
+
+// ------------------------------------------------------------------------------
+// Lifecycle
+// ------------------------------------------------------------------------------
+
+grRenderer *grRendererCreate(const grRendererDesc *descIn) {
+  grRendererDesc defaults;
+  if (!descIn) {
+    grRendererDescInit(&defaults);
+    descIn = &defaults;
+  }
+
+  grRenderer *r = calloc(1, sizeof(grRenderer));
+  if (!r)
+    return NULL;
+  r->clearColor = descIn->clearColor;
+  r->nodeStyle = descIn->nodeStyle;
+  r->edgeStyle = descIn->edgeStyle;
+  grCameraInit2D(&r->camera);
+
+  if (!glfwInit()) {
+    GR_LOG("glfwInit failed\n");
+    free(r);
+    return NULL;
+  }
+
+  glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+  r->window = glfwCreateWindow((int)descIn->width, (int)descIn->height,
+                               descIn->title ? descIn->title : "grender", NULL,
+                               NULL);
+  if (!r->window)
+    goto fail;
+
+  glfwSetWindowUserPointer(r->window, r);
+  glfwSetFramebufferSizeCallback(r->window, onFramebufferSize);
+  glfwSetScrollCallback(r->window, onScroll);
+  glfwSetKeyCallback(r->window, onKey);
+
+  r->instance = wgpuCreateInstance(NULL);
+  if (!r->instance)
+    goto fail;
+
+  r->surface = grPlatformCreateSurface(r->instance, r->window);
+  if (!r->surface)
+    goto fail;
+
+  // wgpu-native services these callbacks synchronously.
+  wgpuInstanceRequestAdapter(
+      r->instance,
+      &(const WGPURequestAdapterOptions){.compatibleSurface = r->surface},
+      (const WGPURequestAdapterCallbackInfo){.callback = onAdapterRequest,
+                                             .userdata1 = &r->adapter});
+  if (!r->adapter)
+    goto fail;
+
+  wgpuAdapterRequestDevice(
+      r->adapter,
+      &(const WGPUDeviceDescriptor){
+          .label = {"grender device", WGPU_STRLEN},
+          .uncapturedErrorCallbackInfo = {.callback = onUncapturedError},
+      },
+      (const WGPURequestDeviceCallbackInfo){.callback = onDeviceRequest,
+                                            .userdata1 = &r->device});
+  if (!r->device)
+    goto fail;
+
+  r->queue = wgpuDeviceGetQueue(r->device);
+
+  WGPUSurfaceCapabilities caps = {0};
+  wgpuSurfaceGetCapabilities(r->surface, r->adapter, &caps);
+  r->surfaceFormat = caps.formats[0];
+
+  WGPUPresentMode presentMode = WGPUPresentMode_Fifo;
+  if (!descIn->vsync) {
+    for (size_t i = 0; i < caps.presentModeCount; i++)
+      if (caps.presentModes[i] == WGPUPresentMode_Immediate)
+        presentMode = WGPUPresentMode_Immediate;
+  }
+
+  int fbw, fbh;
+  glfwGetFramebufferSize(r->window, &fbw, &fbh);
+  r->surfaceConfig = (WGPUSurfaceConfiguration){
+      .device = r->device,
+      .usage = WGPUTextureUsage_RenderAttachment,
+      .format = r->surfaceFormat,
+      .width = (uint32_t)fbw,
+      .height = (uint32_t)fbh,
+      .presentMode = presentMode,
+      .alphaMode = caps.alphaModes[0],
+  };
+  wgpuSurfaceCapabilitiesFreeMembers(caps);
+  wgpuSurfaceConfigure(r->surface, &r->surfaceConfig);
+  recreateDepthTexture(r);
+
+  if (createPipelines(r) < 0) {
+    GR_LOG("pipeline creation failed\n");
+    goto fail;
+  }
+
+  r->globalsBuf = createBuffer(r, sizeof(grGlobalsUBO),
+                               WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
+                               "grender globals");
+
+  glfwGetCursorPos(r->window, &r->dragLastX, &r->dragLastY);
+  r->lastFrameTime = glfwGetTime();
+  return r;
+
+fail:
+  grRendererDestroy(r);
+  return NULL;
+}
+
+#define GR_RELEASE(fn, x)                                                      \
+  do {                                                                         \
+    if (x) {                                                                   \
+      fn(x);                                                                   \
+      (x) = NULL;                                                              \
+    }                                                                          \
+  } while (0)
+
+void grRendererDestroy(grRenderer *r) {
+  if (!r)
+    return;
+
+  GR_RELEASE(wgpuBufferRelease, r->globalsBuf);
+  GR_RELEASE(wgpuBufferRelease, r->positionsBuf);
+  GR_RELEASE(wgpuBufferRelease, r->nodeIdsBuf);
+  GR_RELEASE(wgpuBufferRelease, r->nodeColorsBuf);
+  GR_RELEASE(wgpuBufferRelease, r->nodeSizesBuf);
+  GR_RELEASE(wgpuBufferRelease, r->edgesBuf);
+  GR_RELEASE(wgpuBufferRelease, r->edgeColorsBuf);
+  GR_RELEASE(wgpuBindGroupRelease, r->bindGroup);
+  GR_RELEASE(wgpuRenderPipelineRelease, r->nodePipeline);
+  GR_RELEASE(wgpuRenderPipelineRelease, r->edgePipeline);
+  GR_RELEASE(wgpuPipelineLayoutRelease, r->pipelineLayout);
+  GR_RELEASE(wgpuBindGroupLayoutRelease, r->bindGroupLayout);
+  GR_RELEASE(wgpuShaderModuleRelease, r->shaderModule);
+  GR_RELEASE(wgpuTextureViewRelease, r->depthView);
+  GR_RELEASE(wgpuTextureRelease, r->depthTexture);
+  GR_RELEASE(wgpuQueueRelease, r->queue);
+  GR_RELEASE(wgpuDeviceRelease, r->device);
+  GR_RELEASE(wgpuAdapterRelease, r->adapter);
+  GR_RELEASE(wgpuSurfaceRelease, r->surface);
+  GR_RELEASE(wgpuInstanceRelease, r->instance);
+  GR_RELEASE(glfwDestroyWindow, r->window);
+  glfwTerminate();
+
+  grTopologyRelease(&r->topo);
+  free(r->posStaging);
+  free(r->bindings);
+  free(r->pendingKeys);
+  free(r);
+}
+
+// ------------------------------------------------------------------------------
+// Graph attachment and GPU buffer management
+// ------------------------------------------------------------------------------
+
+/** (Re)creates position-indexed buffers when the vertex capacity changes. */
+static int ensurePositionBuffers(grRenderer *r) {
+  size_t count = gvizEmbeddedGraphPositionCount(r->graph);
+  size_t dim = gvizEmbeddedGraphDim(r->graph);
+  if (count == r->posCapacity && dim == r->posDim && r->positionsBuf)
+    return 0;
+
+  free(r->posStaging);
+  r->posStaging = malloc(sizeof(float) * count * dim);
+  if (!r->posStaging)
+    return -1;
+
+  GR_RELEASE(wgpuBufferRelease, r->positionsBuf);
+  r->positionsBuf = createBuffer(
+      r, sizeof(float) * count * dim,
+      WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst, "grender positions");
+  if (!r->positionsBuf)
+    return -1;
+
+  r->posCapacity = count;
+  r->posDim = dim;
+  r->bindGroupDirty = true;
+
+  // Per-vertex attributes are indexed the same way; stale ones are dropped.
+  if (r->hasNodeColors || r->hasNodeSizes) {
+    r->hasNodeColors = false;
+    r->hasNodeSizes = false;
+  }
+  return 0;
+}
+
+/** Uploads topology-derived buffers (node id remap + edge endpoint pairs). */
+static int uploadTopology(grRenderer *r) {
+  if (grTopologyExtract(&r->topo, r->graph) < 0)
+    return -1;
+
+  size_t nodeBytes = sizeof(uint32_t) * (r->topo.nodeCount ? r->topo.nodeCount : 1);
+  size_t edgeBytes =
+      sizeof(uint32_t) * 2 * (r->topo.edgeCount ? r->topo.edgeCount : 1);
+
+  // Node-id and edge buffers are recreated on structural change only.
+  GR_RELEASE(wgpuBufferRelease, r->nodeIdsBuf);
+  r->nodeIdsBuf =
+      createBuffer(r, nodeBytes,
+                   WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                   "grender node ids");
+  GR_RELEASE(wgpuBufferRelease, r->edgesBuf);
+  r->edgesBuf = createBuffer(r, edgeBytes,
+                             WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                             "grender edges");
+  if (!r->nodeIdsBuf || !r->edgesBuf)
+    return -1;
+
+  if (r->topo.nodeCount)
+    wgpuQueueWriteBuffer(r->queue, r->nodeIdsBuf, 0, r->topo.nodeIds,
+                         sizeof(uint32_t) * r->topo.nodeCount);
+  if (r->topo.edgeCount)
+    wgpuQueueWriteBuffer(r->queue, r->edgesBuf, 0, r->topo.edges,
+                         sizeof(uint32_t) * 2 * r->topo.edgeCount);
+
+  // Stale per-edge colors no longer match the edge ordering.
+  r->hasEdgeColors = false;
+  r->bindGroupDirty = true;
+  return 0;
+}
+
+static int rebuildBindGroup(grRenderer *r) {
+  GR_RELEASE(wgpuBindGroupRelease, r->bindGroup);
+
+  // Optional attribute buffers get 4-byte placeholders so the bind group is
+  // always complete; shaders never read them unless the matching flag is set.
+  if (!r->nodeColorsBuf)
+    r->nodeColorsBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
+                                              WGPUBufferUsage_CopyDst,
+                                    "grender node colors");
+  if (!r->nodeSizesBuf)
+    r->nodeSizesBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
+                                             WGPUBufferUsage_CopyDst,
+                                   "grender node sizes");
+  if (!r->edgeColorsBuf)
+    r->edgeColorsBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
+                                              WGPUBufferUsage_CopyDst,
+                                    "grender edge colors");
+
+  const WGPUBindGroupEntry entries[7] = {
+      {.binding = 0, .buffer = r->globalsBuf, .size = WGPU_WHOLE_SIZE},
+      {.binding = 1, .buffer = r->positionsBuf, .size = WGPU_WHOLE_SIZE},
+      {.binding = 2, .buffer = r->nodeIdsBuf, .size = WGPU_WHOLE_SIZE},
+      {.binding = 3, .buffer = r->nodeColorsBuf, .size = WGPU_WHOLE_SIZE},
+      {.binding = 4, .buffer = r->nodeSizesBuf, .size = WGPU_WHOLE_SIZE},
+      {.binding = 5, .buffer = r->edgesBuf, .size = WGPU_WHOLE_SIZE},
+      {.binding = 6, .buffer = r->edgeColorsBuf, .size = WGPU_WHOLE_SIZE},
+  };
+  r->bindGroup = wgpuDeviceCreateBindGroup(
+      r->device, &(const WGPUBindGroupDescriptor){
+                     .label = {"grender bind group", WGPU_STRLEN},
+                     .layout = r->bindGroupLayout,
+                     .entryCount = 7,
+                     .entries = entries,
+                 });
+  r->bindGroupDirty = false;
+  return r->bindGroup ? 0 : -1;
+}
+
+int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
+  size_t dim = gvizEmbeddedGraphDim(graph);
+  if (dim != 2 && dim != 3) {
+    GR_LOG("unsupported embedding dimension %zu (only 2 and 3)\n", dim);
+    return -1;
+  }
+
+  r->graph = graph;
+  if (dim == 3)
+    grCameraInit3D(&r->camera);
+  else
+    grCameraInit2D(&r->camera);
+
+  if (ensurePositionBuffers(r) < 0 || uploadTopology(r) < 0)
+    return -1;
+  r->topoDirty = false;
+  r->fitRequested = true;
+  return 0;
+}
+
+void grRendererGraphStructureChanged(grRenderer *r) { r->topoDirty = true; }
+
+// ------------------------------------------------------------------------------
+// Styling
+// ------------------------------------------------------------------------------
+
+void grRendererSetNodeStyle(grRenderer *r, const grNodeStyle *style) {
+  r->nodeStyle = *style;
+}
+
+void grRendererSetEdgeStyle(grRenderer *r, const grEdgeStyle *style) {
+  r->edgeStyle = *style;
+}
+
+static int uploadAttribute(grRenderer *r, WGPUBuffer *buf, const void *data,
+                           size_t bytes, bool *flag, const char *label) {
+  if (!data) {
+    *flag = false;
+    return 0;
+  }
+
+  // Grow-only: recreate when the existing buffer is too small.
+  if (*buf && wgpuBufferGetSize(*buf) < bytes) {
+    GR_RELEASE(wgpuBufferRelease, *buf);
+    r->bindGroupDirty = true;
+  }
+  if (!*buf) {
+    *buf = createBuffer(r, bytes,
+                        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                        label);
+    r->bindGroupDirty = true;
+    if (!*buf)
+      return -1;
+  }
+  wgpuQueueWriteBuffer(r->queue, *buf, 0, data, bytes);
+  *flag = true;
+  return 0;
+}
+
+int grRendererSetNodeColors(grRenderer *r, const uint32_t *rgba8,
+                            size_t count) {
+  if (rgba8 && (!r->graph || count != r->posCapacity))
+    return -1;
+  return uploadAttribute(r, &r->nodeColorsBuf, rgba8, count * sizeof(uint32_t),
+                         &r->hasNodeColors, "grender node colors");
+}
+
+int grRendererSetNodeSizes(grRenderer *r, const float *radii, size_t count) {
+  if (radii && (!r->graph || count != r->posCapacity))
+    return -1;
+  return uploadAttribute(r, &r->nodeSizesBuf, radii, count * sizeof(float),
+                         &r->hasNodeSizes, "grender node sizes");
+}
+
+int grRendererSetEdgeColors(grRenderer *r, const uint32_t *rgba8,
+                            size_t count) {
+  if (rgba8 && (!r->graph || count != r->topo.edgeCount))
+    return -1;
+  return uploadAttribute(r, &r->edgeColorsBuf, rgba8, count * sizeof(uint32_t),
+                         &r->hasEdgeColors, "grender edge colors");
+}
+
+size_t grRendererEdgeCount(const grRenderer *r) { return r->topo.edgeCount; }
+
+size_t grRendererGetEdges(const grRenderer *r, uint32_t *out) {
+  memcpy(out, r->topo.edges, sizeof(uint32_t) * 2 * r->topo.edgeCount);
+  return r->topo.edgeCount;
+}
+
+// ------------------------------------------------------------------------------
+// Input and actions
+// ------------------------------------------------------------------------------
+
+int grRendererBindKey(grRenderer *r, int key, const char *actionName) {
+  for (size_t i = 0; i < r->bindingCount; i++) {
+    if (r->bindings[i].key == key) {
+      r->bindings[i].actionName = actionName;
+      return 0;
+    }
+  }
+  if (r->bindingCount == r->bindingCapacity) {
+    size_t cap = r->bindingCapacity ? r->bindingCapacity * 2 : 8;
+    grKeyBinding *grown = realloc(r->bindings, cap * sizeof(grKeyBinding));
+    if (!grown)
+      return -1;
+    r->bindings = grown;
+    r->bindingCapacity = cap;
+  }
+  r->bindings[r->bindingCount++] = (grKeyBinding){key, actionName};
+  return 0;
+}
+
+void grRendererUnbindKey(grRenderer *r, int key) {
+  for (size_t i = 0; i < r->bindingCount; i++) {
+    if (r->bindings[i].key == key) {
+      r->bindings[i] = r->bindings[--r->bindingCount];
+      return;
+    }
+  }
+}
+
+void grRendererFitView(grRenderer *r) { r->fitRequested = true; }
+
+void grRendererRequestClose(grRenderer *r) { r->closeRequested = true; }
+
+double grRendererDeltaTime(const grRenderer *r) { return r->deltaTime; }
+
+static void fitViewNow(grRenderer *r, double fbw, double fbh) {
+  if (!r->graph || r->topo.nodeCount == 0)
+    return;
+
+  const double *pos = gvizEmbeddedGraphPositions(r->graph);
+  size_t dim = r->posDim;
+  double bmin[3] = {INFINITY, INFINITY, 0.0};
+  double bmax[3] = {-INFINITY, -INFINITY, 0.0};
+  if (dim == 3)
+    bmin[2] = INFINITY, bmax[2] = -INFINITY;
+
+  for (size_t i = 0; i < r->topo.nodeCount; i++) {
+    const double *p = pos + (size_t)r->topo.nodeIds[i] * dim;
+    for (size_t d = 0; d < dim; d++) {
+      if (p[d] < bmin[d])
+        bmin[d] = p[d];
+      if (p[d] > bmax[d])
+        bmax[d] = p[d];
+    }
+  }
+  grCameraFitBox(&r->camera, bmin, bmax, fbw, fbh);
+}
+
+/** Applies built-in navigation and queues action dispatches. */
+static void processInput(grRenderer *r, double fbw, double fbh) {
+  double cx, cy;
+  glfwGetCursorPos(r->window, &cx, &cy);
+  double cxPx = cx * r->contentScale, cyPx = cy * r->contentScale;
+
+  bool leftDown =
+      glfwGetMouseButton(r->window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+  bool rightDown =
+      glfwGetMouseButton(r->window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+  bool shiftDown = glfwGetKey(r->window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                   glfwGetKey(r->window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+
+  double dx = (cx - r->dragLastX) * r->contentScale;
+  double dy = (cy - r->dragLastY) * r->contentScale;
+
+  bool pan, orbit;
+  if (r->camera.perspective) {
+    pan = rightDown || (leftDown && shiftDown);
+    orbit = leftDown && !shiftDown;
+  } else {
+    pan = leftDown || rightDown;
+    orbit = false;
+  }
+
+  if (pan && r->draggingPan)
+    grCameraPanPixels(&r->camera, dx, dy, fbh);
+  else if (orbit && r->draggingOrbit)
+    grCameraOrbit(&r->camera, dx * 0.008, dy * 0.008);
+
+  r->draggingPan = pan;
+  r->draggingOrbit = orbit;
+  r->dragLastX = cx;
+  r->dragLastY = cy;
+
+  if (r->scrollAccum != 0.0) {
+    double factor = pow(0.90, r->scrollAccum);
+    if (!r->camera.perspective) {
+      // Zoom about the cursor: keep the world point under it fixed.
+      double wx0, wy0, wx1, wy1;
+      grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh,
+                        &wx0, &wy0);
+      grCameraZoom(&r->camera, factor);
+      grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh,
+                        &wx1, &wy1);
+      r->camera.target[0] += wx0 - wx1;
+      r->camera.target[1] += wy0 - wy1;
+    } else {
+      grCameraZoom(&r->camera, factor);
+    }
+    r->scrollAccum = 0.0;
+  }
+
+  // Key dispatch: built-in fit on F unless the app bound F itself.
+  for (size_t k = 0; k < r->pendingKeyCount; k++) {
+    int key = r->pendingKeys[k].key;
+    int mods = r->pendingKeys[k].mods;
+
+    const char *actionName = NULL;
+    for (size_t i = 0; i < r->bindingCount; i++) {
+      if (r->bindings[i].key == key) {
+        actionName = r->bindings[i].actionName;
+        break;
+      }
+    }
+
+    if (!actionName) {
+      if (key == 'F')
+        r->fitRequested = true;
+      continue;
+    }
+    if (!r->graph)
+      continue;
+
+    gvizActionPayload payload = {0};
+    grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh,
+                      &payload.worldX, &payload.worldY);
+    payload.deltaTime = r->deltaTime;
+    payload.iarg = mods; // GLFW mod bits match GR_MOD_*
+    gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
+  }
+  r->pendingKeyCount = 0;
+}
+
+// ------------------------------------------------------------------------------
+// Frame
+// ------------------------------------------------------------------------------
+
+static void writeGlobals(grRenderer *r, double fbw, double fbh) {
+  grGlobalsUBO g = {0};
+  memcpy(g.viewProj, r->cameraFrame.viewProj, sizeof(g.viewProj));
+  memcpy(g.camRight, r->cameraFrame.camRight, sizeof(float) * 3);
+  memcpy(g.camUp, r->cameraFrame.camUp, sizeof(float) * 3);
+  g.viewport[0] = (float)fbw;
+  g.viewport[1] = (float)fbh;
+  g.posDim = (uint32_t)r->posDim;
+  g.flags = (r->hasNodeColors ? 1u : 0u) | (r->hasNodeSizes ? 2u : 0u) |
+            (r->hasEdgeColors ? 4u : 0u);
+
+  memcpy(g.nodeFill, &r->nodeStyle.fillColor, sizeof(float) * 4);
+  memcpy(g.nodeStroke, &r->nodeStyle.strokeColor, sizeof(float) * 4);
+  g.nodeParams[0] = r->nodeStyle.radius;
+  g.nodeParams[1] = r->nodeStyle.strokeWidth;
+  g.nodeParams[2] = r->nodeStyle.sizeMode == GR_SIZE_WORLD ? 1.0f : 0.0f;
+  g.nodeParams[3] = r->cameraFrame.proj11;
+
+  memcpy(g.edgeColor, &r->edgeStyle.color, sizeof(float) * 4);
+  g.edgeParams[0] = r->edgeStyle.width;
+  g.edgeParams[1] = r->edgeStyle.sizeMode == GR_SIZE_WORLD ? 1.0f : 0.0f;
+
+  wgpuQueueWriteBuffer(r->queue, r->globalsBuf, 0, &g, sizeof(g));
+}
+
+static void uploadPositions(grRenderer *r) {
+  const double *src = gvizEmbeddedGraphPositions(r->graph);
+  size_t n = r->posCapacity * r->posDim;
+  float *dst = r->posStaging;
+  for (size_t i = 0; i < n; i++)
+    dst[i] = (float)src[i];
+  wgpuQueueWriteBuffer(r->queue, r->positionsBuf, 0, dst, sizeof(float) * n);
+}
+
+/** Encodes the scene render pass (clear + edges + nodes) into @p target. */
+static void encodeScenePass(grRenderer *r, WGPUCommandEncoder encoder,
+                            WGPUTextureView target, WGPUTextureView depth) {
+  WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(
+      encoder,
+      &(const WGPURenderPassDescriptor){
+          .colorAttachmentCount = 1,
+          .colorAttachments =
+              &(const WGPURenderPassColorAttachment){
+                  .view = target,
+                  .loadOp = WGPULoadOp_Clear,
+                  .storeOp = WGPUStoreOp_Store,
+                  .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
+                  .clearValue = {r->clearColor.r, r->clearColor.g,
+                                 r->clearColor.b, r->clearColor.a},
+              },
+          .depthStencilAttachment =
+              &(const WGPURenderPassDepthStencilAttachment){
+                  .view = depth,
+                  .depthLoadOp = WGPULoadOp_Clear,
+                  .depthStoreOp = WGPUStoreOp_Store,
+                  .depthClearValue = 1.0f,
+              },
+      });
+
+  if (r->graph && r->bindGroup && r->topo.nodeCount) {
+    wgpuRenderPassEncoderSetBindGroup(pass, 0, r->bindGroup, 0, NULL);
+
+    // 2D: edges below nodes (equal depth, later draw wins).
+    // 3D: nodes first so their depth occludes edges behind them.
+    bool nodesFirst = r->posDim == 3;
+    for (int step = 0; step < 2; step++) {
+      bool drawNodes = (step == 0) == nodesFirst;
+      if (drawNodes) {
+        wgpuRenderPassEncoderSetPipeline(pass, r->nodePipeline);
+        wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->topo.nodeCount, 0, 0);
+      } else if (r->topo.edgeCount) {
+        wgpuRenderPassEncoderSetPipeline(pass, r->edgePipeline);
+        wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->topo.edgeCount, 0, 0);
+      }
+    }
+  }
+
+  wgpuRenderPassEncoderEnd(pass);
+  wgpuRenderPassEncoderRelease(pass);
+}
+
+static void onScreenshotMap(WGPUMapAsyncStatus status, WGPUStringView message,
+                            void *userdata1, void *userdata2) {
+  (void)userdata2;
+  *(WGPUMapAsyncStatus *)userdata1 = status;
+  if (status != WGPUMapAsyncStatus_Success)
+    GR_LOG("screenshot map failed: %.*s\n", (int)message.length, message.data);
+}
+
+int grRendererSaveScreenshot(grRenderer *r, const char *path) {
+  uint32_t w = r->surfaceConfig.width, h = r->surfaceConfig.height;
+  if (w == 0 || h == 0)
+    return -1;
+
+  grCameraFrameCompute(&r->camera, w, h, &r->cameraFrame);
+  writeGlobals(r, w, h);
+  if (r->graph) {
+    uploadPositions(r);
+    if (r->bindGroupDirty && rebuildBindGroup(r) < 0)
+      return -1;
+  }
+
+  WGPUTexture target = wgpuDeviceCreateTexture(
+      r->device, &(const WGPUTextureDescriptor){
+                     .label = {"grender screenshot", WGPU_STRLEN},
+                     .usage = WGPUTextureUsage_RenderAttachment |
+                              WGPUTextureUsage_CopySrc,
+                     .dimension = WGPUTextureDimension_2D,
+                     .size = {w, h, 1},
+                     .format = r->surfaceFormat,
+                     .mipLevelCount = 1,
+                     .sampleCount = 1,
+                 });
+  if (!target)
+    return -1;
+  WGPUTextureView targetView = wgpuTextureCreateView(target, NULL);
+
+  const uint32_t bytesPerRow = (w * 4 + 255) & ~255u; // 256-byte alignment
+  WGPUBuffer readback = wgpuDeviceCreateBuffer(
+      r->device, &(const WGPUBufferDescriptor){
+                     .label = {"grender readback", WGPU_STRLEN},
+                     .size = (uint64_t)bytesPerRow * h,
+                     .usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
+                 });
+
+  WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(r->device, NULL);
+  encodeScenePass(r, encoder, targetView, r->depthView);
+  wgpuCommandEncoderCopyTextureToBuffer(
+      encoder,
+      &(const WGPUTexelCopyTextureInfo){.texture = target},
+      &(const WGPUTexelCopyBufferInfo){
+          .layout = {.bytesPerRow = bytesPerRow, .rowsPerImage = h},
+          .buffer = readback,
+      },
+      &(const WGPUExtent3D){w, h, 1});
+  WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+  wgpuQueueSubmit(r->queue, 1, &commands);
+  wgpuCommandBufferRelease(commands);
+  wgpuCommandEncoderRelease(encoder);
+
+  WGPUMapAsyncStatus mapStatus = 0;
+  wgpuBufferMapAsync(readback, WGPUMapMode_Read, 0,
+                     (size_t)bytesPerRow * h,
+                     (const WGPUBufferMapCallbackInfo){
+                         .callback = onScreenshotMap,
+                         .userdata1 = &mapStatus,
+                     });
+  wgpuDevicePoll(r->device, true, NULL);
+
+  int result = -1;
+  if (mapStatus == WGPUMapAsyncStatus_Success) {
+    const uint8_t *data =
+        wgpuBufferGetConstMappedRange(readback, 0, (size_t)bytesPerRow * h);
+    FILE *f = data ? fopen(path, "wb") : NULL;
+    if (f) {
+      // Surface formats are 8-bit RGBA or BGRA; swizzle BGRA on write.
+      bool bgra = r->surfaceFormat == WGPUTextureFormat_BGRA8Unorm ||
+                  r->surfaceFormat == WGPUTextureFormat_BGRA8UnormSrgb;
+      fprintf(f, "P6\n%u %u\n255\n", w, h);
+      uint8_t *row = malloc((size_t)w * 3);
+      if (row) {
+        for (uint32_t y = 0; y < h; y++) {
+          const uint8_t *src = data + (size_t)y * bytesPerRow;
+          for (uint32_t x = 0; x < w; x++) {
+            row[x * 3 + 0] = src[x * 4 + (bgra ? 2 : 0)];
+            row[x * 3 + 1] = src[x * 4 + 1];
+            row[x * 3 + 2] = src[x * 4 + (bgra ? 0 : 2)];
+          }
+          fwrite(row, 3, w, f);
+        }
+        free(row);
+        result = 0;
+      }
+      fclose(f);
+    }
+    wgpuBufferUnmap(readback);
+  }
+
+  wgpuBufferRelease(readback);
+  wgpuTextureViewRelease(targetView);
+  wgpuTextureRelease(target);
+  return result;
+}
+
+bool grRendererFrame(grRenderer *r) {
+  if (r->closeRequested || glfwWindowShouldClose(r->window))
+    return false;
+
+  glfwPollEvents();
+
+  double now = glfwGetTime();
+  r->deltaTime = now - r->lastFrameTime;
+  r->lastFrameTime = now;
+
+  int fbwI, fbhI, winW, winH;
+  glfwGetFramebufferSize(r->window, &fbwI, &fbhI);
+  glfwGetWindowSize(r->window, &winW, &winH);
+  if (fbwI == 0 || fbhI == 0) // minimized
+    return true;
+  double fbw = fbwI, fbh = fbhI;
+  r->contentScale = winW > 0 ? fbw / winW : 1.0;
+
+  if (r->surfaceDirty || (uint32_t)fbwI != r->surfaceConfig.width ||
+      (uint32_t)fbhI != r->surfaceConfig.height) {
+    r->surfaceConfig.width = (uint32_t)fbwI;
+    r->surfaceConfig.height = (uint32_t)fbhI;
+    wgpuSurfaceConfigure(r->surface, &r->surfaceConfig);
+    recreateDepthTexture(r);
+    r->surfaceDirty = false;
+  }
+
+  processInput(r, fbw, fbh);
+
+  if (r->graph) {
+    if (r->topoDirty) {
+      if (ensurePositionBuffers(r) < 0 || uploadTopology(r) < 0)
+        return false;
+      r->topoDirty = false;
+    }
+    if (r->fitRequested) {
+      fitViewNow(r, fbw, fbh);
+      r->fitRequested = false;
+    }
+  }
+
+  grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
+  writeGlobals(r, fbw, fbh);
+
+  if (r->graph) {
+    uploadPositions(r);
+    if (r->bindGroupDirty && rebuildBindGroup(r) < 0)
+      return false;
+  }
+
+  // acquire frame
+  WGPUSurfaceTexture surfaceTexture;
+  wgpuSurfaceGetCurrentTexture(r->surface, &surfaceTexture);
+  switch (surfaceTexture.status) {
+  case WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal:
+  case WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal:
+    break;
+  default:
+    if (surfaceTexture.texture)
+      wgpuTextureRelease(surfaceTexture.texture);
+    r->surfaceDirty = true;
+    return true; // skip the frame; surface reconfigured next time
+  }
+
+  WGPUTextureView frame = wgpuTextureCreateView(surfaceTexture.texture, NULL);
+  WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(
+      r->device,
+      &(const WGPUCommandEncoderDescriptor){.label = {"grender", WGPU_STRLEN}});
+
+  encodeScenePass(r, encoder, frame, r->depthView);
+
+  WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+  wgpuQueueSubmit(r->queue, 1, &commands);
+  wgpuSurfacePresent(r->surface);
+
+  wgpuCommandBufferRelease(commands);
+  wgpuCommandEncoderRelease(encoder);
+  wgpuTextureViewRelease(frame);
+  wgpuTextureRelease(surfaceTexture.texture);
+  return true;
+}
