@@ -93,6 +93,7 @@ add_library(grender STATIC
     src/grRenderer.c
     src/grCamera.c
     src/grTopology.c
+    src/grStats.c
 )
 
 if(APPLE)

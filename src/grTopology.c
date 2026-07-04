@@ -8,8 +8,8 @@
 
 /**
  * The single place where grender reads graph structure, exclusively through
- * the gviz public subgraph API. Runs once per structural change, never per
- * frame.
+ * the gviz public subgraph and draw-mask API. Runs when structure or draw
+ * mask changes, not on pure position updates.
  */
 int grTopologyExtract(grTopology *topo, gvizEmbeddedGraph *graph) {
   grTopologyRelease(topo);
@@ -18,7 +18,6 @@ int grTopologyExtract(grTopology *topo, gvizEmbeddedGraph *graph) {
   bool directed = gvizGraphIsDirected(sg->g) != 0;
 
   size_t nodeCount = gvizSubgraphVertexCount(sg);
-  // gvizSubgraphEdgeCount counts adjacency entries: 2E undirected, E directed.
   size_t edgeCapacity = gvizSubgraphEdgeCount(sg);
 
   topo->nodeIds = malloc(sizeof(uint32_t) * (nodeCount ? nodeCount : 1));
@@ -32,16 +31,18 @@ int grTopologyExtract(grTopology *topo, gvizEmbeddedGraph *graph) {
   size_t u;
   gvizSubgraphVertexIterator vit = gvizSubgraphVertexIteratorCreate(sg);
   while (gvizSubgraphVertexIterate(&vit, &u)) {
+    if (!gvizEmbeddedGraphIsVertexVisible(graph, u))
+      continue;
     topo->nodeIds[ni++] = (uint32_t)u;
 
     size_t v;
     gvizSubgraphNeighborIterator nit = gvizSubgraphNeighborIteratorCreate(sg, u);
     while (gvizSubgraphNeighborIterate(&nit, &v)) {
-      // Undirected edges appear in both adjacency lists; keep the u < v copy.
-      // Self-loops are skipped (not drawable as segments).
       if (!directed && v <= u)
         continue;
       if (directed && v == u)
+        continue;
+      if (!gvizEmbeddedGraphIsEdgeVisible(graph, u, v))
         continue;
       if (ei == edgeCapacity)
         break;

@@ -50,7 +50,7 @@ positions.
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/gripDemo            # 120x80 mesh embedded live by GRIP, 2D
+./build/gripDemo DEPTH DIM  # DEPTH deep sierpinski tetra embedded live by GRIP
 ./build/gripDemo 60 40 3    # same in 3D
 ./build/millionDemo         # 1M vertices / 2M edges, all positions
                             # rewritten every frame (~16 ms/frame on M-series)

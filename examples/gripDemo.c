@@ -12,6 +12,7 @@
  *   N      - advance to the next (finer) GRIP layer
  *   space  - toggle continuous refinement
  *   F      - fit view
+ *   S      - toggle the stats overlay (GRIP heat/displacement charts)
  *   drag   - pan (2D) / orbit (3D)
  *   scroll - zoom
  *
@@ -71,7 +72,7 @@ int main(int argc, char **argv) {
 
   // gvizGraph graph = buildRectMesh(meshW, meshH);
   // gvizGraph graph = build_sierpinski_carpet(depth);
-  gvizGraph graph = createSierpinski(depth, NULL);
+  gvizGraph graph = createSierpinskiTetrahedron(depth, NULL);
   gvizGraphBuildLayout(&graph);
   gvizSubgraph sg = gvizSubgraphCreateFull(&graph);
 
@@ -84,6 +85,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   gvizEmbeddedGraph *eg = (gvizEmbeddedGraph *)&grip;
+  gvizGRIPEmbedderConfigureK(&grip, 64, 32, 64, GVIZ_GRIP_K_PLACEMENT_DECAY);
+
 
   gvizGRIPEmbedderBegin(&grip);
 

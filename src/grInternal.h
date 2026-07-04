@@ -78,6 +78,31 @@ int grTopologyExtract(grTopology *topo, gvizEmbeddedGraph *graph);
 void grTopologyRelease(grTopology *topo);
 
 // ------------------------------------------------------------------------------
+// Stats overlay (charts for gvizStatSeries recorded by the embedder)
+// ------------------------------------------------------------------------------
+
+/** One screen-space overlay primitive. Must match struct StatsPrim in
+ *  grShaders.h (32 bytes, vec4f-aligned). */
+typedef struct grStatsPrim {
+  /** Rect: min corner (xy) and max corner (zw). Line: endpoints a (xy) and
+   *  b (zw). Framebuffer pixels, origin top-left. */
+  float ab[4];
+  uint32_t color; /**< GR_RGBA8 packed. */
+  uint32_t kind;  /**< 0 = rect, 1 = anti-aliased line segment. */
+  float halfWidth;
+  float pad;
+} grStatsPrim;
+
+struct grRenderer;
+
+/**
+ * Rebuilds the overlay primitive list (r->statsPrims) from the stat series of
+ * the attached graph: one mini line chart per non-empty series, stacked in the
+ * top-right corner. Only reads the graph through gvizEmbeddedGraphStatSeries*.
+ */
+void grStatsOverlayBuild(struct grRenderer *r, double fbw, double fbh);
+
+// ------------------------------------------------------------------------------
 // Platform
 // ------------------------------------------------------------------------------
 
@@ -129,6 +154,7 @@ struct grRenderer {
   WGPUPipelineLayout pipelineLayout;
   WGPURenderPipeline nodePipeline;
   WGPURenderPipeline edgePipeline;
+  WGPURenderPipeline statsPipeline;
   WGPUTexture depthTexture;
   WGPUTextureView depthView;
 
@@ -136,6 +162,7 @@ struct grRenderer {
   gvizEmbeddedGraph *graph;
   grTopology topo;
   bool topoDirty;
+  uint64_t drawMaskRevision;
   size_t posCapacity;   /**< Vertices the GPU buffers are sized for. */
   size_t posDim;
   float *posStaging;    /**< Persistent double->float conversion buffer. */
@@ -155,6 +182,13 @@ struct grRenderer {
   grColor clearColor;
   grNodeStyle nodeStyle;
   grEdgeStyle edgeStyle;
+
+  // stats overlay
+  bool statsVisible;
+  grStatsPrim *statsPrims; /**< CPU staging list, rebuilt per frame. */
+  size_t statsPrimCount, statsPrimCapacity;
+  WGPUBuffer statsBuf;
+  size_t statsBufCapacity; /**< In primitives. */
 
   // camera + input
   grCamera camera;

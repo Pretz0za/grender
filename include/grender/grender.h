@@ -101,13 +101,13 @@ void grRendererDestroy(grRenderer *r);
  */
 int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph);
 
-/**
- * Notifies the renderer that the *structure* of the attached graph changed
- * (vertices/edges added, removed, hidden or shown). Topology buffers are
- * rebuilt lazily before the next frame. Pure position changes never require
- * this call.
- */
-void grRendererGraphStructureChanged(grRenderer *r);
+  /**
+   * Notifies the renderer that the *structure* of the attached graph changed
+   * (vertices/edges added, removed, hidden or shown). Topology buffers are
+   * rebuilt lazily before the next frame. Pure position changes and draw-mask
+   * updates (via gvizEmbeddedGraphSetDrawMask) never require this call.
+   */
+  void grRendererGraphStructureChanged(grRenderer *r);
 
 // STYLING: --------------------------------------------------------------------
 
@@ -213,6 +213,22 @@ double grRendererDeltaTime(const grRenderer *r);
 /** Reframes the camera to fit the bounding box of the live vertex positions.
  *  Also bound to the F key by default. */
 void grRendererFitView(grRenderer *r);
+
+// STATS OVERLAY: ----------------------------------------------------------
+//
+// If the creator of the attached embedded graph records stat series on it
+// (gvizEmbeddedGraphStatAppend, e.g. GRIP's "grip.heat"), the renderer charts
+// them live in the top-right corner: one mini line chart per series, restyled
+// per the series' gvizStatChartKind and autoscaled every frame. The renderer
+// needs no knowledge of what the numbers mean.
+
+/** Shows or hides the stats overlay. Visible by default (nothing is drawn
+ *  when the graph has no non-empty stat series). Also toggled by the S key
+ *  unless the app bound S itself. */
+void grRendererShowStats(grRenderer *r, bool show);
+
+/** Returns whether the stats overlay is currently enabled. */
+bool grRendererStatsShown(const grRenderer *r);
 
 /** Requests that the frame loop end; the next grRendererFrame returns false. */
 void grRendererRequestClose(grRenderer *r);

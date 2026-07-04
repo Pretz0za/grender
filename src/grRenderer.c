@@ -101,13 +101,13 @@ static int createPipelines(grRenderer *r) {
   if (!r->shaderModule)
     return -1;
 
-  WGPUBindGroupLayoutEntry entries[7] = {0};
+  WGPUBindGroupLayoutEntry entries[8] = {0};
   entries[0] = (WGPUBindGroupLayoutEntry){
       .binding = 0,
       .visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
       .buffer = {.type = WGPUBufferBindingType_Uniform},
   };
-  for (int i = 1; i < 7; i++) {
+  for (int i = 1; i < 8; i++) {
     entries[i] = (WGPUBindGroupLayoutEntry){
         .binding = (uint32_t)i,
         .visibility = WGPUShaderStage_Vertex,
@@ -118,7 +118,7 @@ static int createPipelines(grRenderer *r) {
   r->bindGroupLayout = wgpuDeviceCreateBindGroupLayout(
       r->device, &(const WGPUBindGroupLayoutDescriptor){
                      .label = {"grender bgl", WGPU_STRLEN},
-                     .entryCount = 7,
+                     .entryCount = 8,
                      .entries = entries,
                  });
   r->pipelineLayout = wgpuDeviceCreatePipelineLayout(
@@ -145,18 +145,20 @@ static int createPipelines(grRenderer *r) {
       .writeMask = WGPUColorWriteMask_All,
   };
 
-  const char *vsEntries[2] = {"vsNode", "vsEdge"};
-  const char *fsEntries[2] = {"fsNode", "fsEdge"};
-  WGPURenderPipeline pipelines[2] = {0};
+  const char *labels[3] = {"grender nodes", "grender edges", "grender stats"};
+  const char *vsEntries[3] = {"vsNode", "vsEdge", "vsStats"};
+  const char *fsEntries[3] = {"fsNode", "fsEdge", "fsStats"};
+  WGPURenderPipeline pipelines[3] = {0};
 
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < 3; i++) {
     const WGPUDepthStencilState depthState = {
         .format = WGPUTextureFormat_Depth24Plus,
         // Nodes write depth so edges/nodes behind them are occluded in 3D;
-        // edges only test.
+        // edges only test. The stats overlay ignores scene depth entirely.
         .depthWriteEnabled =
             (i == 0) ? WGPUOptionalBool_True : WGPUOptionalBool_False,
-        .depthCompare = WGPUCompareFunction_LessEqual,
+        .depthCompare =
+            (i == 2) ? WGPUCompareFunction_Always : WGPUCompareFunction_LessEqual,
         .stencilFront = {.compare = WGPUCompareFunction_Always},
         .stencilBack = {.compare = WGPUCompareFunction_Always},
         .stencilReadMask = 0xFFFFFFFF,
@@ -166,7 +168,7 @@ static int createPipelines(grRenderer *r) {
     pipelines[i] = wgpuDeviceCreateRenderPipeline(
         r->device,
         &(const WGPURenderPipelineDescriptor){
-            .label = {i == 0 ? "grender nodes" : "grender edges", WGPU_STRLEN},
+            .label = {labels[i], WGPU_STRLEN},
             .layout = r->pipelineLayout,
             .vertex = {.module = r->shaderModule,
                        .entryPoint = {vsEntries[i], WGPU_STRLEN}},
@@ -188,6 +190,7 @@ static int createPipelines(grRenderer *r) {
 
   r->nodePipeline = pipelines[0];
   r->edgePipeline = pipelines[1];
+  r->statsPipeline = pipelines[2];
   return 0;
 }
 
@@ -266,6 +269,7 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   r->clearColor = descIn->clearColor;
   r->nodeStyle = descIn->nodeStyle;
   r->edgeStyle = descIn->edgeStyle;
+  r->statsVisible = true;
   grCameraInit2D(&r->camera);
 
   if (!glfwInit()) {
@@ -379,9 +383,11 @@ void grRendererDestroy(grRenderer *r) {
   GR_RELEASE(wgpuBufferRelease, r->nodeSizesBuf);
   GR_RELEASE(wgpuBufferRelease, r->edgesBuf);
   GR_RELEASE(wgpuBufferRelease, r->edgeColorsBuf);
+  GR_RELEASE(wgpuBufferRelease, r->statsBuf);
   GR_RELEASE(wgpuBindGroupRelease, r->bindGroup);
   GR_RELEASE(wgpuRenderPipelineRelease, r->nodePipeline);
   GR_RELEASE(wgpuRenderPipelineRelease, r->edgePipeline);
+  GR_RELEASE(wgpuRenderPipelineRelease, r->statsPipeline);
   GR_RELEASE(wgpuPipelineLayoutRelease, r->pipelineLayout);
   GR_RELEASE(wgpuBindGroupLayoutRelease, r->bindGroupLayout);
   GR_RELEASE(wgpuShaderModuleRelease, r->shaderModule);
@@ -397,6 +403,7 @@ void grRendererDestroy(grRenderer *r) {
 
   grTopologyRelease(&r->topo);
   free(r->posStaging);
+  free(r->statsPrims);
   free(r->bindings);
   free(r->pendingKeys);
   free(r);
@@ -489,8 +496,12 @@ static int rebuildBindGroup(grRenderer *r) {
     r->edgeColorsBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
                                               WGPUBufferUsage_CopyDst,
                                     "grender edge colors");
+  if (!r->statsBuf)
+    r->statsBuf = createBuffer(r, sizeof(grStatsPrim),
+                               WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                               "grender stats prims");
 
-  const WGPUBindGroupEntry entries[7] = {
+  const WGPUBindGroupEntry entries[8] = {
       {.binding = 0, .buffer = r->globalsBuf, .size = WGPU_WHOLE_SIZE},
       {.binding = 1, .buffer = r->positionsBuf, .size = WGPU_WHOLE_SIZE},
       {.binding = 2, .buffer = r->nodeIdsBuf, .size = WGPU_WHOLE_SIZE},
@@ -498,12 +509,13 @@ static int rebuildBindGroup(grRenderer *r) {
       {.binding = 4, .buffer = r->nodeSizesBuf, .size = WGPU_WHOLE_SIZE},
       {.binding = 5, .buffer = r->edgesBuf, .size = WGPU_WHOLE_SIZE},
       {.binding = 6, .buffer = r->edgeColorsBuf, .size = WGPU_WHOLE_SIZE},
+      {.binding = 7, .buffer = r->statsBuf, .size = WGPU_WHOLE_SIZE},
   };
   r->bindGroup = wgpuDeviceCreateBindGroup(
       r->device, &(const WGPUBindGroupDescriptor){
                      .label = {"grender bind group", WGPU_STRLEN},
                      .layout = r->bindGroupLayout,
-                     .entryCount = 7,
+                     .entryCount = 8,
                      .entries = entries,
                  });
   r->bindGroupDirty = false;
@@ -526,6 +538,7 @@ int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
   if (ensurePositionBuffers(r) < 0 || uploadTopology(r) < 0)
     return -1;
   r->topoDirty = false;
+  r->drawMaskRevision = gvizEmbeddedGraphDrawMaskRevision(graph);
   r->fitRequested = true;
   return 0;
 }
@@ -633,6 +646,10 @@ void grRendererUnbindKey(grRenderer *r, int key) {
 
 void grRendererFitView(grRenderer *r) { r->fitRequested = true; }
 
+void grRendererShowStats(grRenderer *r, bool show) { r->statsVisible = show; }
+
+bool grRendererStatsShown(const grRenderer *r) { return r->statsVisible; }
+
 void grRendererRequestClose(grRenderer *r) { r->closeRequested = true; }
 
 double grRendererDeltaTime(const grRenderer *r) { return r->deltaTime; }
@@ -729,6 +746,8 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     if (!actionName) {
       if (key == 'F')
         r->fitRequested = true;
+      else if (key == 'S')
+        r->statsVisible = !r->statsVisible;
       continue;
     }
     if (!r->graph)
@@ -782,6 +801,31 @@ static void uploadPositions(grRenderer *r) {
   wgpuQueueWriteBuffer(r->queue, r->positionsBuf, 0, dst, sizeof(float) * n);
 }
 
+/** Rebuilds the overlay primitives and uploads them (grow-only buffer). */
+static void uploadStats(grRenderer *r, double fbw, double fbh) {
+  r->statsPrimCount = 0;
+  if (r->statsVisible)
+    grStatsOverlayBuild(r, fbw, fbh);
+  if (r->statsPrimCount == 0)
+    return;
+
+  if (r->statsPrimCount > r->statsBufCapacity) {
+    GR_RELEASE(wgpuBufferRelease, r->statsBuf);
+    r->statsBufCapacity = r->statsPrimCount * 2;
+    r->statsBuf = createBuffer(
+        r, sizeof(grStatsPrim) * r->statsBufCapacity,
+        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+        "grender stats prims");
+    r->bindGroupDirty = true;
+    if (!r->statsBuf) {
+      r->statsPrimCount = 0;
+      return;
+    }
+  }
+  wgpuQueueWriteBuffer(r->queue, r->statsBuf, 0, r->statsPrims,
+                       sizeof(grStatsPrim) * r->statsPrimCount);
+}
+
 /** Encodes the scene render pass (clear + edges + nodes) into @p target. */
 static void encodeScenePass(grRenderer *r, WGPUCommandEncoder encoder,
                             WGPUTextureView target, WGPUTextureView depth) {
@@ -807,21 +851,29 @@ static void encodeScenePass(grRenderer *r, WGPUCommandEncoder encoder,
               },
       });
 
-  if (r->graph && r->bindGroup && r->topo.nodeCount) {
+  if (r->graph && r->bindGroup) {
     wgpuRenderPassEncoderSetBindGroup(pass, 0, r->bindGroup, 0, NULL);
 
-    // 2D: edges below nodes (equal depth, later draw wins).
-    // 3D: nodes first so their depth occludes edges behind them.
-    bool nodesFirst = r->posDim == 3;
-    for (int step = 0; step < 2; step++) {
-      bool drawNodes = (step == 0) == nodesFirst;
-      if (drawNodes) {
-        wgpuRenderPassEncoderSetPipeline(pass, r->nodePipeline);
-        wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->topo.nodeCount, 0, 0);
-      } else if (r->topo.edgeCount) {
-        wgpuRenderPassEncoderSetPipeline(pass, r->edgePipeline);
-        wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->topo.edgeCount, 0, 0);
+    if (r->topo.nodeCount) {
+      // 2D: edges below nodes (equal depth, later draw wins).
+      // 3D: nodes first so their depth occludes edges behind them.
+      bool nodesFirst = r->posDim == 3;
+      for (int step = 0; step < 2; step++) {
+        bool drawNodes = (step == 0) == nodesFirst;
+        if (drawNodes) {
+          wgpuRenderPassEncoderSetPipeline(pass, r->nodePipeline);
+          wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->topo.nodeCount, 0, 0);
+        } else if (r->topo.edgeCount) {
+          wgpuRenderPassEncoderSetPipeline(pass, r->edgePipeline);
+          wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->topo.edgeCount, 0, 0);
+        }
       }
+    }
+
+    // Stats overlay always draws on top of the scene.
+    if (r->statsPrimCount) {
+      wgpuRenderPassEncoderSetPipeline(pass, r->statsPipeline);
+      wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->statsPrimCount, 0, 0);
     }
   }
 
@@ -846,6 +898,7 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
   writeGlobals(r, w, h);
   if (r->graph) {
     uploadPositions(r);
+    uploadStats(r, w, h);
     if (r->bindGroupDirty && rebuildBindGroup(r) < 0)
       return -1;
   }
@@ -962,6 +1015,11 @@ bool grRendererFrame(grRenderer *r) {
   processInput(r, fbw, fbh);
 
   if (r->graph) {
+    uint64_t rev = gvizEmbeddedGraphDrawMaskRevision(r->graph);
+    if (rev != r->drawMaskRevision) {
+      r->drawMaskRevision = rev;
+      r->topoDirty = true;
+    }
     if (r->topoDirty) {
       if (ensurePositionBuffers(r) < 0 || uploadTopology(r) < 0)
         return false;
@@ -978,6 +1036,7 @@ bool grRendererFrame(grRenderer *r) {
 
   if (r->graph) {
     uploadPositions(r);
+    uploadStats(r, fbw, fbh);
     if (r->bindGroupDirty && rebuildBindGroup(r) < 0)
       return false;
   }
