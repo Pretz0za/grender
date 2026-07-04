@@ -1,0 +1,17 @@
+# CMake out-of-tree build directory
+/build/
+
+# Editor / language-server cache
+.cache/
+
+# macOS
+.DS_Store
+
+# Compiled artifacts (in case of in-tree builds)
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
