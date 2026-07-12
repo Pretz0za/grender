@@ -1,6 +1,10 @@
 # CMake out-of-tree build directory
 /build/
 
+# Vendored dependencies (populated once via scripts/setup-deps.sh)
+/third-party/wgpu-native/
+/third-party/glfw/
+
 # Editor / language-server cache
 .cache/
 

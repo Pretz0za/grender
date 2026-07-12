@@ -5,7 +5,8 @@
  * This file only decides *where pixels go* (layout, autoscaling, text); the
  * data and chart kinds come from the embedder through the public
  * gvizEmbeddedGraphStatSeries* API, and drawing is a single instanced pass
- * over the grStatsPrim list built here.
+ * over the grStatsPrim list built here. grRenderer only calls this when a
+ * series revision, series count, or viewport layout changes.
  */
 
 #include "grInternal.h"
@@ -490,13 +491,18 @@ static void buildChart(grRenderer *r, const gvizStatSeries *series,
 
   char buf[64];
   pushText(r, x0 + pad, y0 + pad, fontPx, textColor, series->name);
-  snprintf(buf, sizeof(buf), "%.4g", series->samples[series->count - 1]);
-  pushText(r, x1 - pad - textWidth(buf, fontPx), y0 + pad, fontPx, lineColor,
-           buf);
+  if (series->count > 0) {
+    snprintf(buf, sizeof(buf), "%.4g", series->samples[series->count - 1]);
+    pushText(r, x1 - pad - textWidth(buf, fontPx), y0 + pad, fontPx, lineColor,
+             buf);
+  }
 
   double px0 = x0 + pad, px1 = x1 - pad;
   double py0 = y0 + pad + titleH, py1 = y1 - pad;
   pushFrame(r, px0, py0, px1, py1, 1.0 * s, frameColor);
+
+  if (series->count == 0)
+    return;
 
   double lo, hi;
   if (!seriesRange(series, logScale, &lo, &hi))
@@ -559,7 +565,9 @@ void grStatsOverlayBuild(grRenderer *r, double fbw, double fbh) {
   size_t chartIdx = 0;
   for (size_t i = 0; i < total; i++) {
     const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, i);
-    if (!series || series->count == 0)
+    if (!series)
+      continue;
+    if (i < r->statsSeriesVisibleCount && !r->statsSeriesVisible[i])
       continue;
     if (y + chartH > fbh - margin) // no space for another chart
       break;

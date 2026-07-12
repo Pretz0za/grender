@@ -7,7 +7,8 @@
  * grender sits strictly on the consumer side of the gviz abstraction barrier:
  * it only reads embedded graphs through the public gvizEmbeddedGraph /
  * gvizSubgraph API and is agnostic to which embedding algorithm produced the
- * positions. It supports 2D and 3D embeddings, renders millions of vertices
+ * positions. It supports 2D and 3D embeddings directly, and 4D embeddings
+ * projected to 3D with PCA for display. It renders millions of vertices
  * and edges in two instanced draw calls, and re-reads vertex positions every
  * frame so a live embedder (force-directed, GRIP rounds, ...) is rendered
  * online.
@@ -92,17 +93,15 @@ void grRendererDestroy(grRenderer *r);
  * Attaches the embedded graph to render. The renderer reads structure through
  * the gviz subgraph API and positions through gvizEmbeddedGraphPositions every
  * frame, so position changes made by the caller (or by actions) between frames
- * are always visible. Only 2D and 3D embeddings are supported.
- *
- * The graph must outlive the attachment. Attaching resets the camera to frame
- * the current positions.
+ * are always visible. 2D and 3D embeddings are rendered directly; 4D
+ * embeddings are PCA-projected to 3D each frame.
  *
  * @return 0 on success, -1 on unsupported dimension or GPU allocation failure.
  */
 int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph);
 
-  /**
-   * Notifies the renderer that the *structure* of the attached graph changed
+/**
+ * Notifies the renderer that the *structure* of the attached graph changed
    * (vertices/edges added, removed, hidden or shown). Topology buffers are
    * rebuilt lazily before the next frame. Pure position changes and draw-mask
    * updates (via gvizEmbeddedGraphSetDrawMask) never require this call.
@@ -224,11 +223,29 @@ void grRendererFitView(grRenderer *r);
 
 /** Shows or hides the stats overlay. Visible by default (nothing is drawn
  *  when the graph has no non-empty stat series). Also toggled by the S key
- *  unless the app bound S itself. */
+ *  unless the app bound S itself. On macOS, also available under View. */
 void grRendererShowStats(grRenderer *r, bool show);
 
 /** Returns whether the stats overlay is currently enabled. */
 bool grRendererStatsShown(const grRenderer *r);
+
+/**
+ * Returns the number of stat series registered on the attached embedded graph
+ * (0 when no graph is attached).
+ */
+size_t grRendererStatSeriesCount(const grRenderer *r);
+
+/** Returns the name of the @p idx-th stat series, or NULL if out of bounds. */
+const char *grRendererStatSeriesName(const grRenderer *r, size_t idx);
+
+/** Returns whether the chart for series @p idx is shown (rendering only). */
+bool grRendererStatSeriesShown(const grRenderer *r, size_t idx);
+
+/**
+ * Shows or hides the chart for series @p idx. Does not affect data collection
+ * on the embedded graph. No-op when @p idx is out of bounds.
+ */
+void grRendererShowStatSeries(grRenderer *r, size_t idx, bool show);
 
 /** Requests that the frame loop end; the next grRendererFrame returns false. */
 void grRendererRequestClose(grRenderer *r);

@@ -42,33 +42,124 @@ positions.
 - The same API is implemented by browsers and Emscripten, so a future web
   build can reuse the renderer core unchanged; only the platform layer
   (window/surface creation, currently GLFW + `grSurfaceCocoa.m`) is swapped.
-- Prebuilt static libraries are fetched at configure time - no Rust toolchain
+- Prebuilt static libraries live under `third-party/` - no Rust toolchain
   required.
 
 ## Building
 
+One-time dependency setup (downloads pinned wgpu-native and GLFW, or imports
+from an existing `build/_deps/` cache if present):
+
+```sh
+./scripts/setup-deps.sh
+```
+
+Then configure and build:
+
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/gripDemo DEPTH DIM  # DEPTH deep sierpinski tetra embedded live by GRIP
-./build/gripDemo 60 40 3    # same in 3D
-./build/millionDemo         # 1M vertices / 2M edges, all positions
-                            # rewritten every frame (~16 ms/frame on M-series)
 ```
 
-Requirements: CMake >= 3.20, a C11 compiler, network access on first configure
-(fetches pinned wgpu-native and GLFW), and the gviz repo as a sibling
-directory (or set `-DGRENDER_GVIZ_DIR=/path/to/gviz`).
+See **Example apps** below for runnable demos.
 
-Dependencies (pinned in `CMakeLists.txt`):
+Requirements: CMake >= 3.20, a C11 compiler, OpenBLAS in `$HOME/lib` (needed by
+grender for 4D PCA projection), and the gviz repo as a sibling directory (or
+set `-DGRENDER_GVIZ_DIR=/path/to/gviz`). Network access is only needed when
+running `scripts/setup-deps.sh`.
 
-| dependency  | version   | source                        |
-| ----------- | --------- | ----------------------------- |
-| wgpu-native | v29.0.1.1 | gfx-rs GitHub release binary  |
-| GLFW        | 3.4       | glfw GitHub release source    |
+### Example apps
 
-To upgrade wgpu-native, bump `WGPU_NATIVE_VERSION` and check the release notes
-for `webgpu.h` API changes.
+All examples require a built `graphvis` target from gviz.
+
+```sh
+./build/gripDemo              # live GRIP on a Möbius mesh (default 24×48, 3D)
+./build/gripDemo 60 40 3      # larger mesh, 3D
+./build/treeDemo              # Reingold-Tilford tree layout (binary, depth 7)
+./build/treeDemo 3 5          # 3-ary tree, depth 5
+./build/millionDemo           # 1M-vertex online position-update stress test
+./build/datasetDemo human-jung-2015 2   # GRIP on a gviz data/ graph
+```
+
+`datasetDemo` needs the gviz `data/` tree; CMake passes
+`GRENDER_GVIZ_DATA_DIR` automatically when gviz is built as a subdirectory.
+
+## Working with gviz
+
+grender only consumes the public gviz API (`gvizEmbeddedGraph`,
+`gvizSubgraph`, …). Embedding algorithms live in the sibling
+[`gviz`](../gviz) repo and are linked into the example apps via the
+`graphvis` static library. **Do not modify gviz embedder code from grender
+unless you are intentionally fixing or extending gviz itself.**
+
+### Graph layout before subgraphs
+
+`gvizSubgraphCreateFull` returns an **empty** subgraph (null graph pointer)
+when the parent graph has no built layout. Every example follows the same
+order:
+
+```c
+gvizGraph graph = ...;          // build vertices and edges first
+gvizGraphBuildLayout(&graph);   // required — builds the shared edge layout
+gvizSubgraph sg = gvizSubgraphCreateFull(&graph);
+```
+
+Skipping `gvizGraphBuildLayout` silently produces an invalid subgraph; embedder
+init and rendering will then crash or fail. Rebuild the layout after any
+structural change to vertices or edges (add/remove), then recreate affected
+subgraphs.
+
+### Embedder-specific notes
+
+| embedder | header | graph requirements | dimensions |
+| -------- | ------ | ------------------ | ---------- |
+| GRIP | `embedders/gvizGRIPEmbedder.h` | any graph; undirected is fine | 2, 3, or 4 |
+| Reingold-Tilford tree | `embedders/gvizEmbeddedTree.h` | **directed tree** rooted at the chosen vertex (`gvizGraphInit(..., 1)`) | 2 only |
+| (manual positions) | `embedders/gvizEmbeddedGraph.h` | any | 2, 3, or 4 |
+
+Tree layout workflow (`treeDemo`):
+
+```c
+gvizEmbeddedTree tree = {0};
+gvizEmbeddedTreeRTInit(&tree, sg, root);
+gvizEmbeddedTreeCalculateOffsets(&tree, root, 0);
+double pos[2] = {0.0, 0.0};
+gvizEmbeddedTreeEmbed(&tree, root, pos);
+grRendererSetGraph(r, (gvizEmbeddedGraph *)&tree);  // tree embeds gvizEmbeddedGraph
+```
+
+`gvizEmbeddedTreeRTInit` calls `gvizGraphIsTree` and returns `-1` if the graph
+is not a directed tree (undirected graphs return `-2` from the tree check).
+
+### Attaching an embedded graph to grender
+
+- Pass any embedder state cast to `gvizEmbeddedGraph*` (the embedder struct
+  must have `gvizEmbeddedGraph` as its first member).
+- Call `grRendererGraphStructureChanged(r)` only when vertices/edges are
+  added, removed, or hidden/shown — not for position-only updates.
+- Register embedder actions with `gvizEmbeddedGraphAddAction` and bind keys
+  with `grRendererBindKey`; the renderer dispatches without knowing the
+  embedder type.
+- 4D embeddings are PCA-projected to 3D inside grender each frame.
+
+### Automated screenshots
+
+Pass a `.ppm` path as the last argument to `gripDemo`, `treeDemo`, or
+`millionDemo`; the app renders a few frames, saves the image, and exits.
+Useful for headless CI checks.
+
+
+Dependencies (pinned in `scripts/setup-deps.sh`):
+
+| dependency  | version   | default path                         |
+| ----------- | --------- | ------------------------------------ |
+| wgpu-native | v29.0.1.1 | `third-party/wgpu-native/`           |
+| GLFW        | 3.4       | `third-party/glfw/`                  |
+
+Override with `-DGRENDER_WGPU_NATIVE_DIR=...` or `-DGRENDER_GLFW_DIR=...` if you
+install them elsewhere. To upgrade wgpu-native, bump the version in
+`scripts/setup-deps.sh`, re-run the script, and check release notes for
+`webgpu.h` API changes.
 
 ## API sketch
 
@@ -105,6 +196,8 @@ src/grTopology.c            the only code that reads gviz structure
 src/grShaders.h             WGSL (instanced nodes/edges, vertex pulling)
 src/grSurfaceCocoa.m        macOS CAMetalLayer surface glue
 examples/gripDemo.c         live GRIP embedding with bound actions
+examples/treeDemo.c       Reingold-Tilford tree layout (gvizEmbeddedTree)
+examples/datasetDemo.c    GRIP on graphs from gviz data/
 examples/millionDemo.c      1M-vertex online-update stress test
 ```
 

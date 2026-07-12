@@ -83,6 +83,34 @@ static WGPUBuffer createBuffer(grRenderer *r, size_t size, WGPUBufferUsage usage
                                 });
 }
 
+static int checkStorageBinding(grRenderer *r, const char *what, size_t bytes) {
+  if (bytes > r->maxBufferSize) {
+    GR_LOG("%s needs %zu bytes but this GPU max buffer size is %llu bytes\n",
+           what, bytes, (unsigned long long)r->maxBufferSize);
+    return -1;
+  }
+  if (bytes <= r->maxStorageBufferBindingSize)
+    return 0;
+  GR_LOG(
+      "%s needs %zu bytes but this GPU allows %llu bytes per storage binding "
+      "(WebGPU default is 128 MiB). Use a smaller graph or fewer visible "
+      "edges.\n",
+      what, bytes, (unsigned long long)r->maxStorageBufferBindingSize);
+  return -1;
+}
+
+static uint64_t storageBindBytes(grRenderer *r, WGPUBuffer buf) {
+  if (!buf)
+    return 4;
+  uint64_t sz = wgpuBufferGetSize(buf);
+  if (sz > r->maxStorageBufferBindingSize) {
+    GR_LOG("internal: buffer size %llu exceeds binding limit %llu\n",
+           (unsigned long long)sz,
+           (unsigned long long)r->maxStorageBufferBindingSize);
+  }
+  return sz;
+}
+
 // ------------------------------------------------------------------------------
 // Pipelines
 // ------------------------------------------------------------------------------
@@ -272,11 +300,16 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   r->statsVisible = true;
   grCameraInit2D(&r->camera);
 
+#ifdef __APPLE__
+  glfwInitHint(GLFW_COCOA_MENUBAR, GLFW_FALSE);
+#endif
   if (!glfwInit()) {
     GR_LOG("glfwInit failed\n");
     free(r);
     return NULL;
   }
+
+  grPlatformInitApplication();
 
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
   r->window = glfwCreateWindow((int)descIn->width, (int)descIn->height,
@@ -307,16 +340,42 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   if (!r->adapter)
     goto fail;
 
+  WGPULimits adapterLimits = WGPU_LIMITS_INIT;
+  if (wgpuAdapterGetLimits(r->adapter, &adapterLimits) != WGPUStatus_Success) {
+    GR_LOG("failed to query adapter limits\n");
+    goto fail;
+  }
+
+  WGPULimits requiredLimits = WGPU_LIMITS_INIT;
+  requiredLimits.maxStorageBufferBindingSize =
+      adapterLimits.maxStorageBufferBindingSize;
+  requiredLimits.maxBufferSize = adapterLimits.maxBufferSize;
+
   wgpuAdapterRequestDevice(
       r->adapter,
       &(const WGPUDeviceDescriptor){
           .label = {"grender device", WGPU_STRLEN},
+          .requiredLimits = &requiredLimits,
           .uncapturedErrorCallbackInfo = {.callback = onUncapturedError},
       },
       (const WGPURequestDeviceCallbackInfo){.callback = onDeviceRequest,
                                             .userdata1 = &r->device});
   if (!r->device)
     goto fail;
+
+  {
+    WGPULimits deviceLimits = WGPU_LIMITS_INIT;
+    if (wgpuDeviceGetLimits(r->device, &deviceLimits) == WGPUStatus_Success) {
+      r->maxStorageBufferBindingSize = deviceLimits.maxStorageBufferBindingSize;
+      r->maxBufferSize = deviceLimits.maxBufferSize;
+      GR_LOG("GPU storage binding limit: %.0f MiB, max buffer: %.0f MiB\n",
+             deviceLimits.maxStorageBufferBindingSize / (1024.0 * 1024.0),
+             deviceLimits.maxBufferSize / (1024.0 * 1024.0));
+    } else {
+      r->maxStorageBufferBindingSize = 128u * 1024u * 1024u;
+      r->maxBufferSize = 256u * 1024u * 1024u;
+    }
+  }
 
   r->queue = wgpuDeviceGetQueue(r->device);
 
@@ -404,10 +463,89 @@ void grRendererDestroy(grRenderer *r) {
   grTopologyRelease(&r->topo);
   free(r->posStaging);
   free(r->statsPrims);
+  free(r->statsSeriesRevisions);
+  free(r->statsSeriesVisible);
   free(r->bindings);
   free(r->pendingKeys);
   free(r);
 }
+
+// ------------------------------------------------------------------------------
+// Stats overlay visibility
+// ------------------------------------------------------------------------------
+
+static void statsVisibilitySync(grRenderer *r) {
+  free(r->statsSeriesVisible);
+  r->statsSeriesVisible = NULL;
+  r->statsSeriesVisibleCount = 0;
+
+  if (!r->graph)
+    return;
+
+  size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
+  if (n == 0)
+    return;
+
+  r->statsSeriesVisible = calloc(n, sizeof(bool));
+  if (!r->statsSeriesVisible)
+    return;
+  for (size_t i = 0; i < n; i++)
+    r->statsSeriesVisible[i] = true;
+  r->statsSeriesVisibleCount = n;
+}
+
+static void statsMenuSyncIfNeeded(grRenderer *r) {
+  if (!r->graph)
+    return;
+  size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
+  if (n == r->statsMenuSeriesCount)
+    return;
+  if (n != r->statsSeriesVisibleCount)
+    statsVisibilitySync(r);
+  r->statsMenuSeriesCount = n;
+  grPlatformStatsMenuRefresh(r);
+}
+
+size_t grRendererStatSeriesCount(const grRenderer *r) {
+  if (!r || !r->graph)
+    return 0;
+  return gvizEmbeddedGraphStatSeriesCount(r->graph);
+}
+
+const char *grRendererStatSeriesName(const grRenderer *r, size_t idx) {
+  if (!r || !r->graph)
+    return NULL;
+  const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, idx);
+  return series ? series->name : NULL;
+}
+
+bool grRendererStatSeriesShown(const grRenderer *r, size_t idx) {
+  if (!r || idx >= r->statsSeriesVisibleCount)
+    return false;
+  return r->statsSeriesVisible[idx];
+}
+
+void grRendererShowStatSeries(grRenderer *r, size_t idx, bool show) {
+  if (!r || idx >= r->statsSeriesVisibleCount ||
+      r->statsSeriesVisible[idx] == show)
+    return;
+  r->statsSeriesVisible[idx] = show;
+  r->statsOverlayDirty = true;
+  grPlatformStatsMenuRefresh(r);
+}
+
+void grRendererShowStats(grRenderer *r, bool show) {
+  if (r->statsVisible == show)
+    return;
+  r->statsVisible = show;
+  if (show)
+    r->statsOverlayDirty = true;
+  else
+    r->statsPrimCount = 0;
+  grPlatformStatsMenuRefresh(r);
+}
+
+bool grRendererStatsShown(const grRenderer *r) { return r->statsVisible; }
 
 // ------------------------------------------------------------------------------
 // Graph attachment and GPU buffer management
@@ -416,24 +554,30 @@ void grRendererDestroy(grRenderer *r) {
 /** (Re)creates position-indexed buffers when the vertex capacity changes. */
 static int ensurePositionBuffers(grRenderer *r) {
   size_t count = gvizEmbeddedGraphPositionCount(r->graph);
-  size_t dim = gvizEmbeddedGraphDim(r->graph);
-  if (count == r->posCapacity && dim == r->posDim && r->positionsBuf)
+  size_t srcDim = gvizEmbeddedGraphDim(r->graph);
+  size_t renderDim = srcDim == 4 ? 3 : srcDim;
+  if (count == r->posCapacity && srcDim == r->srcDim && renderDim == r->posDim &&
+      r->positionsBuf)
     return 0;
 
   free(r->posStaging);
-  r->posStaging = malloc(sizeof(float) * count * dim);
+  r->posStaging = malloc(sizeof(float) * count * renderDim);
   if (!r->posStaging)
     return -1;
 
   GR_RELEASE(wgpuBufferRelease, r->positionsBuf);
+  size_t posBytes = sizeof(float) * count * renderDim;
+  if (checkStorageBinding(r, "positions", posBytes) < 0)
+    return -1;
   r->positionsBuf = createBuffer(
-      r, sizeof(float) * count * dim,
+      r, posBytes,
       WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst, "grender positions");
   if (!r->positionsBuf)
     return -1;
 
   r->posCapacity = count;
-  r->posDim = dim;
+  r->srcDim = srcDim;
+  r->posDim = renderDim;
   r->bindGroupDirty = true;
 
   // Per-vertex attributes are indexed the same way; stale ones are dropped.
@@ -452,6 +596,10 @@ static int uploadTopology(grRenderer *r) {
   size_t nodeBytes = sizeof(uint32_t) * (r->topo.nodeCount ? r->topo.nodeCount : 1);
   size_t edgeBytes =
       sizeof(uint32_t) * 2 * (r->topo.edgeCount ? r->topo.edgeCount : 1);
+
+  if (checkStorageBinding(r, "node ids", nodeBytes) < 0 ||
+      checkStorageBinding(r, "edges", edgeBytes) < 0)
+    return -1;
 
   // Node-id and edge buffers are recreated on structural change only.
   GR_RELEASE(wgpuBufferRelease, r->nodeIdsBuf);
@@ -502,15 +650,30 @@ static int rebuildBindGroup(grRenderer *r) {
                                "grender stats prims");
 
   const WGPUBindGroupEntry entries[8] = {
-      {.binding = 0, .buffer = r->globalsBuf, .size = WGPU_WHOLE_SIZE},
-      {.binding = 1, .buffer = r->positionsBuf, .size = WGPU_WHOLE_SIZE},
-      {.binding = 2, .buffer = r->nodeIdsBuf, .size = WGPU_WHOLE_SIZE},
-      {.binding = 3, .buffer = r->nodeColorsBuf, .size = WGPU_WHOLE_SIZE},
-      {.binding = 4, .buffer = r->nodeSizesBuf, .size = WGPU_WHOLE_SIZE},
-      {.binding = 5, .buffer = r->edgesBuf, .size = WGPU_WHOLE_SIZE},
-      {.binding = 6, .buffer = r->edgeColorsBuf, .size = WGPU_WHOLE_SIZE},
-      {.binding = 7, .buffer = r->statsBuf, .size = WGPU_WHOLE_SIZE},
+      {.binding = 0, .buffer = r->globalsBuf,
+       .size = storageBindBytes(r, r->globalsBuf)},
+      {.binding = 1, .buffer = r->positionsBuf,
+       .size = storageBindBytes(r, r->positionsBuf)},
+      {.binding = 2, .buffer = r->nodeIdsBuf,
+       .size = storageBindBytes(r, r->nodeIdsBuf)},
+      {.binding = 3, .buffer = r->nodeColorsBuf,
+       .size = storageBindBytes(r, r->nodeColorsBuf)},
+      {.binding = 4, .buffer = r->nodeSizesBuf,
+       .size = storageBindBytes(r, r->nodeSizesBuf)},
+      {.binding = 5, .buffer = r->edgesBuf,
+       .size = storageBindBytes(r, r->edgesBuf)},
+      {.binding = 6, .buffer = r->edgeColorsBuf,
+       .size = storageBindBytes(r, r->edgeColorsBuf)},
+      {.binding = 7, .buffer = r->statsBuf,
+       .size = storageBindBytes(r, r->statsBuf)},
   };
+  for (size_t i = 0; i < 8; i++) {
+    if (entries[i].size > r->maxStorageBufferBindingSize) {
+      GR_LOG("bind group entry %zu size %llu exceeds storage binding limit\n",
+             i, (unsigned long long)entries[i].size);
+      return -1;
+    }
+  }
   r->bindGroup = wgpuDeviceCreateBindGroup(
       r->device, &(const WGPUBindGroupDescriptor){
                      .label = {"grender bind group", WGPU_STRLEN},
@@ -524,13 +687,13 @@ static int rebuildBindGroup(grRenderer *r) {
 
 int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
   size_t dim = gvizEmbeddedGraphDim(graph);
-  if (dim != 2 && dim != 3) {
-    GR_LOG("unsupported embedding dimension %zu (only 2 and 3)\n", dim);
+  if (dim != 2 && dim != 3 && dim != 4) {
+    GR_LOG("unsupported embedding dimension %zu (only 2, 3, and 4)\n", dim);
     return -1;
   }
 
   r->graph = graph;
-  if (dim == 3)
+  if (dim == 3 || dim == 4)
     grCameraInit3D(&r->camera);
   else
     grCameraInit2D(&r->camera);
@@ -539,6 +702,16 @@ int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
     return -1;
   r->topoDirty = false;
   r->drawMaskRevision = gvizEmbeddedGraphDrawMaskRevision(graph);
+  free(r->statsSeriesRevisions);
+  r->statsSeriesRevisions = NULL;
+  r->statsSeriesCacheCount = 0;
+  r->statsSeriesCacheCapacity = 0;
+  r->statsOverlayDirty = true;
+  r->statsPrimCount = 0;
+  r->pcaBasisValid = false;
+  statsVisibilitySync(r);
+  r->statsMenuSeriesCount = gvizEmbeddedGraphStatSeriesCount(graph);
+  grPlatformStatsMenuRefresh(r);
   r->fitRequested = true;
   return 0;
 }
@@ -646,10 +819,6 @@ void grRendererUnbindKey(grRenderer *r, int key) {
 
 void grRendererFitView(grRenderer *r) { r->fitRequested = true; }
 
-void grRendererShowStats(grRenderer *r, bool show) { r->statsVisible = show; }
-
-bool grRendererStatsShown(const grRenderer *r) { return r->statsVisible; }
-
 void grRendererRequestClose(grRenderer *r) { r->closeRequested = true; }
 
 double grRendererDeltaTime(const grRenderer *r) { return r->deltaTime; }
@@ -659,19 +828,41 @@ static void fitViewNow(grRenderer *r, double fbw, double fbh) {
     return;
 
   const double *pos = gvizEmbeddedGraphPositions(r->graph);
-  size_t dim = r->posDim;
+  size_t srcDim = r->srcDim;
   double bmin[3] = {INFINITY, INFINITY, 0.0};
   double bmax[3] = {-INFINITY, -INFINITY, 0.0};
-  if (dim == 3)
+  if (r->posDim == 3)
     bmin[2] = INFINITY, bmax[2] = -INFINITY;
 
-  for (size_t i = 0; i < r->topo.nodeCount; i++) {
-    const double *p = pos + (size_t)r->topo.nodeIds[i] * dim;
-    for (size_t d = 0; d < dim; d++) {
-      if (p[d] < bmin[d])
-        bmin[d] = p[d];
-      if (p[d] > bmax[d])
-        bmax[d] = p[d];
+  if (srcDim == 4) {
+    float *proj = malloc(sizeof(float) * r->posCapacity * 3);
+    if (!proj)
+      return;
+    if (grPCAProjectTo3(pos, r->posCapacity, srcDim, proj, r->pcaBasis,
+                        r->pcaBasisValid ? r->pcaBasis : NULL) < 0) {
+      free(proj);
+      return;
+    }
+    r->pcaBasisValid = true;
+    for (size_t i = 0; i < r->topo.nodeCount; i++) {
+      const float *p = proj + (size_t)r->topo.nodeIds[i] * 3;
+      for (size_t d = 0; d < 3; d++) {
+        if (p[d] < bmin[d])
+          bmin[d] = p[d];
+        if (p[d] > bmax[d])
+          bmax[d] = p[d];
+      }
+    }
+    free(proj);
+  } else {
+    for (size_t i = 0; i < r->topo.nodeCount; i++) {
+      const double *p = pos + (size_t)r->topo.nodeIds[i] * srcDim;
+      for (size_t d = 0; d < srcDim; d++) {
+        if (p[d] < bmin[d])
+          bmin[d] = p[d];
+        if (p[d] > bmax[d])
+          bmax[d] = p[d];
+      }
     }
   }
   grCameraFitBox(&r->camera, bmin, bmax, fbw, fbh);
@@ -747,7 +938,7 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
       if (key == 'F')
         r->fitRequested = true;
       else if (key == 'S')
-        r->statsVisible = !r->statsVisible;
+        grRendererShowStats(r, !r->statsVisible);
       continue;
     }
     if (!r->graph)
@@ -794,18 +985,88 @@ static void writeGlobals(grRenderer *r, double fbw, double fbh) {
 
 static void uploadPositions(grRenderer *r) {
   const double *src = gvizEmbeddedGraphPositions(r->graph);
-  size_t n = r->posCapacity * r->posDim;
+  size_t n = r->posCapacity;
   float *dst = r->posStaging;
-  for (size_t i = 0; i < n; i++)
+  if (r->srcDim == 4) {
+    if (grPCAProjectTo3(src, n, r->srcDim, dst, r->pcaBasis,
+                        r->pcaBasisValid ? r->pcaBasis : NULL) < 0) {
+      for (size_t i = 0; i < n * 3; i++)
+        dst[i] = 0.0f;
+    } else {
+      r->pcaBasisValid = true;
+    }
+    wgpuQueueWriteBuffer(r->queue, r->positionsBuf, 0, dst, sizeof(float) * n * 3);
+    return;
+  }
+  for (size_t i = 0; i < n * r->posDim; i++)
     dst[i] = (float)src[i];
-  wgpuQueueWriteBuffer(r->queue, r->positionsBuf, 0, dst, sizeof(float) * n);
+  wgpuQueueWriteBuffer(r->queue, r->positionsBuf, 0, dst,
+                       sizeof(float) * n * r->posDim);
 }
 
-/** Rebuilds the overlay primitives and uploads them (grow-only buffer). */
+static int statsRevisionCacheEnsure(grRenderer *r, size_t n) {
+  if (n <= r->statsSeriesCacheCapacity)
+    return 0;
+  size_t cap = r->statsSeriesCacheCapacity ? r->statsSeriesCacheCapacity * 2 : 4;
+  while (cap < n)
+    cap *= 2;
+  uint64_t *grown =
+      realloc(r->statsSeriesRevisions, cap * sizeof(uint64_t));
+  if (!grown)
+    return -1;
+  r->statsSeriesRevisions = grown;
+  r->statsSeriesCacheCapacity = cap;
+  return 0;
+}
+
+static void statsRevisionCacheSync(grRenderer *r, double fbw, double fbh) {
+  size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
+  if (statsRevisionCacheEnsure(r, n) < 0)
+    return;
+  for (size_t i = 0; i < n; i++) {
+    const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, i);
+    r->statsSeriesRevisions[i] = series ? series->revision : 0;
+  }
+  r->statsSeriesCacheCount = n;
+  r->statsLayoutFbw = fbw;
+  r->statsLayoutFbh = fbh;
+  r->statsLayoutScale = r->contentScale > 0.0 ? r->contentScale : 1.0;
+  r->statsOverlayDirty = false;
+}
+
+static bool statsOverlayNeedsRebuild(grRenderer *r, double fbw, double fbh) {
+  if (r->statsOverlayDirty)
+    return true;
+  double scale = r->contentScale > 0.0 ? r->contentScale : 1.0;
+  if (fbw != r->statsLayoutFbw || fbh != r->statsLayoutFbh ||
+      scale != r->statsLayoutScale)
+    return true;
+  size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
+  if (n != r->statsSeriesCacheCount)
+    return true;
+  for (size_t i = 0; i < n; i++) {
+    const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, i);
+    if (!series)
+      continue;
+    if (series->revision != r->statsSeriesRevisions[i])
+      return true;
+  }
+  return false;
+}
+
+/** Rebuilds overlay primitives when stat data or layout changed; uploads
+ *  (grow-only buffer). */
 static void uploadStats(grRenderer *r, double fbw, double fbh) {
+  if (!r->statsVisible) {
+    r->statsPrimCount = 0;
+    return;
+  }
+  if (!statsOverlayNeedsRebuild(r, fbw, fbh))
+    return;
+
   r->statsPrimCount = 0;
-  if (r->statsVisible)
-    grStatsOverlayBuild(r, fbw, fbh);
+  grStatsOverlayBuild(r, fbw, fbh);
+  statsRevisionCacheSync(r, fbw, fbh);
   if (r->statsPrimCount == 0)
     return;
 
@@ -1015,6 +1276,7 @@ bool grRendererFrame(grRenderer *r) {
   processInput(r, fbw, fbh);
 
   if (r->graph) {
+    statsMenuSyncIfNeeded(r);
     uint64_t rev = gvizEmbeddedGraphDrawMaskRevision(r->graph);
     if (rev != r->drawMaskRevision) {
       r->drawMaskRevision = rev;

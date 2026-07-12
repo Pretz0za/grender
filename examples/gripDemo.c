@@ -1,7 +1,7 @@
 /**
  * Live GRIP embedding demo.
  *
- * A rectangular mesh is embedded by gviz's GRIP embedder while grender draws
+ * A Möbius strip mesh is embedded by gviz's GRIP embedder while grender draws
  * every frame, demonstrating online rendering (spec 3) and creator-defined
  * actions (spec 4): the GRIP embedder registers "grip.refineRound" and
  * "grip.nextStage" on its embedded graph; this app merely binds keys to those
@@ -16,9 +16,10 @@
  *   drag   - pan (2D) / orbit (3D)
  *   scroll - zoom
  *
- * Usage: gripDemo [meshWidth] [meshHeight] [dim(2|3)] [screenshot.ppm]
+ * Usage: gripDemo [rows] [cols] [dim(2|3|4)] [screenshot.ppm] [noStats]
  *
- * When a screenshot path is given, the demo runs the embedding for a fixed
+ * Pass noStats (or --no-stats) as the last argument to disable GRIP stat
+ * collection at init time; grender needs no changes (zero series registered).
  * number of frames, saves the image, and exits (used for automated checks).
  */
 
@@ -33,22 +34,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-// static gvizGraph buildRectMesh(size_t w, size_t h) {
-//   gvizGraph g;
-//   gvizGraphInitAtCapacity(&g, 0, w * h);
-//   for (size_t i = 0; i < w * h; i++)
-//     gvizGraphAddVertex(&g, NULL, NULL, NULL);
-//   for (size_t y = 0; y < h; y++)
-//     for (size_t x = 0; x < w; x++) {
-//       if (x + 1 < w)
-//         gvizGraphAddEdge(&g, y * w + x, y * w + x + 1);
-//       if (y + 1 < h)
-//         gvizGraphAddEdge(&g, y * w + x, (y + 1) * w + x);
-//     }
-//   return g;
-// }
-//
 /** Demo-owned action: toggles the auto-refine flag. Registered on the embedded
  *  graph like any embedder action would be. */
 static void actionToggleAuto(gvizEmbeddedGraph *eg, void *userData,
@@ -60,33 +47,38 @@ static void actionToggleAuto(gvizEmbeddedGraph *eg, void *userData,
 }
 
 int main(int argc, char **argv) {
-  // size_t meshW = argc > 1 ? (size_t)atoi(argv[1]) : 120;
-  // size_t meshH = argc > 2 ? (size_t)atoi(argv[2]) : 80;
-  size_t depth = argc > 1 ? (size_t)atoi(argv[1]) : 6;
-  size_t dim = argc > 2 ? (size_t)atoi(argv[2]) : 2;
-  const char *screenshotPath = argc > 4 ? argv[4] : NULL;
-  if (dim != 2 && dim != 3) {
-    fprintf(stderr, "dim must be 2 or 3\n");
+  size_t rows = argc > 1 ? (size_t)atoi(argv[1]) : 24;
+  size_t cols = argc > 2 ? (size_t)atoi(argv[2]) : 48;
+  size_t dim = argc > 3 ? (size_t)atoi(argv[3]) : 3;
+  const char *screenshotPath = NULL;
+  bool gripStats = true;
+  for (int i = 4; i < argc; i++) {
+    if (!strcmp(argv[i], "noStats") || !strcmp(argv[i], "--no-stats"))
+      gripStats = false;
+    else if (!screenshotPath)
+      screenshotPath = argv[i];
+  }
+  if (dim != 2 && dim != 3 && dim != 4) {
+    fprintf(stderr, "dim must be 2, 3, or 4\n");
     return 1;
   }
 
-  // gvizGraph graph = buildRectMesh(meshW, meshH);
-  // gvizGraph graph = build_sierpinski_carpet(depth);
-  gvizGraph graph = createSierpinskiTetrahedron(depth, NULL);
+  size_t depth = rows;
+  gvizGraph graph = createSierpinski(depth, NULL);
   gvizGraphBuildLayout(&graph);
   gvizSubgraph sg = gvizSubgraphCreateFull(&graph);
 
-  gvizGRIPState grip;
-  // size_t diameter = (meshW - 1) + (meshH - 1);
-  size_t diameter = pow(3, depth) + 64;
-  
+  gvizGRIPState grip = {0};
+  size_t diameter = rows + cols + 64;
+
+  if (!gripStats)
+    gvizGRIPEmbedderConfigureStats(&grip, false);
   if (gvizGRIPEmbedderInit(&grip, sg, diameter, dim) < 0) {
     fprintf(stderr, "GRIP init failed\n");
     return 1;
   }
   gvizEmbeddedGraph *eg = (gvizEmbeddedGraph *)&grip;
-  gvizGRIPEmbedderConfigureK(&grip, 64, 32, 64, GVIZ_GRIP_K_PLACEMENT_DECAY);
-
+  gvizGRIPEmbedderConfigureK(&grip, 128, 128, 128, GVIZ_GRIP_K_CONSTANT);
 
   gvizGRIPEmbedderBegin(&grip);
 
@@ -96,7 +88,7 @@ int main(int argc, char **argv) {
 
   grRendererDesc desc;
   grRendererDescInit(&desc);
-  desc.title = "grender - GRIP (R: refine, N: next stage, space: auto)";
+  desc.title = "grender - GRIP Möbius (R: refine, N: next stage, space: auto)";
   desc.nodeStyle.radius = 2.5f;
   desc.nodeStyle.fillColor = GR_COLOR(0.55f, 0.78f, 1.0f, 1.0f);
   desc.edgeStyle.color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.35f);
@@ -115,26 +107,28 @@ int main(int argc, char **argv) {
   grRendererBindKey(r, 'N', "grip.nextStage");
   grRendererBindKey(r, GR_KEY_SPACE, "demo.toggleAuto");
 
-  const size_t roundsPerStage = SIZE_MAX;
-  size_t frameCount = 0;
+  const size_t roundsPerStage = screenshotPath ? 150 : SIZE_MAX;
   while (grRendererFrame(r)) {
-    // Drive the embedder from the frame loop; the renderer re-reads positions
-    // automatically, no notification needed for position changes.
     if (autoRefine) {
-      if (grip.currRound >= roundsPerStage && grip.currLayer > 0)
-        beginNewStage(&grip);
-      else if (grip.currRound < roundsPerStage)
+      if (grip.currRound >= roundsPerStage) {
+        if (screenshotPath) {
+          char path[512];
+          snprintf(path, sizeof(path), "%s.layer%zu.ppm", screenshotPath,
+                   grip.currLayer);
+          grRendererFitView(r);
+          grRendererFrame(r);
+          if (grRendererSaveScreenshot(r, path) == 0)
+            printf("screenshot saved to %s\n", path);
+          else
+            fprintf(stderr, "screenshot failed\n");
+        }
+        if (grip.currLayer == 0)
+          grRendererRequestClose(r);
+        else
+          beginNewStage(&grip);
+      } else {
         runRefinementRound(&grip);
-    }
-
-    if (screenshotPath && ++frameCount == 240) {
-      grRendererFitView(r);       // reframe before capturing
-      grRendererFrame(r);         // let the fit apply
-      if (grRendererSaveScreenshot(r, screenshotPath) == 0)
-        printf("screenshot saved to %s\n", screenshotPath);
-      else
-        fprintf(stderr, "screenshot failed\n");
-      grRendererRequestClose(r);
+      }
     }
   }
 

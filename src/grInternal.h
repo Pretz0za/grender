@@ -102,12 +102,31 @@ struct grRenderer;
  */
 void grStatsOverlayBuild(struct grRenderer *r, double fbw, double fbh);
 
+/**
+ * PCA-project @p n vertex-major points from @p srcDim to 3D into @p dst
+ * (n * 3 floats). Falls back to copying the leading components when
+ * @p srcDim <= 3.
+ *
+ * @p basisOut/@p basisIn hold srcDim * 3 eigenvectors (row-major); pass NULL
+ * to ignore. When @p basisIn is set, signs are aligned to reduce frame jumps.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int grPCAProjectTo3(const double *src, size_t n, size_t srcDim, float *dst,
+                    double *basisOut, const double *basisIn);
+
 // ------------------------------------------------------------------------------
 // Platform
 // ------------------------------------------------------------------------------
 
 /** Creates a WGPUSurface for @p window (per-OS implementation). */
 WGPUSurface grPlatformCreateSurface(WGPUInstance instance, GLFWwindow *window);
+
+/** macOS: registers the app and installs the menu bar; no-op elsewhere. */
+void grPlatformInitApplication(void);
+
+/** Refreshes the Charts submenu from the attached graph's stat series. */
+void grPlatformStatsMenuRefresh(struct grRenderer *r);
 
 // ------------------------------------------------------------------------------
 // Renderer
@@ -144,6 +163,9 @@ struct grRenderer {
   WGPUAdapter adapter;
   WGPUDevice device;
   WGPUQueue queue;
+  /** From @ref wgpuDeviceGetLimits after creation; used to validate uploads. */
+  uint64_t maxStorageBufferBindingSize;
+  uint64_t maxBufferSize;
   WGPUSurfaceConfiguration surfaceConfig;
   WGPUTextureFormat surfaceFormat;
   bool surfaceDirty; /**< Reconfigure surface + depth before next frame. */
@@ -164,8 +186,11 @@ struct grRenderer {
   bool topoDirty;
   uint64_t drawMaskRevision;
   size_t posCapacity;   /**< Vertices the GPU buffers are sized for. */
-  size_t posDim;
+  size_t srcDim;        /**< Embedding dimension from the attached graph. */
+  size_t posDim;        /**< Dimension uploaded to the GPU (3 when srcDim==4). */
   float *posStaging;    /**< Persistent double->float conversion buffer. */
+  double pcaBasis[48];  /**< Cached PCA eigenvectors (up to 4D * 3). */
+  bool pcaBasisValid;
   WGPUBuffer globalsBuf;
   WGPUBuffer positionsBuf;
   WGPUBuffer nodeIdsBuf;
@@ -185,10 +210,18 @@ struct grRenderer {
 
   // stats overlay
   bool statsVisible;
-  grStatsPrim *statsPrims; /**< CPU staging list, rebuilt per frame. */
+  grStatsPrim *statsPrims; /**< CPU staging list; rebuilt when series revision
+                                or layout changes. */
   size_t statsPrimCount, statsPrimCapacity;
   WGPUBuffer statsBuf;
   size_t statsBufCapacity; /**< In primitives. */
+  uint64_t *statsSeriesRevisions; /**< Cached gvizStatSeries.revision per index. */
+  size_t statsSeriesCacheCount, statsSeriesCacheCapacity;
+  bool *statsSeriesVisible; /**< Per-series chart visibility (render only). */
+  size_t statsSeriesVisibleCount;
+  size_t statsMenuSeriesCount; /**< Last series count synced to the macOS menu. */
+  double statsLayoutFbw, statsLayoutFbh, statsLayoutScale;
+  bool statsOverlayDirty;
 
   // camera + input
   grCamera camera;
