@@ -92,6 +92,19 @@ grender only consumes the public gviz API (`gvizEmbeddedGraph`,
 `graphvis` static library. **Do not modify gviz embedder code from grender
 unless you are intentionally fixing or extending gviz itself.**
 
+### Data structures: use gviz's, never reimplement
+
+gviz ships generic, reusable data structures under `ds/` (`gvizArray`,
+`gvizGraph`, `gvizSubgraph`, `gvizDeque`, `gvizBitArray`, `gvizTree`, ...) and
+grender already links against them. In particular, **any growable/dynamic
+array in grender must be a `gvizArray`** (`#include "ds/gvizArray.h"`) — never
+a hand-rolled `malloc`/`realloc`-doubling loop. This applies just as much to
+grender-internal state (pending input queues, key/mouse bindings, staging
+buffers, ...) as to anything that touches gviz graphs directly. Before adding
+a new container of any kind, check whether gviz already provides it; the goal
+is one implementation of each data structure in the combined codebase, not
+one per call site.
+
 ### Graph layout before subgraphs
 
 `gvizSubgraphCreateFull` returns an **empty** subgraph (null graph pointer)
@@ -193,12 +206,19 @@ include/grender/grender.h   public API (the only header consumers include)
 src/grRenderer.c            device setup, frame loop, input, GPU buffers
 src/grCamera.c              2D ortho + 3D orbit camera, picking math
 src/grTopology.c            the only code that reads gviz structure
+src/grStats.c               stats overlay: chart layout, text, primitive list
+src/grPCA.c                 4D -> 3D PCA projection (OpenBLAS)
+src/grObjMesh.c             .obj mesh parsing for the object overlay
+src/grObjOverlay.c          object overlay: own pipelines, camera, render pass
 src/grShaders.h             WGSL (instanced nodes/edges, vertex pulling)
 src/grSurfaceCocoa.m        macOS CAMetalLayer surface glue
+src/grMenuCocoa.m           macOS menu bar (Charts submenu, ...)
+src/grPlatformMenu.c        non-macOS no-op menu stub
 examples/gripDemo.c         live GRIP embedding with bound actions
 examples/treeDemo.c       Reingold-Tilford tree layout (gvizEmbeddedTree)
 examples/datasetDemo.c    GRIP on graphs from gviz data/
 examples/millionDemo.c      1M-vertex online-update stress test
+examples/tutteDemo.c        live Tutte embedding; optional object overlay
 ```
 
 `grRendererSaveScreenshot` renders the current scene offscreen and writes a

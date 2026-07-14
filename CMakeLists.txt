@@ -85,6 +85,8 @@ add_library(grender STATIC
     src/grTopology.c
     src/grStats.c
     src/grPCA.c
+    src/grObjMesh.c
+    src/grObjOverlay.c
 )
 
 if(APPLE)

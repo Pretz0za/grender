@@ -274,17 +274,8 @@ static void onKey(GLFWwindow *window, int key, int scancode, int action,
   if (!r || (action != GLFW_PRESS && action != GLFW_REPEAT))
     return;
 
-  if (r->pendingKeyCount == r->pendingKeyCapacity) {
-    size_t cap = r->pendingKeyCapacity ? r->pendingKeyCapacity * 2 : 16;
-    void *grown = realloc(r->pendingKeys, cap * sizeof(*r->pendingKeys));
-    if (!grown)
-      return;
-    r->pendingKeys = grown;
-    r->pendingKeyCapacity = cap;
-  }
-  r->pendingKeys[r->pendingKeyCount].key = key;
-  r->pendingKeys[r->pendingKeyCount].mods = mods;
-  r->pendingKeyCount++;
+  grPendingKey pk = {key, mods};
+  gvizArrayPush(&r->pendingKeys, &pk);
 }
 
 static void onMouseButton(GLFWwindow *window, int button, int action, int mods) {
@@ -311,19 +302,8 @@ static void onMouseButton(GLFWwindow *window, int button, int action, int mods) 
   double cx, cy;
   glfwGetCursorPos(window, &cx, &cy);
 
-  if (r->pendingMouseCount == r->pendingMouseCapacity) {
-    size_t cap = r->pendingMouseCapacity ? r->pendingMouseCapacity * 2 : 8;
-    void *grown = realloc(r->pendingMouse, cap * sizeof(*r->pendingMouse));
-    if (!grown)
-      return;
-    r->pendingMouse = grown;
-    r->pendingMouseCapacity = cap;
-  }
-  r->pendingMouse[r->pendingMouseCount].button = button;
-  r->pendingMouse[r->pendingMouseCount].mods = mods;
-  r->pendingMouse[r->pendingMouseCount].xPx = cx * r->contentScale;
-  r->pendingMouse[r->pendingMouseCount].yPx = cy * r->contentScale;
-  r->pendingMouseCount++;
+  grPendingMouse pm = {button, mods, cx * r->contentScale, cy * r->contentScale};
+  gvizArrayPush(&r->pendingMouse, &pm);
 }
 
 // ------------------------------------------------------------------------------
@@ -344,6 +324,12 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   r->nodeStyle = descIn->nodeStyle;
   r->edgeStyle = descIn->edgeStyle;
   r->statsVisible = true;
+  gvizArrayInit(&r->statsPrims, sizeof(grStatsPrim));
+  gvizArrayInit(&r->statsSeriesRevisions, sizeof(uint64_t));
+  gvizArrayInit(&r->bindings, sizeof(grKeyBinding));
+  gvizArrayInit(&r->mouseBindings, sizeof(grMouseBinding));
+  gvizArrayInit(&r->pendingKeys, sizeof(grPendingKey));
+  gvizArrayInit(&r->pendingMouse, sizeof(grPendingMouse));
   grCameraInit2D(&r->camera);
 
 #ifdef __APPLE__
@@ -491,6 +477,7 @@ void grRendererDestroy(grRenderer *r) {
   GR_RELEASE(wgpuBufferRelease, r->edgeColorsBuf);
   GR_RELEASE(wgpuBufferRelease, r->statsBuf);
   GR_RELEASE(wgpuBindGroupRelease, r->bindGroup);
+  grObjOverlayRelease(r);
   GR_RELEASE(wgpuRenderPipelineRelease, r->nodePipeline);
   GR_RELEASE(wgpuRenderPipelineRelease, r->edgePipeline);
   GR_RELEASE(wgpuRenderPipelineRelease, r->statsPipeline);
@@ -509,13 +496,13 @@ void grRendererDestroy(grRenderer *r) {
 
   grTopologyRelease(&r->topo);
   free(r->posStaging);
-  free(r->statsPrims);
-  free(r->statsSeriesRevisions);
+  gvizArrayRelease(&r->statsPrims);
+  gvizArrayRelease(&r->statsSeriesRevisions);
   free(r->statsSeriesVisible);
-  free(r->bindings);
-  free(r->mouseBindings);
-  free(r->pendingKeys);
-  free(r->pendingMouse);
+  gvizArrayRelease(&r->bindings);
+  gvizArrayRelease(&r->mouseBindings);
+  gvizArrayRelease(&r->pendingKeys);
+  gvizArrayRelease(&r->pendingMouse);
   free(r);
 }
 
@@ -590,7 +577,7 @@ void grRendererShowStats(grRenderer *r, bool show) {
   if (show)
     r->statsOverlayDirty = true;
   else
-    r->statsPrimCount = 0;
+    r->statsPrims.count = 0;
   grPlatformStatsMenuRefresh(r);
 }
 
@@ -756,12 +743,9 @@ int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
     return -1;
   r->topoDirty = false;
   r->drawMaskRevision = gvizEmbeddedGraphDrawMaskRevision(graph);
-  free(r->statsSeriesRevisions);
-  r->statsSeriesRevisions = NULL;
-  r->statsSeriesCacheCount = 0;
-  r->statsSeriesCacheCapacity = 0;
+  r->statsSeriesRevisions.count = 0;
   r->statsOverlayDirty = true;
-  r->statsPrimCount = 0;
+  r->statsPrims.count = 0;
   r->pcaBasisValid = false;
   statsVisibilitySync(r);
   r->statsMenuSeriesCount = gvizEmbeddedGraphStatSeriesCount(graph);
@@ -844,58 +828,44 @@ size_t grRendererGetEdges(const grRenderer *r, uint32_t *out) {
 // ------------------------------------------------------------------------------
 
 int grRendererBindKey(grRenderer *r, int key, const char *actionName) {
-  for (size_t i = 0; i < r->bindingCount; i++) {
-    if (r->bindings[i].key == key) {
-      r->bindings[i].actionName = actionName;
+  grKeyBinding *bindings = r->bindings.arr;
+  for (size_t i = 0; i < r->bindings.count; i++) {
+    if (bindings[i].key == key) {
+      bindings[i].actionName = actionName;
       return 0;
     }
   }
-  if (r->bindingCount == r->bindingCapacity) {
-    size_t cap = r->bindingCapacity ? r->bindingCapacity * 2 : 8;
-    grKeyBinding *grown = realloc(r->bindings, cap * sizeof(grKeyBinding));
-    if (!grown)
-      return -1;
-    r->bindings = grown;
-    r->bindingCapacity = cap;
-  }
-  r->bindings[r->bindingCount++] = (grKeyBinding){key, actionName};
-  return 0;
+  grKeyBinding kb = {key, actionName};
+  return gvizArrayPush(&r->bindings, &kb);
 }
 
 void grRendererUnbindKey(grRenderer *r, int key) {
-  for (size_t i = 0; i < r->bindingCount; i++) {
-    if (r->bindings[i].key == key) {
-      r->bindings[i] = r->bindings[--r->bindingCount];
+  grKeyBinding *bindings = r->bindings.arr;
+  for (size_t i = 0; i < r->bindings.count; i++) {
+    if (bindings[i].key == key) {
+      gvizArraySwapDelete(&r->bindings, i);
       return;
     }
   }
 }
 
 int grRendererBindMouse(grRenderer *r, int button, const char *actionName) {
-  for (size_t i = 0; i < r->mouseBindingCount; i++) {
-    if (r->mouseBindings[i].button == button) {
-      r->mouseBindings[i].actionName = actionName;
+  grMouseBinding *mouseBindings = r->mouseBindings.arr;
+  for (size_t i = 0; i < r->mouseBindings.count; i++) {
+    if (mouseBindings[i].button == button) {
+      mouseBindings[i].actionName = actionName;
       return 0;
     }
   }
-  if (r->mouseBindingCount == r->mouseBindingCapacity) {
-    size_t cap = r->mouseBindingCapacity ? r->mouseBindingCapacity * 2 : 4;
-    grMouseBinding *grown =
-        realloc(r->mouseBindings, cap * sizeof(grMouseBinding));
-    if (!grown)
-      return -1;
-    r->mouseBindings = grown;
-    r->mouseBindingCapacity = cap;
-  }
-  r->mouseBindings[r->mouseBindingCount++] =
-      (grMouseBinding){button, actionName};
-  return 0;
+  grMouseBinding mb = {button, actionName};
+  return gvizArrayPush(&r->mouseBindings, &mb);
 }
 
 void grRendererUnbindMouse(grRenderer *r, int button) {
-  for (size_t i = 0; i < r->mouseBindingCount; i++) {
-    if (r->mouseBindings[i].button == button) {
-      r->mouseBindings[i] = r->mouseBindings[--r->mouseBindingCount];
+  grMouseBinding *mouseBindings = r->mouseBindings.arr;
+  for (size_t i = 0; i < r->mouseBindings.count; i++) {
+    if (mouseBindings[i].button == button) {
+      gvizArraySwapDelete(&r->mouseBindings, i);
       return;
     }
   }
@@ -1208,14 +1178,16 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
 
   // Key dispatch: built-in fit on F unless the app bound F itself.
-  for (size_t k = 0; k < r->pendingKeyCount; k++) {
-    int key = r->pendingKeys[k].key;
-    int mods = r->pendingKeys[k].mods;
+  const grPendingKey *pendingKeys = r->pendingKeys.arr;
+  const grKeyBinding *bindings = r->bindings.arr;
+  for (size_t k = 0; k < r->pendingKeys.count; k++) {
+    int key = pendingKeys[k].key;
+    int mods = pendingKeys[k].mods;
 
     const char *actionName = NULL;
-    for (size_t i = 0; i < r->bindingCount; i++) {
-      if (r->bindings[i].key == key) {
-        actionName = r->bindings[i].actionName;
+    for (size_t i = 0; i < r->bindings.count; i++) {
+      if (bindings[i].key == key) {
+        actionName = bindings[i].actionName;
         break;
       }
     }
@@ -1237,16 +1209,18 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     payload.iarg = mods; // GLFW mod bits match GR_MOD_*
     gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
   }
-  r->pendingKeyCount = 0;
+  r->pendingKeys.count = 0;
 
-  for (size_t m = 0; m < r->pendingMouseCount; m++) {
-    int button = r->pendingMouse[m].button;
-    int mods = r->pendingMouse[m].mods;
+  const grPendingMouse *pendingMouse = r->pendingMouse.arr;
+  const grMouseBinding *mouseBindings = r->mouseBindings.arr;
+  for (size_t m = 0; m < r->pendingMouse.count; m++) {
+    int button = pendingMouse[m].button;
+    int mods = pendingMouse[m].mods;
 
     const char *actionName = NULL;
-    for (size_t i = 0; i < r->mouseBindingCount; i++) {
-      if (r->mouseBindings[i].button == button) {
-        actionName = r->mouseBindings[i].actionName;
+    for (size_t i = 0; i < r->mouseBindings.count; i++) {
+      if (mouseBindings[i].button == button) {
+        actionName = mouseBindings[i].actionName;
         break;
       }
     }
@@ -1254,14 +1228,14 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
       continue;
 
     gvizActionPayload payload = {0};
-    grCameraUnproject(&r->camera, &r->cameraFrame, r->pendingMouse[m].xPx,
-                      r->pendingMouse[m].yPx, fbw, fbh, &payload.worldX,
+    grCameraUnproject(&r->camera, &r->cameraFrame, pendingMouse[m].xPx,
+                      pendingMouse[m].yPx, fbw, fbh, &payload.worldX,
                       &payload.worldY);
     payload.deltaTime = r->deltaTime;
     payload.iarg = mods;
     gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
   }
-  r->pendingMouseCount = 0;
+  r->pendingMouse.count = 0;
 }
 
 // ------------------------------------------------------------------------------
@@ -1314,30 +1288,15 @@ static void uploadPositions(grRenderer *r) {
                        sizeof(float) * n * r->posDim);
 }
 
-static int statsRevisionCacheEnsure(grRenderer *r, size_t n) {
-  if (n <= r->statsSeriesCacheCapacity)
-    return 0;
-  size_t cap = r->statsSeriesCacheCapacity ? r->statsSeriesCacheCapacity * 2 : 4;
-  while (cap < n)
-    cap *= 2;
-  uint64_t *grown =
-      realloc(r->statsSeriesRevisions, cap * sizeof(uint64_t));
-  if (!grown)
-    return -1;
-  r->statsSeriesRevisions = grown;
-  r->statsSeriesCacheCapacity = cap;
-  return 0;
-}
-
 static void statsRevisionCacheSync(grRenderer *r, double fbw, double fbh) {
   size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
-  if (statsRevisionCacheEnsure(r, n) < 0)
-    return;
+  r->statsSeriesRevisions.count = 0;
   for (size_t i = 0; i < n; i++) {
     const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, i);
-    r->statsSeriesRevisions[i] = series ? series->revision : 0;
+    uint64_t rev = series ? series->revision : 0;
+    if (gvizArrayPush(&r->statsSeriesRevisions, &rev) < 0)
+      return;
   }
-  r->statsSeriesCacheCount = n;
   r->statsLayoutFbw = fbw;
   r->statsLayoutFbh = fbh;
   r->statsLayoutScale = r->contentScale > 0.0 ? r->contentScale : 1.0;
@@ -1352,13 +1311,14 @@ static bool statsOverlayNeedsRebuild(grRenderer *r, double fbw, double fbh) {
       scale != r->statsLayoutScale)
     return true;
   size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
-  if (n != r->statsSeriesCacheCount)
+  if (n != r->statsSeriesRevisions.count)
     return true;
+  const uint64_t *cached = r->statsSeriesRevisions.arr;
   for (size_t i = 0; i < n; i++) {
     const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, i);
     if (!series)
       continue;
-    if (series->revision != r->statsSeriesRevisions[i])
+    if (series->revision != cached[i])
       return true;
   }
   return false;
@@ -1368,33 +1328,33 @@ static bool statsOverlayNeedsRebuild(grRenderer *r, double fbw, double fbh) {
  *  (grow-only buffer). */
 static void uploadStats(grRenderer *r, double fbw, double fbh) {
   if (!r->statsVisible) {
-    r->statsPrimCount = 0;
+    r->statsPrims.count = 0;
     return;
   }
   if (!statsOverlayNeedsRebuild(r, fbw, fbh))
     return;
 
-  r->statsPrimCount = 0;
+  r->statsPrims.count = 0;
   grStatsOverlayBuild(r, fbw, fbh);
   statsRevisionCacheSync(r, fbw, fbh);
-  if (r->statsPrimCount == 0)
+  if (r->statsPrims.count == 0)
     return;
 
-  if (r->statsPrimCount > r->statsBufCapacity) {
+  if (r->statsPrims.count > r->statsBufCapacity) {
     GR_RELEASE(wgpuBufferRelease, r->statsBuf);
-    r->statsBufCapacity = r->statsPrimCount * 2;
+    r->statsBufCapacity = r->statsPrims.count * 2;
     r->statsBuf = createBuffer(
         r, sizeof(grStatsPrim) * r->statsBufCapacity,
         WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
         "grender stats prims");
     r->bindGroupDirty = true;
     if (!r->statsBuf) {
-      r->statsPrimCount = 0;
+      r->statsPrims.count = 0;
       return;
     }
   }
-  wgpuQueueWriteBuffer(r->queue, r->statsBuf, 0, r->statsPrims,
-                       sizeof(grStatsPrim) * r->statsPrimCount);
+  wgpuQueueWriteBuffer(r->queue, r->statsBuf, 0, r->statsPrims.arr,
+                       sizeof(grStatsPrim) * r->statsPrims.count);
 }
 
 /** Encodes the scene render pass (clear + edges + nodes) into @p target. */
@@ -1442,9 +1402,9 @@ static void encodeScenePass(grRenderer *r, WGPUCommandEncoder encoder,
     }
 
     // Stats overlay always draws on top of the scene.
-    if (r->statsPrimCount) {
+    if (r->statsPrims.count) {
       wgpuRenderPassEncoderSetPipeline(pass, r->statsPipeline);
-      wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->statsPrimCount, 0, 0);
+      wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->statsPrims.count, 0, 0);
     }
   }
 
@@ -1499,6 +1459,7 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
 
   WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(r->device, NULL);
   encodeScenePass(r, encoder, targetView, r->depthView);
+  grObjOverlayEncode(r, encoder, targetView, r->depthView, w, h);
   wgpuCommandEncoderCopyTextureToBuffer(
       encoder,
       &(const WGPUTexelCopyTextureInfo){.texture = target},
@@ -1584,6 +1545,7 @@ bool grRendererFrame(grRenderer *r) {
   }
 
   processInput(r, fbw, fbh);
+  grObjOverlayUpdate(r, r->deltaTime);
 
   if (r->graph) {
     statsMenuSyncIfNeeded(r);
@@ -1633,6 +1595,7 @@ bool grRendererFrame(grRenderer *r) {
       &(const WGPUCommandEncoderDescriptor){.label = {"grender", WGPU_STRLEN}});
 
   encodeScenePass(r, encoder, frame, r->depthView);
+  grObjOverlayEncode(r, encoder, frame, r->depthView, fbw, fbh);
 
   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
   wgpuQueueSubmit(r->queue, 1, &commands);

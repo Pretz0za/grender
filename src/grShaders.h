@@ -235,4 +235,77 @@ static const char GR_WGSL_SOURCE[] =
     "  return vec4f(in.color.rgb, in.color.a * coverage);\n"
     "}\n";
 
+/**
+ * WGSL for the object overlay: a small self-contained panel (background +
+ * border, then a triangle mesh lit with a fixed camera-relative light) drawn
+ * into its own render pass with the viewport/scissor restricted to the panel
+ * rect. Layout must match grObjOverlayUBO and the bind group in
+ * grObjOverlay.c.
+ */
+static const char GR_WGSL_OBJ_SOURCE[] =
+    "struct ObjGlobals {\n"
+    "  viewProj    : mat4x4f,\n"
+    "  lightDir    : vec4f,\n"
+    "  baseColor   : vec4f,\n"
+    "  panelSizePx : vec4f,\n" // xy used
+    "}\n"
+    "\n"
+    "@group(0) @binding(0) var<uniform> OG : ObjGlobals;\n"
+    "@group(0) @binding(1) var<storage, read> objPositions : array<f32>;\n"
+    "@group(0) @binding(2) var<storage, read> objNormals   : array<f32>;\n"
+    "@group(0) @binding(3) var<storage, read> objIndices   : array<u32>;\n"
+    "\n"
+    "const OBJ_CORNERS = array<vec2f, 6>(\n"
+    "  vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),\n"
+    "  vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));\n"
+    "\n"
+    // -------------------------------------------------------- panel bg --
+    "struct ObjBgOut {\n"
+    "  @builtin(position) clip : vec4f,\n"
+    "  @location(0) uv : vec2f,\n"
+    "}\n"
+    "\n"
+    "@vertex\n"
+    "fn vsObjBg(@builtin(vertex_index) vid : u32) -> ObjBgOut {\n"
+    "  let corner = OBJ_CORNERS[vid];\n"
+    "  return ObjBgOut(vec4f(corner, 0.999, 1.0), corner * 0.5 + 0.5);\n"
+    "}\n"
+    "\n"
+    "@fragment\n"
+    "fn fsObjBg(in : ObjBgOut) -> @location(0) vec4f {\n"
+    "  let edgePx = min(in.uv, vec2f(1.0) - in.uv) * OG.panelSizePx.xy;\n"
+    "  let dist = min(edgePx.x, edgePx.y);\n"
+    "  let border = 1.0 - smoothstep(1.5, 2.5, dist);\n"
+    "  let bg = vec4f(0.06, 0.07, 0.09, 0.88);\n"
+    "  let borderColor = vec4f(1.0, 1.0, 1.0, 0.22);\n"
+    "  return mix(bg, borderColor, border);\n"
+    "}\n"
+    "\n"
+    // ---------------------------------------------------------------- mesh --
+    "struct ObjOut {\n"
+    "  @builtin(position) clip : vec4f,\n"
+    "  @location(0) normal : vec3f,\n"
+    "}\n"
+    "\n"
+    "@vertex\n"
+    "fn vsObj(@builtin(vertex_index) vid : u32) -> ObjOut {\n"
+    "  let idx = objIndices[vid];\n"
+    "  let base = idx * 3u;\n"
+    "  let pos = vec3f(objPositions[base], objPositions[base + 1u],\n"
+    "                  objPositions[base + 2u]);\n"
+    "  let nrm = vec3f(objNormals[base], objNormals[base + 1u],\n"
+    "                  objNormals[base + 2u]);\n"
+    "  let clip = OG.viewProj * vec4f(pos, 1.0);\n"
+    "  return ObjOut(clip, nrm);\n"
+    "}\n"
+    "\n"
+    "@fragment\n"
+    "fn fsObj(in : ObjOut) -> @location(0) vec4f {\n"
+    "  let n = normalize(in.normal);\n"
+    "  let l = normalize(OG.lightDir.xyz);\n"
+    "  let diffuse = max(dot(n, l), 0.0);\n"
+    "  let shade = clamp(0.28 + diffuse * 0.85, 0.0, 1.0);\n"
+    "  return vec4f(OG.baseColor.rgb * shade, OG.baseColor.a);\n"
+    "}\n";
+
 #endif

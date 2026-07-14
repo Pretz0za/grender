@@ -3,7 +3,14 @@
 
 #include "grender/grender.h"
 
+#include "ds/gvizArray.h"
+
 #include <webgpu/webgpu.h>
+
+// grender never hand-rolls a growable array: gviz already provides gvizArray
+// (see ds/gvizArray.h) and every dynamically-sized list in this codebase
+// (pending input events, key/mouse bindings, stats primitives, ...) is one.
+// Reach for gvizArray before writing another malloc/realloc-doubling loop.
 
 typedef struct GLFWwindow GLFWwindow;
 
@@ -116,6 +123,81 @@ int grPCAProjectTo3(const double *src, size_t n, size_t srcDim, float *dst,
                     double *basisOut, const double *basisIn);
 
 // ------------------------------------------------------------------------------
+// Object overlay (rotating picture-in-picture preview of a loaded Wavefront
+// .obj mesh, fully independent of the attached embedded graph and its camera)
+// ------------------------------------------------------------------------------
+
+/** CPU-side triangle mesh parsed from a .obj file. Only 'v' and 'f' lines are
+ *  read; per-vertex normals are the area-weighted average of adjacent face
+ *  normals. Owns its arrays. */
+typedef struct grObjMesh {
+  float *positions;   /**< vertexCount * 3 (xyz). */
+  float *normals;     /**< vertexCount * 3 (xyz), unit length. */
+  uint32_t *indices;  /**< indexCount, 3 per triangle. */
+  size_t vertexCount;
+  size_t indexCount;
+  double bmin[3], bmax[3];
+} grObjMesh;
+
+int grObjMeshLoad(const char *path, grObjMesh *out);
+void grObjMeshRelease(grObjMesh *mesh);
+
+/** Must match struct ObjGlobals in grShaders.h. */
+typedef struct grObjOverlayUBO {
+  float viewProj[16];
+  float lightDir[4];
+  float baseColor[4];
+  float panelSizePx[4]; /**< xy used, zw padding. */
+} grObjOverlayUBO;
+
+typedef struct grObjOverlay {
+  bool loaded;
+  bool visible;
+  grObjMesh mesh;
+  grCamera camera; /**< Independent of grRenderer::camera; never reads input. */
+
+  WGPUShaderModule shaderModule;
+  WGPUBindGroupLayout bindGroupLayout;
+  WGPUPipelineLayout pipelineLayout;
+  WGPURenderPipeline bgPipeline;
+  WGPURenderPipeline meshPipeline;
+
+  WGPUBuffer uniformBuf;
+  WGPUBuffer positionsBuf;
+  WGPUBuffer normalsBuf;
+  WGPUBuffer indicesBuf;
+  WGPUBindGroup bindGroup;
+  bool bindGroupDirty;
+} grObjOverlay;
+
+/** Parses @p path and swaps it in as the overlay's mesh, replacing any
+ *  previous one. Lazily creates the overlay's GPU pipelines on first use.
+ *  Positions the overlay's own orbiting camera to fit the mesh.
+ *
+ * @return 0 on success, -1 on parse or GPU allocation failure. */
+int grObjOverlayLoad(grRenderer *r, const char *path);
+
+/** Frees the loaded mesh (CPU and GPU) and resets overlay state. Safe to call
+ *  with no mesh loaded. */
+void grObjOverlayClear(grRenderer *r);
+
+/** Advances the overlay's orbit camera by @p dt seconds. No-op when no mesh
+ *  is loaded. */
+void grObjOverlayUpdate(grRenderer *r, double dt);
+
+/** Encodes a render pass drawing the overlay panel into the bottom-left
+ *  corner of @p colorTarget, reusing @p depthView (cleared fresh) as its
+ *  depth attachment. No-op when no mesh is loaded, the overlay is hidden, or
+ *  the framebuffer is too small to fit the panel. */
+void grObjOverlayEncode(grRenderer *r, WGPUCommandEncoder encoder,
+                        WGPUTextureView colorTarget, WGPUTextureView depthView,
+                        double fbw, double fbh);
+
+/** Releases all GPU resources owned by the overlay. Called from
+ *  grRendererDestroy. */
+void grObjOverlayRelease(grRenderer *r);
+
+// ------------------------------------------------------------------------------
 // Platform
 // ------------------------------------------------------------------------------
 
@@ -141,6 +223,18 @@ typedef struct grMouseBinding {
   int button;
   const char *actionName;
 } grMouseBinding;
+
+typedef struct grPendingKey {
+  int key;
+  int mods;
+} grPendingKey;
+
+typedef struct grPendingMouse {
+  int button;
+  int mods;
+  double xPx;
+  double yPx;
+} grPendingMouse;
 
 /** Must match struct Globals in grShaders.h (16-byte aligned rows). */
 typedef struct grGlobalsUBO {
@@ -221,18 +315,20 @@ struct grRenderer {
 
   // stats overlay
   bool statsVisible;
-  grStatsPrim *statsPrims; /**< CPU staging list; rebuilt when series revision
-                                or layout changes. */
-  size_t statsPrimCount, statsPrimCapacity;
+  gvizArray statsPrims; /**< of grStatsPrim; CPU staging list, rebuilt when
+                             series revision or layout changes. */
   WGPUBuffer statsBuf;
   size_t statsBufCapacity; /**< In primitives. */
-  uint64_t *statsSeriesRevisions; /**< Cached gvizStatSeries.revision per index. */
-  size_t statsSeriesCacheCount, statsSeriesCacheCapacity;
+  gvizArray statsSeriesRevisions; /**< of uint64_t; cached
+                                       gvizStatSeries.revision per index. */
   bool *statsSeriesVisible; /**< Per-series chart visibility (render only). */
   size_t statsSeriesVisibleCount;
   size_t statsMenuSeriesCount; /**< Last series count synced to the macOS menu. */
   double statsLayoutFbw, statsLayoutFbh, statsLayoutScale;
   bool statsOverlayDirty;
+
+  // object overlay (rotating .obj mesh preview, independent of the graph)
+  grObjOverlay objOverlay;
 
   // camera + input
   grCamera camera;
@@ -244,22 +340,10 @@ struct grRenderer {
   bool fitRequested;
 
   // actions
-  grKeyBinding *bindings;
-  size_t bindingCount, bindingCapacity;
-  grMouseBinding *mouseBindings;
-  size_t mouseBindingCount, mouseBindingCapacity;
-  struct {
-    int key;
-    int mods;
-  } *pendingKeys;
-  size_t pendingKeyCount, pendingKeyCapacity;
-  struct {
-    int button;
-    int mods;
-    double xPx;
-    double yPx;
-  } *pendingMouse;
-  size_t pendingMouseCount, pendingMouseCapacity;
+  gvizArray bindings;      /**< of grKeyBinding. */
+  gvizArray mouseBindings; /**< of grMouseBinding. */
+  gvizArray pendingKeys;   /**< of grPendingKey. */
+  gvizArray pendingMouse;  /**< of grPendingMouse. */
   bool mouseDown[3];
   bool mouseDragged[3];
   double mousePressX, mousePressY;

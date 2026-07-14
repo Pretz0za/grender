@@ -300,6 +300,35 @@ bool grRendererStatSeriesShown(const grRenderer *r, size_t idx);
  */
 void grRendererShowStatSeries(grRenderer *r, size_t idx, bool show);
 
+// OBJECT OVERLAY: -----------------------------------------------------------
+//
+// Loads a Wavefront .obj mesh (only 'v' and 'f' lines are read; per-vertex
+// normals are computed from face windings) and renders it in a small panel
+// in the bottom-left corner, with its own camera that continuously orbits
+// the object. The overlay is fully decoupled from the main scene: it never
+// receives keyboard or mouse input, and its camera is independent of
+// grRenderer's own camera, so the usual pan/zoom/orbit controls keep
+// affecting only the main view.
+
+/** Loads @p path and shows it in the rotating object overlay panel,
+ *  replacing any previously loaded mesh. Positions the overlay's camera to
+ *  fit the mesh; call between grRendererCreate and the frame loop, or at any
+ *  point during it.
+ *
+ * @return 0 on success, -1 on file/parse error or GPU allocation failure. */
+int grRendererLoadObjOverlay(grRenderer *r, const char *path);
+
+/** Shows or hides the object overlay panel. No-op when no mesh is loaded.
+ *  Visible by default once a mesh is loaded. */
+void grRendererShowObjOverlay(grRenderer *r, bool show);
+
+/** Returns whether the object overlay is currently visible and has a mesh
+ *  loaded. */
+bool grRendererObjOverlayShown(const grRenderer *r);
+
+/** Releases the loaded mesh, if any, and hides the overlay. */
+void grRendererClearObjOverlay(grRenderer *r);
+
 /** Requests that the frame loop end; the next grRendererFrame returns false. */
 void grRendererRequestClose(grRenderer *r);
 

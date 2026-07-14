@@ -16,7 +16,12 @@
  *   drag     - pan
  *   scroll   - zoom
  *
- * Usage: tutteDemo [rows] [cols] [screenshot.ppm]
+ * Usage: tutteDemo [rows] [cols] [obj] [screenshot.ppm]
+ *
+ * When [obj] is given, its topology also drives the Tutte embedding (as
+ * before), and the same file is additionally loaded into grender's object
+ * overlay: a small always-rotating 3D preview of the source mesh in the
+ * bottom-left corner, independent of the main 2D Tutte view and its camera.
  */
 
 #include "algorithms/search/gvizConnectedComponents.h"
@@ -166,6 +171,9 @@ int main(int argc, char **argv) {
   grRendererBindKey(r, 'B', "tutte.fixOuterFace");
   grRendererBindKey(r, GR_KEY_SPACE, "demo.toggleAuto");
   grRendererBindMouse(r, GR_MOUSE_BUTTON_RIGHT, GR_ACTION_PICK_FACE);
+
+  if (obj && grRendererLoadObjOverlay(r, obj) < 0)
+    fprintf(stderr, "object overlay: failed to load '%s'\n", obj);
 
   const size_t stepsBeforeShot = screenshotPath ? 300 : SIZE_MAX;
   size_t totalSteps = 0;

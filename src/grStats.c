@@ -338,16 +338,7 @@ static const char *glyphRows(char c) {
 // ------------------------------------------------------------------------------
 
 static int pushPrim(grRenderer *r, grStatsPrim prim) {
-  if (r->statsPrimCount == r->statsPrimCapacity) {
-    size_t cap = r->statsPrimCapacity ? r->statsPrimCapacity * 2 : 1024;
-    grStatsPrim *grown = realloc(r->statsPrims, cap * sizeof(grStatsPrim));
-    if (!grown)
-      return -1;
-    r->statsPrims = grown;
-    r->statsPrimCapacity = cap;
-  }
-  r->statsPrims[r->statsPrimCount++] = prim;
-  return 0;
+  return gvizArrayPush(&r->statsPrims, &prim);
 }
 
 static void pushRect(grRenderer *r, double x0, double y0, double x1, double y1,
@@ -546,7 +537,7 @@ static void buildChart(grRenderer *r, const gvizStatSeries *series,
 }
 
 void grStatsOverlayBuild(grRenderer *r, double fbw, double fbh) {
-  r->statsPrimCount = 0;
+  r->statsPrims.count = 0;
   if (!r->graph)
     return;
 
