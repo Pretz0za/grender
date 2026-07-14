@@ -64,7 +64,8 @@ int main(int argc, char **argv) {
   }
 
   size_t depth = rows;
-  gvizGraph graph = createSierpinski(depth, NULL);
+  // gvizGraph graph = createSierpinski(depth, NULL);
+  gvizGraph graph = build_rect_mesh(rows, cols);
   gvizGraphBuildLayout(&graph);
   gvizSubgraph sg = gvizSubgraphCreateFull(&graph);
 
@@ -89,7 +90,7 @@ int main(int argc, char **argv) {
   grRendererDesc desc;
   grRendererDescInit(&desc);
   desc.title = "grender - GRIP Möbius (R: refine, N: next stage, space: auto)";
-  desc.nodeStyle.radius = 2.5f;
+  desc.nodeStyle.radius = 7.0f;
   desc.nodeStyle.fillColor = GR_COLOR(0.55f, 0.78f, 1.0f, 1.0f);
   desc.edgeStyle.color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.35f);
 

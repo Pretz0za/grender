@@ -149,7 +149,6 @@ int main(int argc, char **argv) {
 
   grRendererDestroy(r);
   gvizEmbeddedTreeRTRelease(&tree);
-  gvizSubgraphRelease(&sg);
   gvizGraphRelease(&graph);
   return 0;
 }

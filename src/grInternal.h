@@ -137,6 +137,11 @@ typedef struct grKeyBinding {
   const char *actionName;
 } grKeyBinding;
 
+typedef struct grMouseBinding {
+  int button;
+  const char *actionName;
+} grMouseBinding;
+
 /** Must match struct Globals in grShaders.h (16-byte aligned rows). */
 typedef struct grGlobalsUBO {
   float viewProj[16];
@@ -203,6 +208,12 @@ struct grRenderer {
   bool bindGroupDirty;
   bool hasNodeColors, hasNodeSizes, hasEdgeColors;
 
+  // highlight styling (subgraph lives on the attached gvizEmbeddedGraph)
+  bool highlightActive;
+  uint32_t highlightNodeRgba;
+  uint32_t highlightEdgeRgba;
+  bool highlightDirty;
+
   // style
   grColor clearColor;
   grNodeStyle nodeStyle;
@@ -235,11 +246,23 @@ struct grRenderer {
   // actions
   grKeyBinding *bindings;
   size_t bindingCount, bindingCapacity;
+  grMouseBinding *mouseBindings;
+  size_t mouseBindingCount, mouseBindingCapacity;
   struct {
     int key;
     int mods;
   } *pendingKeys;
   size_t pendingKeyCount, pendingKeyCapacity;
+  struct {
+    int button;
+    int mods;
+    double xPx;
+    double yPx;
+  } *pendingMouse;
+  size_t pendingMouseCount, pendingMouseCapacity;
+  bool mouseDown[3];
+  bool mouseDragged[3];
+  double mousePressX, mousePressY;
 
   // timing
   double lastFrameTime;

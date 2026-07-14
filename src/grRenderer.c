@@ -1,6 +1,10 @@
 #include "grInternal.h"
 #include "grShaders.h"
 
+#include "ds/gvizArray.h"
+#include "ds/gvizGraph.h"
+#include "ds/gvizSubgraph.h"
+
 #include <webgpu/wgpu.h> // wgpu-native extensions (wgpuDevicePoll)
 
 #include <GLFW/glfw3.h>
@@ -12,6 +16,9 @@
 #include <string.h>
 
 #define GR_LOG(...) fprintf(stderr, "[grender] " __VA_ARGS__)
+
+static void grenderActionPickFace(gvizEmbeddedGraph *eg, void *userData,
+                                  const gvizActionPayload *payload);
 
 // ------------------------------------------------------------------------------
 // Defaults
@@ -280,6 +287,45 @@ static void onKey(GLFWwindow *window, int key, int scancode, int action,
   r->pendingKeyCount++;
 }
 
+static void onMouseButton(GLFWwindow *window, int button, int action, int mods) {
+  grRenderer *r = glfwGetWindowUserPointer(window);
+  if (!r || button < 0 || button > 2)
+    return;
+
+  if (action == GLFW_PRESS) {
+    r->mouseDown[button] = true;
+    r->mouseDragged[button] = false;
+    glfwGetCursorPos(window, &r->mousePressX, &r->mousePressY);
+    (void)mods;
+    return;
+  }
+
+  if (action != GLFW_RELEASE)
+    return;
+
+  bool wasDown = r->mouseDown[button];
+  r->mouseDown[button] = false;
+  if (!wasDown || r->mouseDragged[button])
+    return;
+
+  double cx, cy;
+  glfwGetCursorPos(window, &cx, &cy);
+
+  if (r->pendingMouseCount == r->pendingMouseCapacity) {
+    size_t cap = r->pendingMouseCapacity ? r->pendingMouseCapacity * 2 : 8;
+    void *grown = realloc(r->pendingMouse, cap * sizeof(*r->pendingMouse));
+    if (!grown)
+      return;
+    r->pendingMouse = grown;
+    r->pendingMouseCapacity = cap;
+  }
+  r->pendingMouse[r->pendingMouseCount].button = button;
+  r->pendingMouse[r->pendingMouseCount].mods = mods;
+  r->pendingMouse[r->pendingMouseCount].xPx = cx * r->contentScale;
+  r->pendingMouse[r->pendingMouseCount].yPx = cy * r->contentScale;
+  r->pendingMouseCount++;
+}
+
 // ------------------------------------------------------------------------------
 // Lifecycle
 // ------------------------------------------------------------------------------
@@ -322,6 +368,7 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   glfwSetFramebufferSizeCallback(r->window, onFramebufferSize);
   glfwSetScrollCallback(r->window, onScroll);
   glfwSetKeyCallback(r->window, onKey);
+  glfwSetMouseButtonCallback(r->window, onMouseButton);
 
   r->instance = wgpuCreateInstance(NULL);
   if (!r->instance)
@@ -466,7 +513,9 @@ void grRendererDestroy(grRenderer *r) {
   free(r->statsSeriesRevisions);
   free(r->statsSeriesVisible);
   free(r->bindings);
+  free(r->mouseBindings);
   free(r->pendingKeys);
+  free(r->pendingMouse);
   free(r);
 }
 
@@ -623,6 +672,7 @@ static int uploadTopology(grRenderer *r) {
 
   // Stale per-edge colors no longer match the edge ordering.
   r->hasEdgeColors = false;
+  r->highlightDirty = true;
   r->bindGroupDirty = true;
   return 0;
 }
@@ -693,6 +743,10 @@ int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
   }
 
   r->graph = graph;
+  gvizEmbeddedGraphAddAction(graph, GR_ACTION_PICK_FACE, grenderActionPickFace,
+                             r);
+  r->highlightActive = false;
+  r->highlightDirty = false;
   if (dim == 3 || dim == 4)
     grCameraInit3D(&r->camera);
   else
@@ -817,6 +871,227 @@ void grRendererUnbindKey(grRenderer *r, int key) {
   }
 }
 
+int grRendererBindMouse(grRenderer *r, int button, const char *actionName) {
+  for (size_t i = 0; i < r->mouseBindingCount; i++) {
+    if (r->mouseBindings[i].button == button) {
+      r->mouseBindings[i].actionName = actionName;
+      return 0;
+    }
+  }
+  if (r->mouseBindingCount == r->mouseBindingCapacity) {
+    size_t cap = r->mouseBindingCapacity ? r->mouseBindingCapacity * 2 : 4;
+    grMouseBinding *grown =
+        realloc(r->mouseBindings, cap * sizeof(grMouseBinding));
+    if (!grown)
+      return -1;
+    r->mouseBindings = grown;
+    r->mouseBindingCapacity = cap;
+  }
+  r->mouseBindings[r->mouseBindingCount++] =
+      (grMouseBinding){button, actionName};
+  return 0;
+}
+
+void grRendererUnbindMouse(grRenderer *r, int button) {
+  for (size_t i = 0; i < r->mouseBindingCount; i++) {
+    if (r->mouseBindings[i].button == button) {
+      r->mouseBindings[i] = r->mouseBindings[--r->mouseBindingCount];
+      return;
+    }
+  }
+}
+
+static uint32_t colorToRgba8(const grColor *c) {
+  return GR_RGBA8((uint32_t)(c->r * 255.0f + 0.5f),
+                (uint32_t)(c->g * 255.0f + 0.5f),
+                (uint32_t)(c->b * 255.0f + 0.5f),
+                (uint32_t)(c->a * 255.0f + 0.5f));
+}
+
+static void grHighlightReset(grRenderer *r) {
+  r->highlightActive = false;
+  r->highlightDirty = false;
+}
+
+static gvizSubgraph grHighlightCopySubgraph(const gvizSubgraph *src) {
+  gvizSubgraph dst = {0};
+  if (!src || !src->g)
+    return dst;
+
+  dst = gvizSubgraphCreateEmpty(src->g);
+  if (!dst.g)
+    return dst;
+
+  gvizSubgraphVertexIterator vit = gvizSubgraphVertexIteratorCreate(src);
+  size_t u;
+  while (gvizSubgraphVertexIterate(&vit, &u))
+    gvizSubgraphShowVertex(&dst, u);
+
+  vit = gvizSubgraphVertexIteratorCreate(src);
+  while (gvizSubgraphVertexIterate(&vit, &u)) {
+    gvizSubgraphNeighborIterator nit =
+        gvizSubgraphNeighborIteratorCreate(src, u);
+    size_t v;
+    while (gvizSubgraphNeighborIterate(&nit, &v)) {
+      if (gvizSubgraphHasEdge(src, u, v))
+        gvizSubgraphShowEdge(&dst, u, v);
+    }
+  }
+  gvizSubgraphRebuild(&dst);
+  return dst;
+}
+
+static int highlightHasEdge(const gvizSubgraph *sg, size_t u, size_t v) {
+  if (gvizSubgraphHasEdge(sg, u, v))
+    return 1;
+  if (u == v)
+    return 0;
+  return gvizSubgraphHasEdge(sg, v, u);
+}
+
+static void applyHighlightColors(grRenderer *r) {
+  if (!r->graph)
+    return;
+
+  if (!r->highlightActive || !gvizEmbeddedGraphHasHighlight(r->graph)) {
+    if (r->hasNodeColors || r->hasEdgeColors) {
+      grRendererSetNodeColors(r, NULL, 0);
+      grRendererSetEdgeColors(r, NULL, 0);
+    }
+    r->highlightDirty = false;
+    return;
+  }
+
+  if (!r->highlightDirty)
+    return;
+
+  const gvizSubgraph *highlight = gvizEmbeddedGraphGetHighlight(r->graph);
+  size_t nodeCount = r->posCapacity;
+  uint32_t *nodeColors = calloc(nodeCount, sizeof(uint32_t));
+  if (!nodeColors)
+    return;
+
+  uint32_t baseNode = colorToRgba8(&r->nodeStyle.fillColor);
+  for (size_t i = 0; i < nodeCount; i++)
+    nodeColors[i] = baseNode;
+
+  size_t u;
+  gvizSubgraphVertexIterator vit =
+      gvizSubgraphVertexIteratorCreate(highlight);
+  while (gvizSubgraphVertexIterate(&vit, &u)) {
+    if (r->highlightNodeRgba)
+      nodeColors[u] = r->highlightNodeRgba;
+  }
+
+  if (grRendererSetNodeColors(r, nodeColors, nodeCount) < 0) {
+    free(nodeColors);
+    return;
+  }
+  free(nodeColors);
+
+  size_t edgeCount = r->topo.edgeCount;
+  if (edgeCount == 0) {
+    r->highlightDirty = false;
+    return;
+  }
+
+  uint32_t *edgeColors = calloc(edgeCount, sizeof(uint32_t));
+  if (!edgeColors)
+    return;
+
+  uint32_t baseEdge = colorToRgba8(&r->edgeStyle.color);
+  for (size_t i = 0; i < edgeCount; i++)
+    edgeColors[i] = baseEdge;
+
+  if (r->highlightEdgeRgba) {
+    for (size_t i = 0; i < edgeCount; i++) {
+      uint32_t eu = r->topo.edges[i * 2];
+      uint32_t ev = r->topo.edges[i * 2 + 1];
+      if (highlightHasEdge(highlight, eu, ev))
+        edgeColors[i] = r->highlightEdgeRgba;
+    }
+  }
+
+  grRendererSetEdgeColors(r, edgeColors, edgeCount);
+  free(edgeColors);
+  r->highlightDirty = false;
+}
+
+static void highlightShowBoundaryEdge(gvizSubgraph *sg, size_t u, size_t v) {
+  if (u > v) {
+    size_t t = u;
+    u = v;
+    v = t;
+  }
+  gvizSubgraphShowEdge(sg, u, v);
+}
+
+int grRendererSetHighlight(grRenderer *r, const gvizSubgraph *highlight,
+                           uint32_t nodeRgba, uint32_t edgeRgba) {
+  if (!r || !r->graph || !highlight)
+    return -1;
+
+  gvizSubgraph copy = grHighlightCopySubgraph(highlight);
+  if (!copy.g)
+    return -1;
+
+  gvizEmbeddedGraphSetHighlight(r->graph, copy);
+  r->highlightActive = true;
+  r->highlightNodeRgba = nodeRgba;
+  r->highlightEdgeRgba = edgeRgba;
+  r->highlightDirty = true;
+  return 0;
+}
+
+int grRendererSetHighlightCycle(grRenderer *r, const size_t *vertices,
+                                size_t count, uint32_t nodeRgba,
+                                uint32_t edgeRgba) {
+  if (!r || !r->graph || !vertices || count < 3)
+    return -1;
+
+  const gvizGraph *g = gvizEmbeddedGraphStructure(r->graph)->g;
+  gvizSubgraph cycle = gvizSubgraphCreateEmpty(g);
+  if (!cycle.g)
+    return -1;
+
+  for (size_t i = 0; i < count; i++)
+    gvizSubgraphShowVertex(&cycle, vertices[i]);
+  for (size_t i = 0; i < count; i++)
+    highlightShowBoundaryEdge(&cycle, vertices[i], vertices[(i + 1) % count]);
+
+  int res = grRendererSetHighlight(r, &cycle, nodeRgba, edgeRgba);
+  gvizSubgraphRelease(&cycle);
+  return res;
+}
+
+void grRendererClearHighlight(grRenderer *r) {
+  if (!r)
+    return;
+  if (r->graph)
+    gvizEmbeddedGraphClearHighlight(r->graph);
+  grHighlightReset(r);
+  grRendererSetNodeColors(r, NULL, 0);
+  grRendererSetEdgeColors(r, NULL, 0);
+}
+
+static void grenderActionPickFace(gvizEmbeddedGraph *eg, void *userData,
+                                  const gvizActionPayload *payload) {
+  grRenderer *r = userData;
+  if (!r || !payload)
+    return;
+
+  gvizSubgraph face = {0};
+  if (gvizEmbeddedGraphFaceSubgraphAt(eg, payload->worldX, payload->worldY,
+                                     &face) != 0) {
+    grRendererClearHighlight(r);
+    return;
+  }
+
+  grRendererSetHighlight(r, &face, GR_RGBA8(255, 210, 80, 255),
+                         GR_RGBA8(255, 180, 40, 255));
+  gvizSubgraphRelease(&face);
+}
+
 void grRendererFitView(grRenderer *r) { r->fitRequested = true; }
 
 void grRendererRequestClose(grRenderer *r) { r->closeRequested = true; }
@@ -884,6 +1159,15 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   double dx = (cx - r->dragLastX) * r->contentScale;
   double dy = (cy - r->dragLastY) * r->contentScale;
 
+  for (int b = 0; b < 3; b++) {
+    if (!r->mouseDown[b])
+      continue;
+    double pdx = (cx - r->mousePressX) * r->contentScale;
+    double pdy = (cy - r->mousePressY) * r->contentScale;
+    if (pdx * pdx + pdy * pdy > 25.0)
+      r->mouseDragged[b] = true;
+  }
+
   bool pan, orbit;
   if (r->camera.perspective) {
     pan = rightDown || (leftDown && shiftDown);
@@ -921,6 +1205,8 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     r->scrollAccum = 0.0;
   }
 
+  grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
+
   // Key dispatch: built-in fit on F unless the app bound F itself.
   for (size_t k = 0; k < r->pendingKeyCount; k++) {
     int key = r->pendingKeys[k].key;
@@ -952,6 +1238,30 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
   }
   r->pendingKeyCount = 0;
+
+  for (size_t m = 0; m < r->pendingMouseCount; m++) {
+    int button = r->pendingMouse[m].button;
+    int mods = r->pendingMouse[m].mods;
+
+    const char *actionName = NULL;
+    for (size_t i = 0; i < r->mouseBindingCount; i++) {
+      if (r->mouseBindings[i].button == button) {
+        actionName = r->mouseBindings[i].actionName;
+        break;
+      }
+    }
+    if (!actionName || !r->graph)
+      continue;
+
+    gvizActionPayload payload = {0};
+    grCameraUnproject(&r->camera, &r->cameraFrame, r->pendingMouse[m].xPx,
+                      r->pendingMouse[m].yPx, fbw, fbh, &payload.worldX,
+                      &payload.worldY);
+    payload.deltaTime = r->deltaTime;
+    payload.iarg = mods;
+    gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
+  }
+  r->pendingMouseCount = 0;
 }
 
 // ------------------------------------------------------------------------------
@@ -1287,13 +1597,13 @@ bool grRendererFrame(grRenderer *r) {
         return false;
       r->topoDirty = false;
     }
+    applyHighlightColors(r);
     if (r->fitRequested) {
       fitViewNow(r, fbw, fbh);
       r->fitRequested = false;
     }
   }
 
-  grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
   writeGlobals(r, fbw, fbh);
 
   if (r->graph) {

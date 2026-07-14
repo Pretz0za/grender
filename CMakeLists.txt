@@ -132,4 +132,7 @@ if(GRENDER_BUILD_EXAMPLES AND TARGET graphvis)
 
     add_executable(treeDemo examples/treeDemo.c)
     target_link_libraries(treeDemo PRIVATE grender graphvis)
+
+    add_executable(tutteDemo examples/tutteDemo.c)
+    target_link_libraries(tutteDemo PRIVATE grender graphvis)
 endif()

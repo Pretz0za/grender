@@ -169,6 +169,20 @@ enum {
   GR_MOD_SUPER = 8,
 };
 
+/** Mouse buttons accepted by grRendererBindMouse (GLFW button ids). */
+enum {
+  GR_MOUSE_BUTTON_LEFT = 0,
+  GR_MOUSE_BUTTON_RIGHT = 1,
+  GR_MOUSE_BUTTON_MIDDLE = 2,
+};
+
+/**
+ * Action name registered by grRendererSetGraph for 2D face picking and
+ * highlighting. The payload worldX/worldY are filled from the click position.
+ * Requires a planar combinatorial embedding (gvizEmbeddedGraphApplyPlanarEmbedding).
+ */
+#define GR_ACTION_PICK_FACE "grender.pickFace"
+
 /**
  * Binds @p key so that pressing it invokes the action named @p actionName on
  * the attached embedded graph (see gvizEmbeddedGraphAddAction). The payload is
@@ -188,6 +202,45 @@ int grRendererBindKey(grRenderer *r, int key, const char *actionName);
 
 /** Removes the binding for @p key, if any. */
 void grRendererUnbindKey(grRenderer *r, int key);
+
+/**
+ * Binds @p button so that a click (press and release without a drag) invokes
+ * the action named @p actionName on the attached embedded graph. The payload
+ * is filled like grRendererBindKey. Dragging with the same button still pans
+ * or orbits as usual.
+ *
+ * @return 0 on success, -1 on allocation failure.
+ */
+int grRendererBindMouse(grRenderer *r, int button, const char *actionName);
+
+/** Removes the binding for @p button, if any. */
+void grRendererUnbindMouse(grRenderer *r, int button);
+
+// HIGHLIGHTS: ---------------------------------------------------------------
+
+/**
+ * Stores @p highlight (a gvizSubgraph on the same parent graph as the
+ * attached embedded graph) and colors its vertices/edges differently from the
+ * global node/edge styles every frame. Pass 0 for @p nodeRgba or @p edgeRgba
+ * to keep the global style for that element class. The subgraph is copied;
+ * @p highlight may be released by the caller afterward.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int grRendererSetHighlight(grRenderer *r, const gvizSubgraph *highlight,
+                           uint32_t nodeRgba, uint32_t edgeRgba);
+
+/**
+ * Convenience for highlighting a planar face boundary: @p vertices lists the
+ * dart-head cycle from the rotation system (as returned by planar face
+ * enumeration). Consecutive entries are endpoints of one boundary dart.
+ */
+int grRendererSetHighlightCycle(grRenderer *r, const size_t *vertices,
+                                size_t count, uint32_t nodeRgba,
+                                uint32_t edgeRgba);
+
+/** Clears the stored highlight and reverts to global node/edge styles. */
+void grRendererClearHighlight(grRenderer *r);
 
 // FRAME LOOP: -------------------------------------------------------------
 

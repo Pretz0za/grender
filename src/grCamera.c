@@ -148,9 +148,38 @@ void grCameraFrameCompute(const grCamera *cam, double viewportWPx,
   out->proj11 = (float)proj[5];
 }
 
+static int unprojectEmbeddingPlane(const float viewProj[16], double xPx,
+                                 double yPx, double viewportWPx,
+                                 double viewportHPx, double *worldX,
+                                 double *worldY) {
+  double ndcX = 2.0 * xPx / viewportWPx - 1.0;
+  double ndcY = 1.0 - 2.0 * yPx / viewportHPx;
+
+  double a00 = (double)viewProj[0] - ndcX * (double)viewProj[3];
+  double a01 = (double)viewProj[4] - ndcX * (double)viewProj[7];
+  double b0 = ndcX * (double)viewProj[15] - (double)viewProj[12];
+
+  double a10 = (double)viewProj[1] - ndcY * (double)viewProj[3];
+  double a11 = (double)viewProj[5] - ndcY * (double)viewProj[7];
+  double b1 = ndcY * (double)viewProj[15] - (double)viewProj[13];
+
+  double det = a00 * a11 - a01 * a10;
+  if (fabs(det) < 1e-12)
+    return -1;
+
+  *worldX = (b0 * a11 - b1 * a01) / det;
+  *worldY = (a00 * b1 - a10 * b0) / det;
+  return 0;
+}
+
 void grCameraUnproject(const grCamera *cam, const grCameraFrame *frame,
                        double xPx, double yPx, double viewportWPx,
                        double viewportHPx, double *worldX, double *worldY) {
+  if (frame &&
+      unprojectEmbeddingPlane(frame->viewProj, xPx, yPx, viewportWPx,
+                              viewportHPx, worldX, worldY) == 0)
+    return;
+
   // NDC of the cursor; window y grows downward.
   double nx = 2.0 * xPx / viewportWPx - 1.0;
   double ny = 1.0 - 2.0 * yPx / viewportHPx;
