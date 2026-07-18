@@ -248,12 +248,16 @@ static const char GR_WGSL_OBJ_SOURCE[] =
     "  lightDir    : vec4f,\n"
     "  baseColor   : vec4f,\n"
     "  panelSizePx : vec4f,\n" // xy used
+    "  texFlags    : vec4f,\n" // x: 1.0 when a texture map is active
     "}\n"
     "\n"
     "@group(0) @binding(0) var<uniform> OG : ObjGlobals;\n"
     "@group(0) @binding(1) var<storage, read> objPositions : array<f32>;\n"
     "@group(0) @binding(2) var<storage, read> objNormals   : array<f32>;\n"
     "@group(0) @binding(3) var<storage, read> objIndices   : array<u32>;\n"
+    "@group(0) @binding(4) var<storage, read> objUV    : array<f32>;\n"
+    "@group(0) @binding(5) var texSampler : sampler;\n"
+    "@group(0) @binding(6) var tex        : texture_2d<f32>;\n"
     "\n"
     "const OBJ_CORNERS = array<vec2f, 6>(\n"
     "  vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),\n"
@@ -285,6 +289,7 @@ static const char GR_WGSL_OBJ_SOURCE[] =
     "struct ObjOut {\n"
     "  @builtin(position) clip : vec4f,\n"
     "  @location(0) normal : vec3f,\n"
+    "  @location(1) uv : vec2f,\n"
     "}\n"
     "\n"
     "@vertex\n"
@@ -295,8 +300,9 @@ static const char GR_WGSL_OBJ_SOURCE[] =
     "                  objPositions[base + 2u]);\n"
     "  let nrm = vec3f(objNormals[base], objNormals[base + 1u],\n"
     "                  objNormals[base + 2u]);\n"
+    "  let uv = vec2f(objUV[idx * 2u], objUV[idx * 2u + 1u]);\n"
     "  let clip = OG.viewProj * vec4f(pos, 1.0);\n"
-    "  return ObjOut(clip, nrm);\n"
+    "  return ObjOut(clip, nrm, uv);\n"
     "}\n"
     "\n"
     "@fragment\n"
@@ -305,7 +311,65 @@ static const char GR_WGSL_OBJ_SOURCE[] =
     "  let l = normalize(OG.lightDir.xyz);\n"
     "  let diffuse = max(dot(n, l), 0.0);\n"
     "  let shade = clamp(0.28 + diffuse * 0.85, 0.0, 1.0);\n"
+    "  if (OG.texFlags.x > 0.5) {\n"
+    "    let outsideImage = in.uv.x < 0.0 || in.uv.x > 1.0 ||\n"
+    "                       in.uv.y < 0.0 || in.uv.y > 1.0;\n"
+    "    if (outsideImage) {\n"
+    "      return vec4f(1.0, 1.0, 1.0, OG.baseColor.a);\n"
+    "    }\n"
+    "    let texColor = textureSample(tex, texSampler, in.uv).rgb;\n"
+    "    return vec4f(texColor * shade, OG.baseColor.a);\n"
+    "  }\n"
     "  return vec4f(OG.baseColor.rgb * shade, OG.baseColor.a);\n"
+    "}\n";
+
+/**
+ * WGSL for a single textured quad drawn directly in the main scene at the
+ * texture map's movable image rectangle (in the same embedding-space
+ * coordinates as the attached graph), so a user can see exactly how the
+ * image lines up with the live graph. Drawn as 6 vertex-pulled vertices (2
+ * triangles), no vertex buffers. Layout must match grTexMapImageUBO and the
+ * bind group in grTextureMap.c.
+ */
+static const char GR_WGSL_TEXMAP_IMAGE_SOURCE[] =
+    "struct ImgGlobals {\n"
+    "  viewProj      : mat4x4f,\n"
+    "  rectCenter    : vec2f,\n"
+    "  rectHalfExtent : vec2f,\n"
+    "  opacity       : f32,\n"
+    "  pad0 : f32,\n"
+    "  pad1 : f32,\n"
+    "  pad2 : f32,\n"
+    "}\n"
+    "\n"
+    "@group(0) @binding(0) var<uniform> IG : ImgGlobals;\n"
+    "@group(0) @binding(1) var imgSampler : sampler;\n"
+    "@group(0) @binding(2) var imgTex     : texture_2d<f32>;\n"
+    "\n"
+    "const IMG_CORNERS = array<vec2f, 6>(\n"
+    "  vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),\n"
+    "  vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));\n"
+    "\n"
+    "struct ImgOut {\n"
+    "  @builtin(position) clip : vec4f,\n"
+    "  @location(0) uv : vec2f,\n"
+    "}\n"
+    "\n"
+    "@vertex\n"
+    "fn vsTexMapImage(@builtin(vertex_index) vid : u32) -> ImgOut {\n"
+    "  let corner = IMG_CORNERS[vid];\n"
+    "  let world = IG.rectCenter + corner * IG.rectHalfExtent;\n"
+    "  let clip = IG.viewProj * vec4f(world, 0.0, 1.0);\n"
+    // Same (u, v) convention as grTextureMapComputeUV: v flipped so row 0 of
+    // the source image (top) lands at the rect's max-y edge.
+    "  let uv = vec2f(corner.x * 0.5 + 0.5, 1.0 - (corner.y * 0.5 + 0.5));\n"
+    "  return ImgOut(clip, uv);\n"
+    "}\n"
+    "\n"
+    "@fragment\n"
+    "fn fsTexMapImage(in : ImgOut) -> @location(0) vec4f {\n"
+    "  let c = textureSample(imgTex, imgSampler, in.uv).rgb;\n"
+    "  return vec4f(c, IG.opacity);\n"
     "}\n";
 
 #endif

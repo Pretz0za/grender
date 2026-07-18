@@ -1197,6 +1197,8 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
         r->fitRequested = true;
       else if (key == 'S')
         grRendererShowStats(r, !r->statsVisible);
+      else if (key == 'I')
+        grRendererShowTextureMapImage(r, !grRendererTextureMapImageShown(r));
       continue;
     }
     if (!r->graph)
@@ -1382,6 +1384,11 @@ static void encodeScenePass(grRenderer *r, WGPUCommandEncoder encoder,
               },
       });
 
+  // Texture map's movable image rect, if shown: drawn first (and never
+  // depth-writing) so nodes/edges always remain visible on top of it,
+  // letting a user see exactly how the image and the live graph overlap.
+  grTextureMapEncodeImageQuad(r, pass);
+
   if (r->graph && r->bindGroup) {
     wgpuRenderPassEncoderSetBindGroup(pass, 0, r->bindGroup, 0, NULL);
 
@@ -1521,6 +1528,8 @@ bool grRendererFrame(grRenderer *r) {
   if (r->closeRequested || glfwWindowShouldClose(r->window))
     return false;
 
+  GR_PROF_FRAME_BEGIN();
+
   glfwPollEvents();
 
   double now = glfwGetTime();
@@ -1605,5 +1614,6 @@ bool grRendererFrame(grRenderer *r) {
   wgpuCommandEncoderRelease(encoder);
   wgpuTextureViewRelease(frame);
   wgpuTextureRelease(surfaceTexture.texture);
+  GR_PROF_FRAME_END();
   return true;
 }

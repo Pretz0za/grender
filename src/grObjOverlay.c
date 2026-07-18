@@ -28,8 +28,8 @@
     }                                                                        \
   } while (0)
 
-static WGPUBuffer objMakeStorageBuffer(grRenderer *r, const void *data,
-                                       size_t bytes, const char *label) {
+WGPUBuffer grMakeStorageBuffer(grRenderer *r, const void *data, size_t bytes,
+                               const char *label) {
   size_t bufSize = bytes < 4 ? 4 : (bytes + 3) & ~(size_t)3;
   WGPUBuffer buf = wgpuDeviceCreateBuffer(
       r->device, &(const WGPUBufferDescriptor){
@@ -58,24 +58,39 @@ static int createObjPipelines(grRenderer *r) {
   if (!ov->shaderModule)
     return -1;
 
-  WGPUBindGroupLayoutEntry entries[4] = {0};
+  // 0: uniform. 1-4: read-only vertex storage (positions/normals/indices/uv).
+  // 5-6: fragment sampler + texture (image; whitening is a per-fragment UV
+  // bounds check in fsObj, no per-triangle validity buffer needed).
+  WGPUBindGroupLayoutEntry entries[7] = {0};
   entries[0] = (WGPUBindGroupLayoutEntry){
       .binding = 0,
       .visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
       .buffer = {.type = WGPUBufferBindingType_Uniform},
   };
-  for (int i = 1; i < 4; i++) {
+  for (int i = 1; i < 5; i++) {
     entries[i] = (WGPUBindGroupLayoutEntry){
         .binding = (uint32_t)i,
         .visibility = WGPUShaderStage_Vertex,
         .buffer = {.type = WGPUBufferBindingType_ReadOnlyStorage},
     };
   }
+  entries[5] = (WGPUBindGroupLayoutEntry){
+      .binding = 5,
+      .visibility = WGPUShaderStage_Fragment,
+      .sampler = {.type = WGPUSamplerBindingType_Filtering},
+  };
+  entries[6] = (WGPUBindGroupLayoutEntry){
+      .binding = 6,
+      .visibility = WGPUShaderStage_Fragment,
+      .texture = {.sampleType = WGPUTextureSampleType_Float,
+                  .viewDimension = WGPUTextureViewDimension_2D,
+                  .multisampled = false},
+  };
 
   ov->bindGroupLayout = wgpuDeviceCreateBindGroupLayout(
       r->device, &(const WGPUBindGroupLayoutDescriptor){
                      .label = {"grender obj bgl", WGPU_STRLEN},
-                     .entryCount = 4,
+                     .entryCount = 7,
                      .entries = entries,
                  });
   ov->pipelineLayout = wgpuDeviceCreatePipelineLayout(
@@ -173,11 +188,75 @@ static int createObjPipelines(grRenderer *r) {
   return ov->uniformBuf ? 0 : -1;
 }
 
+/** Lazily creates the overlay-lifetime placeholder resources bound at slots
+ *  4-6 whenever no texture map is active: a 4-byte storage buffer and a 1x1
+ *  white texture/view/sampler. Mirrors the "always-complete bind group with
+ *  dummies when unused" convention used for nodeColorsBuf/nodeSizesBuf/
+ *  edgeColorsBuf in grRenderer.c's rebuildBindGroup. */
+static int ensureObjDummyResources(grRenderer *r) {
+  grObjOverlay *ov = &r->objOverlay;
+
+  if (!ov->dummyUvBuf)
+    ov->dummyUvBuf = grMakeStorageBuffer(r, NULL, 0, "grender obj dummy uv");
+
+  if (!ov->dummyTexture) {
+    ov->dummyTexture = wgpuDeviceCreateTexture(
+        r->device,
+        &(const WGPUTextureDescriptor){
+            .label = {"grender obj dummy tex", WGPU_STRLEN},
+            .usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
+            .dimension = WGPUTextureDimension_2D,
+            .size = {1, 1, 1},
+            .format = WGPUTextureFormat_RGBA8Unorm,
+            .mipLevelCount = 1,
+            .sampleCount = 1,
+        });
+    if (ov->dummyTexture) {
+      ov->dummyView = wgpuTextureCreateView(ov->dummyTexture, NULL);
+      const uint8_t whitePixel[4] = {255, 255, 255, 255};
+      wgpuQueueWriteTexture(
+          r->queue,
+          &(const WGPUTexelCopyTextureInfo){
+              .texture = ov->dummyTexture, .mipLevel = 0, .origin = {0, 0, 0}},
+          whitePixel, sizeof(whitePixel),
+          &(const WGPUTexelCopyBufferLayout){
+              .offset = 0, .bytesPerRow = 4, .rowsPerImage = 1},
+          &(const WGPUExtent3D){1, 1, 1});
+    }
+  }
+
+  if (!ov->dummySampler)
+    ov->dummySampler = wgpuDeviceCreateSampler(
+        r->device, &(const WGPUSamplerDescriptor){
+                       .label = {"grender obj dummy sampler", WGPU_STRLEN},
+                       .addressModeU = WGPUAddressMode_ClampToEdge,
+                       .addressModeV = WGPUAddressMode_ClampToEdge,
+                       .addressModeW = WGPUAddressMode_ClampToEdge,
+                       .magFilter = WGPUFilterMode_Nearest,
+                       .minFilter = WGPUFilterMode_Nearest,
+                       .mipmapFilter = WGPUMipmapFilterMode_Nearest,
+                       .maxAnisotropy = 1,
+                   });
+
+  return (ov->dummyUvBuf && ov->dummyTexture && ov->dummyView &&
+          ov->dummySampler)
+             ? 0
+             : -1;
+}
+
 static int rebuildObjBindGroup(grRenderer *r) {
   grObjOverlay *ov = &r->objOverlay;
   GR_OBJ_RELEASE(wgpuBindGroupRelease, ov->bindGroup);
 
-  const WGPUBindGroupEntry bgEntries[4] = {
+  if (ensureObjDummyResources(r) < 0)
+    return -1;
+
+  bool tex = ov->texMap.active;
+  WGPUBuffer uvBuf = tex ? ov->texMap.uvBuf : ov->dummyUvBuf;
+  WGPUSampler sampler = tex ? ov->texMap.imageSampler : ov->dummySampler;
+  WGPUTextureView view = tex ? ov->texMap.imageView : ov->dummyView;
+
+  const WGPUBindGroupEntry bgEntries[7] = {
       {.binding = 0, .buffer = ov->uniformBuf, .size = sizeof(grObjOverlayUBO)},
       {.binding = 1,
        .buffer = ov->positionsBuf,
@@ -188,12 +267,15 @@ static int rebuildObjBindGroup(grRenderer *r) {
       {.binding = 3,
        .buffer = ov->indicesBuf,
        .size = wgpuBufferGetSize(ov->indicesBuf)},
+      {.binding = 4, .buffer = uvBuf, .size = wgpuBufferGetSize(uvBuf)},
+      {.binding = 5, .sampler = sampler},
+      {.binding = 6, .textureView = view},
   };
   ov->bindGroup = wgpuDeviceCreateBindGroup(
       r->device, &(const WGPUBindGroupDescriptor){
                      .label = {"grender obj bind group", WGPU_STRLEN},
                      .layout = ov->bindGroupLayout,
-                     .entryCount = 4,
+                     .entryCount = 7,
                      .entries = bgEntries,
                  });
   ov->bindGroupDirty = false;
@@ -220,12 +302,12 @@ int grObjOverlayLoad(grRenderer *r, const char *path) {
   grObjMeshRelease(&ov->mesh);
 
   ov->positionsBuf =
-      objMakeStorageBuffer(r, mesh.positions, sizeof(float) * mesh.vertexCount * 3,
-                           "grender obj positions");
+      grMakeStorageBuffer(r, mesh.positions, sizeof(float) * mesh.vertexCount * 3,
+                          "grender obj positions");
   ov->normalsBuf =
-      objMakeStorageBuffer(r, mesh.normals, sizeof(float) * mesh.vertexCount * 3,
-                           "grender obj normals");
-  ov->indicesBuf = objMakeStorageBuffer(
+      grMakeStorageBuffer(r, mesh.normals, sizeof(float) * mesh.vertexCount * 3,
+                          "grender obj normals");
+  ov->indicesBuf = grMakeStorageBuffer(
       r, mesh.indices, sizeof(uint32_t) * mesh.indexCount, "grender obj indices");
   if (!ov->positionsBuf || !ov->normalsBuf || !ov->indicesBuf) {
     grObjMeshRelease(&mesh);
@@ -247,6 +329,7 @@ void grObjOverlayClear(grRenderer *r) {
   if (!r)
     return;
   grObjOverlay *ov = &r->objOverlay;
+  grTextureMapRelease(r);
   GR_OBJ_RELEASE(wgpuBufferRelease, ov->positionsBuf);
   GR_OBJ_RELEASE(wgpuBufferRelease, ov->normalsBuf);
   GR_OBJ_RELEASE(wgpuBufferRelease, ov->indicesBuf);
@@ -260,6 +343,7 @@ void grObjOverlayUpdate(grRenderer *r, double dt) {
   if (!r || !r->objOverlay.loaded)
     return;
   r->objOverlay.camera.yaw += dt * GR_OBJ_SPIN_RADIANS_PER_SEC;
+  grTextureMapUpdate(r);
 }
 
 void grObjOverlayEncode(grRenderer *r, WGPUCommandEncoder encoder,
@@ -294,6 +378,7 @@ void grObjOverlayEncode(grRenderer *r, WGPUCommandEncoder encoder,
   u.baseColor[3] = 1.0f;
   u.panelSizePx[0] = (float)size;
   u.panelSizePx[1] = (float)size;
+  u.texFlags[0] = ov->texMap.active ? 1.0f : 0.0f;
   wgpuQueueWriteBuffer(r->queue, ov->uniformBuf, 0, &u, sizeof(u));
 
   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(
@@ -336,10 +421,18 @@ void grObjOverlayRelease(grRenderer *r) {
   if (!r)
     return;
   grObjOverlay *ov = &r->objOverlay;
+  grTextureMapRelease(r);
   GR_OBJ_RELEASE(wgpuBufferRelease, ov->positionsBuf);
   GR_OBJ_RELEASE(wgpuBufferRelease, ov->normalsBuf);
   GR_OBJ_RELEASE(wgpuBufferRelease, ov->indicesBuf);
   GR_OBJ_RELEASE(wgpuBufferRelease, ov->uniformBuf);
+  GR_OBJ_RELEASE(wgpuBufferRelease, ov->dummyUvBuf);
+  GR_OBJ_RELEASE(wgpuTextureViewRelease, ov->dummyView);
+  if (ov->dummyTexture) {
+    wgpuTextureDestroy(ov->dummyTexture);
+    GR_OBJ_RELEASE(wgpuTextureRelease, ov->dummyTexture);
+  }
+  GR_OBJ_RELEASE(wgpuSamplerRelease, ov->dummySampler);
   GR_OBJ_RELEASE(wgpuBindGroupRelease, ov->bindGroup);
   GR_OBJ_RELEASE(wgpuRenderPipelineRelease, ov->bgPipeline);
   GR_OBJ_RELEASE(wgpuRenderPipelineRelease, ov->meshPipeline);

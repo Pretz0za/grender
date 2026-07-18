@@ -5,6 +5,7 @@
 static grRenderer *g_statsMenuRenderer = NULL;
 static NSMenu *g_chartsSubmenu = NULL;
 static NSMenuItem *g_overlayMenuItem = NULL;
+static NSMenuItem *g_texMapImageMenuItem = NULL;
 
 @interface GRStatsMenuTarget : NSObject
 @end
@@ -25,6 +26,14 @@ static NSMenuItem *g_overlayMenuItem = NULL;
   size_t idx = (size_t)item.tag;
   bool show = item.state != NSControlStateValueOn;
   grRendererShowStatSeries(g_statsMenuRenderer, idx, show);
+  item.state = show ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+- (void)toggleTextureMapImage:(NSMenuItem *)item {
+  if (!g_statsMenuRenderer)
+    return;
+  bool show = item.state != NSControlStateValueOn;
+  grRendererShowTextureMapImage(g_statsMenuRenderer, show);
   item.state = show ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
@@ -115,6 +124,15 @@ void grPlatformInitApplication(void) {
   g_overlayMenuItem =
       makeCheckItem(@"Show Stats Overlay", @selector(toggleOverlay:), -1, true);
   [viewMenu addItem:g_overlayMenuItem];
+
+  g_texMapImageMenuItem = [[NSMenuItem alloc]
+      initWithTitle:@"Show Texture Image"
+             action:@selector(toggleTextureMapImage:)
+      keyEquivalent:@"i"];
+  g_texMapImageMenuItem.target = g_statsMenuTarget;
+  g_texMapImageMenuItem.state = NSControlStateValueOff;
+  g_texMapImageMenuItem.enabled = NO;
+  [viewMenu addItem:g_texMapImageMenuItem];
   [viewMenu addItem:[NSMenuItem separatorItem]];
 
   NSMenuItem *chartsItem = [[NSMenuItem alloc] initWithTitle:@"Charts"
@@ -165,4 +183,22 @@ void grPlatformStatsMenuRefresh(grRenderer *r) {
     [g_chartsSubmenu addItem:makeCheckItem(title, @selector(toggleSeries:),
                                            (NSInteger)i, shown)];
   }
+}
+
+void grPlatformTextureMapMenuRefresh(grRenderer *r) {
+  if (!g_texMapImageMenuItem)
+    grPlatformInitApplication();
+
+  g_statsMenuRenderer = r;
+
+  if (!g_texMapImageMenuItem)
+    return;
+
+  // Only reached once a texture map exists (called from
+  // grRendererLoadTextureMap/grRendererShowTextureMapImage), so it's always
+  // selectable here; its checkmark mirrors current visibility.
+  g_texMapImageMenuItem.enabled = YES;
+  g_texMapImageMenuItem.state = grRendererTextureMapImageShown(r)
+                                    ? NSControlStateValueOn
+                                    : NSControlStateValueOff;
 }

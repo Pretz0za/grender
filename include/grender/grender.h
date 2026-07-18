@@ -329,6 +329,73 @@ bool grRendererObjOverlayShown(const grRenderer *r);
 /** Releases the loaded mesh, if any, and hides the overlay. */
 void grRendererClearObjOverlay(grRenderer *r);
 
+// TEXTURE MAPPING: ------------------------------------------------------------
+//
+// Derives per-vertex (u, v) texture coordinates for an .obj mesh loaded into
+// the object overlay from where a live 2D embedded graph's vertices land
+// relative to a movable/resizable image rectangle in embedding space. This
+// works because gvizGraphLoadFromObjFile (gviz) and the object overlay's own
+// .obj parser both assign vertex id i to the i-th 'v' line of the file, in
+// file order, so an embedding built on that same graph and a mesh loaded from
+// the same file always agree on vertex correspondence. Mesh regions that
+// don't overlap the image rectangle at all render white; regions that
+// partially overlap it are textured normally, with (u, v) interpolated
+// per-fragment across each triangle so the white/textured transition lands
+// exactly at the image's edge. Texture mapping replaces the object overlay's
+// flat-shaded preview while active.
+
+/** Opaque; owned by the renderer's object overlay. */
+typedef struct grTextureMap grTextureMap;
+
+/**
+ * Loads @p objPath into the object overlay (replacing any previously loaded
+ * mesh, same as grRendererLoadObjOverlay) and ties it to @p graph, a 2D
+ * embedded graph whose vertex count must match the mesh's. The initial image
+ * rectangle is fit to the graph's current live bounding box, preserving
+ * @p imagePath's aspect ratio.
+ *
+ * @return the texture map on success (borrowed; owned by @p r), or NULL on
+ *         a non-2D embedding, vertex-count mismatch, file/parse error, or
+ *         GPU allocation failure.
+ */
+grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
+                                       const char *objPath,
+                                       const char *imagePath);
+
+/** Sets the image rectangle's center and half-extents, in embedding
+ *  coordinates. NULL-safe (no-op). */
+void grTextureMapSetImageRect(grTextureMap *tm, double cx, double cy,
+                              double halfW, double halfH);
+
+/** Translates the image rectangle's center by (@p dx, @p dy). NULL-safe. */
+void grTextureMapMoveImage(grTextureMap *tm, double dx, double dy);
+
+/** Scales the image rectangle's half-extents by @p factor about its current
+ *  center. NULL-safe. */
+void grTextureMapScaleImage(grTextureMap *tm, double factor);
+
+/** Restores the image rectangle to the fit computed at load time. NULL-safe. */
+void grTextureMapResetImage(grTextureMap *tm);
+
+/** Reads back the current image rectangle. Any output pointer may be NULL.
+ *  Writes zeros when @p tm is NULL. */
+void grTextureMapGetImageRect(const grTextureMap *tm, double *cx, double *cy,
+                              double *halfW, double *halfH);
+
+/**
+ * Shows or hides the movable image rectangle drawn directly in the main
+ * scene, in the same embedding-space coordinates as the attached graph, so a
+ * user can see exactly how the image and the live graph overlap. This is
+ * independent of the object-overlay panel's always-on textured mesh preview.
+ * Visible by default as soon as a texture map loads. No-op when @p r has no
+ * active texture map.
+ */
+void grRendererShowTextureMapImage(grRenderer *r, bool show);
+
+/** Returns whether the main-scene image rectangle is currently shown (false
+ *  when no texture map is active). */
+bool grRendererTextureMapImageShown(const grRenderer *r);
+
 /** Requests that the frame loop end; the next grRendererFrame returns false. */
 void grRendererRequestClose(grRenderer *r);
 

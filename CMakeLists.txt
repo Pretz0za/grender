@@ -8,6 +8,8 @@ if(APPLE)
 endif()
 
 option(GRENDER_BUILD_EXAMPLES "Build grender example apps" ON)
+option(GRENDER_ENABLE_PROFILING
+    "Time every rendered frame and print avg/p50/p95/p99/max on exit" OFF)
 set(GRENDER_GVIZ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../gviz" CACHE PATH
     "Path to the gviz repository (provides gviz public headers and the graphvis library)")
 
@@ -87,7 +89,13 @@ add_library(grender STATIC
     src/grPCA.c
     src/grObjMesh.c
     src/grObjOverlay.c
+    src/grTextureMap.c
+    src/grProfiling.c
 )
+
+if(GRENDER_ENABLE_PROFILING)
+    target_compile_definitions(grender PRIVATE GRENDER_ENABLE_PROFILING)
+endif()
 
 if(APPLE)
     target_sources(grender PRIVATE src/grSurfaceCocoa.m src/grMenuCocoa.m)
@@ -99,6 +107,7 @@ endif()
 target_include_directories(grender
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PUBLIC ${GRENDER_GVIZ_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third-party
     PRIVATE "$ENV{HOME}/include"
 )
 
@@ -137,4 +146,14 @@ if(GRENDER_BUILD_EXAMPLES AND TARGET graphvis)
 
     add_executable(tutteDemo examples/tutteDemo.c)
     target_link_libraries(tutteDemo PRIVATE grender graphvis)
+
+    add_executable(frPairwiseDemo examples/frPairwiseDemo.c)
+    target_link_libraries(frPairwiseDemo PRIVATE grender graphvis)
+
+    add_executable(textureMapDemo examples/textureMapDemo.c)
+    target_link_libraries(textureMapDemo PRIVATE grender graphvis)
+
+    add_executable(textureMapUnitTest examples/textureMapUnitTest.c)
+    target_include_directories(textureMapUnitTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(textureMapUnitTest PRIVATE grender graphvis)
 endif()

@@ -2,6 +2,7 @@
 #define _GRENDER_INTERNAL_H_
 
 #include "grender/grender.h"
+#include "grProfiling.h"
 
 #include "ds/gvizArray.h"
 
@@ -134,13 +135,23 @@ typedef struct grObjMesh {
   float *positions;   /**< vertexCount * 3 (xyz). */
   float *normals;     /**< vertexCount * 3 (xyz), unit length. */
   uint32_t *indices;  /**< indexCount, 3 per triangle. */
+  uint32_t *triangleFaceIds; /**< indexCount/3 entries; one per emitted
+                                   triangle, = the 0-based index of the 'f'
+                                   line it was fan-triangulated from. */
   size_t vertexCount;
   size_t indexCount;
+  size_t faceCount; /**< Number of 'f' lines parsed. */
   double bmin[3], bmax[3];
 } grObjMesh;
 
 int grObjMeshLoad(const char *path, grObjMesh *out);
 void grObjMeshRelease(grObjMesh *mesh);
+
+/** Shared WGPU storage-buffer helper: rounds @p bytes up to a 4-byte,
+ *  >=4-byte size and optionally uploads @p data immediately. Used by the
+ *  object overlay and the texture map for their read-only storage buffers. */
+WGPUBuffer grMakeStorageBuffer(grRenderer *r, const void *data, size_t bytes,
+                               const char *label);
 
 /** Must match struct ObjGlobals in grShaders.h. */
 typedef struct grObjOverlayUBO {
@@ -148,7 +159,51 @@ typedef struct grObjOverlayUBO {
   float lightDir[4];
   float baseColor[4];
   float panelSizePx[4]; /**< xy used, zw padding. */
+  float texFlags[4]; /**< x: 1.0 when a texture map is active else 0.0. */
 } grObjOverlayUBO;
+
+/** Must match struct ImgGlobals in grShaders.h. */
+typedef struct grTexMapImageUBO {
+  float viewProj[16];
+  float rectCenter[2];
+  float rectHalfExtent[2];
+  float opacity;
+  float pad[3];
+} grTexMapImageUBO;
+
+/**
+ * Live UV mapping tying a 2D gvizEmbeddedGraph's vertex positions to a
+ * movable/resizable image rectangle in embedding space, reprojected as
+ * texture coordinates for the object overlay's mesh. Owned by grObjOverlay;
+ * `graph` itself is a borrowed pointer.
+ */
+typedef struct grTextureMap {
+  bool active;
+  bool visible; /**< Whether the image rect also draws in the main scene. */
+  gvizEmbeddedGraph *graph; /**< Not owned; must be a 2D embedding. */
+  double imgCenter[2], imgHalfExtent[2];
+  double initCenter[2], initHalfExtent[2]; /**< For grTextureMapResetImage. */
+  float *uvStaging;          /**< vertexCount * 2, rebuilt every frame. */
+  uint32_t *insideStaging;   /**< vertexCount scratch (0/1). */
+  uint32_t *faceValidStaging; /**< faceCount scratch (0/1). */
+  uint32_t *triValidStaging; /**< indexCount/3, uploaded every frame. */
+  WGPUBuffer uvBuf;
+  WGPUBuffer triValidBuf;
+  WGPUTexture imageTexture;
+  WGPUTextureView imageView;
+  WGPUSampler imageSampler;
+  int imageW, imageH;
+
+  /** Lazily-created pipeline drawing the image rect directly in the main
+   *  scene (grRenderer's own camera/pass), reusing imageTexture/imageView/
+   *  imageSampler above. Independent of the object-overlay's own pipeline. */
+  WGPUShaderModule imgQuadShaderModule;
+  WGPUBindGroupLayout imgQuadBindGroupLayout;
+  WGPUPipelineLayout imgQuadPipelineLayout;
+  WGPURenderPipeline imgQuadPipeline;
+  WGPUBuffer imgQuadUniformBuf;
+  WGPUBindGroup imgQuadBindGroup;
+} grTextureMap;
 
 typedef struct grObjOverlay {
   bool loaded;
@@ -168,6 +223,17 @@ typedef struct grObjOverlay {
   WGPUBuffer indicesBuf;
   WGPUBindGroup bindGroup;
   bool bindGroupDirty;
+
+  /** Lazily-created placeholders bound at slots 4-6 whenever texMap.active is
+   *  false (or no mesh has ever been loaded), so the bind group is always
+   *  complete WGPU state. Overlay-lifetime, released only in
+   *  grObjOverlayRelease. */
+  WGPUBuffer dummyUvBuf;
+  WGPUTexture dummyTexture;
+  WGPUTextureView dummyView;
+  WGPUSampler dummySampler;
+
+  grTextureMap texMap;
 } grObjOverlay;
 
 /** Parses @p path and swaps it in as the overlay's mesh, replacing any
@@ -197,6 +263,48 @@ void grObjOverlayEncode(grRenderer *r, WGPUCommandEncoder encoder,
  *  grRendererDestroy. */
 void grObjOverlayRelease(grRenderer *r);
 
+/** Recomputes uv/triValid staging from the live graph and uploads the GPU
+ *  buffers. No-op when no texture map is active. */
+void grTextureMapUpdate(grRenderer *r);
+
+/** Frees the texture map's staging arrays and GPU resources (image
+ *  texture/view/sampler, uv/triValid buffers) and resets it to a zeroed,
+ *  inactive state. Safe to call repeatedly and when no texture map was ever
+ *  loaded. Does not touch the mesh itself (owned by grObjOverlay). Called
+ *  from grObjOverlayClear/grObjOverlayRelease. */
+void grTextureMapRelease(grRenderer *r);
+
+/** Encodes the image-rect quad directly into the main scene's render pass
+ *  (@p pass already active, same pass as nodes/edges), using @p r's current
+ *  camera frame so the quad lines up with the live graph. No-op when no
+ *  texture map is active or grTextureMapShowImage(false) was called. Drawn
+ *  before nodes/edges by the caller so the graph remains visible on top. */
+void grTextureMapEncodeImageQuad(grRenderer *r, WGPURenderPassEncoder pass);
+
+/** Pure CPU math (no GPU/gviz types) behind grTextureMapUpdate, split out so
+ *  it is directly unit-testable. For each of @p vertexCount 2D positions,
+ *  computes its (u, v) inside the rect defined by @p center/@p halfExtent
+ *  (u,v in [0,1] when inside; v is flipped so row 0 is "top", matching
+ *  stbi_load's row order) and whether it falls inside that rect. */
+void grTextureMapComputeUV(const double *pos2D, size_t vertexCount,
+                           const double center[2], const double halfExtent[2],
+                           float *uvOut, uint32_t *insideOut);
+
+/** Pure CPU math behind grTextureMapUpdate: derives per-face and per-triangle
+ *  validity from per-vertex insideness. A face (possibly an n-gon,
+ *  fan-triangulated into several triangles sharing @p triangleFaceIds) is
+ *  valid only if every triangle emitted from it has all 3 vertices inside;
+ *  that per-face result is then propagated back to every triangle belonging
+ *  to it, so triangles are only ever marked valid together with the rest of
+ *  their originating face. */
+void grTextureMapComputeFaceValidity(const uint32_t *insideOut,
+                                     size_t vertexCount,
+                                     const uint32_t *indices,
+                                     const uint32_t *triangleFaceIds,
+                                     size_t triangleCount, size_t faceCount,
+                                     uint32_t *faceValidOut,
+                                     uint32_t *triValidOut);
+
 // ------------------------------------------------------------------------------
 // Platform
 // ------------------------------------------------------------------------------
@@ -209,6 +317,10 @@ void grPlatformInitApplication(void);
 
 /** Refreshes the Charts submenu from the attached graph's stat series. */
 void grPlatformStatsMenuRefresh(struct grRenderer *r);
+
+/** Refreshes the View menu's "Show Texture Image" checkbox from the current
+ *  texture map state (enabled/checked only while a texture map is active). */
+void grPlatformTextureMapMenuRefresh(struct grRenderer *r);
 
 // ------------------------------------------------------------------------------
 // Renderer

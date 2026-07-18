@@ -38,7 +38,8 @@ static int parseFaceVertexIndex(const char *tok, size_t vertexCount,
 }
 
 static int parseFaceLine(const char *p, size_t vertexCount,
-                         gvizArray *indices) {
+                         gvizArray *indices, gvizArray *faceIds,
+                         size_t faceId) {
   size_t faceVerts[GR_OBJ_MAX_FACE_VERTS];
   size_t faceLen = 0;
 
@@ -58,13 +59,16 @@ static int parseFaceLine(const char *p, size_t vertexCount,
       p++;
   }
 
-  // Fan-triangulate the polygon (v0, vi, vi+1).
+  // Fan-triangulate the polygon (v0, vi, vi+1); every emitted triangle
+  // records the same faceId so callers can recover which original 'f' line
+  // (possibly an n-gon) a triangle belongs to.
   for (size_t i = 1; i + 1 < faceLen; i++) {
     uint32_t a = (uint32_t)faceVerts[0];
     uint32_t b = (uint32_t)faceVerts[i];
     uint32_t c = (uint32_t)faceVerts[i + 1];
+    uint32_t fid = (uint32_t)faceId;
     if (gvizArrayPush(indices, &a) < 0 || gvizArrayPush(indices, &b) < 0 ||
-        gvizArrayPush(indices, &c) < 0)
+        gvizArrayPush(indices, &c) < 0 || gvizArrayPush(faceIds, &fid) < 0)
       return -1;
   }
   return 0;
@@ -120,10 +124,12 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
     return -1;
   }
 
-  gvizArray positions, indices;
+  gvizArray positions, indices, faceIds;
   if (gvizArrayInit(&positions, sizeof(grVec3d)) < 0 ||
-      gvizArrayInit(&indices, sizeof(uint32_t)) < 0) {
+      gvizArrayInit(&indices, sizeof(uint32_t)) < 0 ||
+      gvizArrayInit(&faceIds, sizeof(uint32_t)) < 0) {
     gvizArrayRelease(&positions);
+    gvizArrayRelease(&indices);
     fclose(file);
     return -1;
   }
@@ -131,6 +137,7 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
   char *line = NULL;
   size_t lineCap = 0;
   int err = 0;
+  size_t faceCount = 0;
 
   while (getline(&line, &lineCap, file) != -1) {
     const char *p = line;
@@ -151,10 +158,12 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
     }
 
     if (p[0] == 'f' && (p[1] == ' ' || p[1] == '\t')) {
-      if (parseFaceLine(p + 1, positions.count, &indices) < 0) {
+      if (parseFaceLine(p + 1, positions.count, &indices, &faceIds,
+                        faceCount) < 0) {
         err = -1;
         break;
       }
+      faceCount++;
     }
   }
 
@@ -165,12 +174,14 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
     GR_LOG("failed to parse obj file '%s'\n", path);
     gvizArrayRelease(&positions);
     gvizArrayRelease(&indices);
+    gvizArrayRelease(&faceIds);
     return -1;
   }
 
   size_t vertexCount = positions.count;
   size_t indexCount = indices.count;
   const uint32_t *idx = indices.arr;
+  const uint32_t *faceIdsArr = faceIds.arr;
 
   // .obj files are Y-up by convention; grender's world is Z-up, so rotate
   // the mesh +90 degrees about X (y,z) -> (-z,y) to stand it upright facing
@@ -186,12 +197,15 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
   float *outPositions = malloc(sizeof(float) * vertexCount * 3);
   float *outNormals = malloc(sizeof(float) * vertexCount * 3);
   uint32_t *outIndices = malloc(sizeof(uint32_t) * indexCount);
-  if (!outPositions || !outNormals || !outIndices) {
+  uint32_t *outFaceIds = malloc(sizeof(uint32_t) * (indexCount / 3));
+  if (!outPositions || !outNormals || !outIndices || !outFaceIds) {
     free(outPositions);
     free(outNormals);
     free(outIndices);
+    free(outFaceIds);
     gvizArrayRelease(&positions);
     gvizArrayRelease(&indices);
+    gvizArrayRelease(&faceIds);
     return -1;
   }
 
@@ -208,16 +222,20 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
     }
   }
   memcpy(outIndices, idx, sizeof(uint32_t) * indexCount);
+  memcpy(outFaceIds, faceIdsArr, sizeof(uint32_t) * (indexCount / 3));
   computeNormals(pos, vertexCount, idx, indexCount, outNormals);
 
   gvizArrayRelease(&positions);
   gvizArrayRelease(&indices);
+  gvizArrayRelease(&faceIds);
 
   out->positions = outPositions;
   out->normals = outNormals;
   out->indices = outIndices;
+  out->triangleFaceIds = outFaceIds;
   out->vertexCount = vertexCount;
   out->indexCount = indexCount;
+  out->faceCount = faceCount;
   memcpy(out->bmin, bmin, sizeof(bmin));
   memcpy(out->bmax, bmax, sizeof(bmax));
   return 0;
@@ -229,5 +247,6 @@ void grObjMeshRelease(grObjMesh *mesh) {
   free(mesh->positions);
   free(mesh->normals);
   free(mesh->indices);
+  free(mesh->triangleFaceIds);
   memset(mesh, 0, sizeof(*mesh));
 }
