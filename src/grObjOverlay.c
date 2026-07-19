@@ -16,7 +16,7 @@
 
 #define GR_LOG(...) fprintf(stderr, "[grender] " __VA_ARGS__)
 
-#define GR_OBJ_PANEL_SIZE 200.0
+#define GR_OBJ_PANEL_SIZE 400.0
 #define GR_OBJ_PANEL_MARGIN 12.0
 #define GR_OBJ_SPIN_RADIANS_PER_SEC 0.6
 

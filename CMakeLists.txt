@@ -147,8 +147,8 @@ if(GRENDER_BUILD_EXAMPLES AND TARGET graphvis)
     add_executable(tutteDemo examples/tutteDemo.c)
     target_link_libraries(tutteDemo PRIVATE grender graphvis)
 
-    add_executable(frPairwiseDemo examples/frPairwiseDemo.c)
-    target_link_libraries(frPairwiseDemo PRIVATE grender graphvis)
+    add_executable(forceEmbedderDemo examples/forceEmbedderDemo.c)
+    target_link_libraries(forceEmbedderDemo PRIVATE grender graphvis)
 
     add_executable(textureMapDemo examples/textureMapDemo.c)
     target_link_libraries(textureMapDemo PRIVATE grender graphvis)

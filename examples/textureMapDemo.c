@@ -134,7 +134,7 @@ static void actionMoveUp(gvizEmbeddedGraph *eg, void *userData,
   grTextureMapMoveImage(userData, 0.0, hh * TEXMAP_MOVE_STEP_FRACTION);
 }
 static void actionMoveDown(gvizEmbeddedGraph *eg, void *userData,
-                          const gvizActionPayload *payload) {
+                           const gvizActionPayload *payload) {
   (void)eg;
   (void)payload;
   double cx, cy, hw, hh;
@@ -142,7 +142,7 @@ static void actionMoveDown(gvizEmbeddedGraph *eg, void *userData,
   grTextureMapMoveImage(userData, 0.0, -hh * TEXMAP_MOVE_STEP_FRACTION);
 }
 static void actionMoveLeft(gvizEmbeddedGraph *eg, void *userData,
-                          const gvizActionPayload *payload) {
+                           const gvizActionPayload *payload) {
   (void)eg;
   (void)payload;
   double cx, cy, hw, hh;
@@ -150,13 +150,13 @@ static void actionMoveLeft(gvizEmbeddedGraph *eg, void *userData,
   grTextureMapMoveImage(userData, -hw * TEXMAP_MOVE_STEP_FRACTION, 0.0);
 }
 static void actionGrow(gvizEmbeddedGraph *eg, void *userData,
-                      const gvizActionPayload *payload) {
+                       const gvizActionPayload *payload) {
   (void)eg;
   (void)payload;
   grTextureMapScaleImage(userData, TEXMAP_SCALE_STEP_FACTOR);
 }
 static void actionShrink(gvizEmbeddedGraph *eg, void *userData,
-                        const gvizActionPayload *payload) {
+                         const gvizActionPayload *payload) {
   (void)eg;
   (void)payload;
   grTextureMapScaleImage(userData, 1.0 / TEXMAP_SCALE_STEP_FACTOR);
@@ -202,7 +202,7 @@ static void actionDampingDown(gvizEmbeddedGraph *eg, void *userData,
 // back to the jumbled/oscillating layout (begun = 0) so a new boundary face
 // can be picked.
 static void actionReset(gvizEmbeddedGraph *eg, void *userData,
-                       const gvizActionPayload *payload) {
+                        const gvizActionPayload *payload) {
   (void)eg;
   (void)payload;
   TexMapDemoState *ds = userData;
@@ -264,7 +264,7 @@ static void actionNextFaceOrMoveRight(gvizEmbeddedGraph *eg, void *userData,
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr,
-           "usage: textureMapDemo <obj> <image> [screenshot.ppm] [move]\n");
+            "usage: textureMapDemo <obj> <image> [screenshot.ppm] [move]\n");
     return 1;
   }
   const char *obj = argv[1];
@@ -289,6 +289,7 @@ int main(int argc, char **argv) {
     gvizGraphRelease(&graph);
     return 1;
   }
+  gvizSpringTutteEmbedderConfigure(&tutte, 20, 0.5);
 
   gvizEmbeddedGraph *eg = (gvizEmbeddedGraph *)&tutte;
 
@@ -331,7 +332,7 @@ int main(int argc, char **argv) {
       seed = 1;
     gvizEmbeddedGraphRandomizePositions(eg, TEXMAP_SCATTER_BOX_EXTENT, seed);
     memcpy(scatterAnchors + i * posN, gvizEmbeddedGraphPositions(eg),
-          sizeof(double) * posN);
+           sizeof(double) * posN);
   }
   bool autoStep = true;
   gvizEmbeddedGraphAddAction(eg, "demo.toggleAuto", actionToggleAuto,
@@ -340,8 +341,8 @@ int main(int argc, char **argv) {
   grRendererDesc desc;
   grRendererDescInit(&desc);
   desc.title = "grender - Texture Map (right arrow: pick face, B: fix, R: "
-              "step, space: auto, K/J: stiffness, '/;: damping, =/-: scale "
-              "image, 0: reset)";
+               "step, space: auto, K/J: stiffness, '/;: damping, =/-: scale "
+               "image, 0: reset)";
   desc.nodeStyle.radius = 3.0f;
   desc.nodeStyle.fillColor = GR_COLOR(0.55f, 0.78f, 1.0f, 1.0f);
   desc.edgeStyle.color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.45f);
@@ -370,9 +371,9 @@ int main(int argc, char **argv) {
   grTextureMap *tm = grRendererLoadTextureMap(r, eg, obj, imagePath);
   if (!tm) {
     fprintf(stderr,
-           "texture map load failed for obj '%s' / image '%s' (vertex-count "
-           "mismatch, bad image, or non-2D embedding)\n",
-           obj, imagePath);
+            "texture map load failed for obj '%s' / image '%s' (vertex-count "
+            "mismatch, bad image, or non-2D embedding)\n",
+            obj, imagePath);
     grRendererDestroy(r);
     free(scatterAnchors);
     gvizEmbeddedGraphFaceSearchRelease(&ds.faceSearch);
@@ -433,9 +434,8 @@ int main(int argc, char **argv) {
     demoCycleFace(&ds);
     if (gvizSpringTutteEmbedderFixOuterFace(&tutte) < 0)
       fprintf(stderr,
-             "warning: failed to auto-fix initial boundary for screenshot\n");
+              "warning: failed to auto-fix initial boundary for screenshot\n");
   }
-
 
   grRendererShowStats(r, false);
   grRendererShowObjOverlay(r, false);
@@ -459,7 +459,7 @@ int main(int argc, char **argv) {
       }
     } else if (autoStep && !tutte.converged) {
       double dt = grRendererDeltaTime(r);
-      for (size_t i = 0; i < 1; i++) {
+      for (size_t i = 0; i < 20; i++) {
         gvizSpringTutteEmbedderStep(&tutte, dt);
       }
     }
