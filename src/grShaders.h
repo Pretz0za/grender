@@ -18,6 +18,7 @@ static const char GR_WGSL_SOURCE[] =
     "  nodeFill   : vec4f,\n"
     "  nodeStroke : vec4f,\n"
     "  nodeParams : vec4f,\n" // x radius, y strokeWidth, z sizeMode, w proj11
+    "  nodeSizeLimits : vec4f,\n" // x minPixelRadius, y maxPixelRadius (0 = off)
     "  edgeColor  : vec4f,\n"
     "  edgeParams : vec4f,\n" // x width, y sizeMode
     "}\n"
@@ -88,7 +89,14 @@ static const char GR_WGSL_SOURCE[] =
     "  var radius = G.nodeParams.x;\n"
     "  if ((G.flags & FLAG_NODE_SIZES) != 0u) { radius = nodeSizes[id]; }\n"
     "  var radiusPx = radius;\n"
-    "  if (G.nodeParams.z > 0.5) { radiusPx = radius * pxPerWorld(clip.w); }\n"
+    "  if (G.nodeParams.z > 0.5) {\n"
+    "    radiusPx = radius * pxPerWorld(clip.w);\n"
+    // Clamp only the on-screen pixel size, at draw time; the world-space
+    // radius (e.g. used as a physics collision radius elsewhere) is
+    // untouched. maxPixelRadius <= 0 means no ceiling.
+    "    if (G.nodeSizeLimits.y > 0.0) { radiusPx = min(radiusPx, G.nodeSizeLimits.y); }\n"
+    "    radiusPx = max(radiusPx, G.nodeSizeLimits.x);\n"
+    "  }\n"
     "  let strokePx = select(G.nodeParams.y,\n"
     "                        G.nodeParams.y * pxPerWorld(clip.w),\n"
     "                        G.nodeParams.z > 0.5);\n"

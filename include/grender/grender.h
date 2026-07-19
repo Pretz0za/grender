@@ -58,6 +58,18 @@ typedef struct grNodeStyle {
   float radius;        /**< Node radius, interpreted per sizeMode. */
   float strokeWidth;   /**< Outline width in the same unit as radius. */
   grSizeMode sizeMode;
+  /**
+   * Floor/ceiling on the on-screen node radius in pixels, applied only when
+   * sizeMode is GR_SIZE_WORLD and only at draw time: the world-space radius
+   * itself (global or per-node, see grRendererSetNodeSizes) is never
+   * altered, so anything else reading it -- e.g. physics using it as a
+   * collision radius -- is unaffected. Use these to keep nodes visible when
+   * zoomed far out or reasonably sized when zoomed far in, without giving up
+   * world-space sizing the rest of the time. 0 disables each independently
+   * (the default for both).
+   */
+  float minPixelRadius;
+  float maxPixelRadius;
 } grNodeStyle;
 
 typedef struct grEdgeStyle {
@@ -182,6 +194,24 @@ enum {
  * Requires a planar combinatorial embedding (gvizEmbeddedGraphApplyPlanarEmbedding).
  */
 #define GR_ACTION_PICK_FACE "grender.pickFace"
+
+/**
+ * Action name registered by grRendererSetGraph for vertex picking. Selects
+ * the vertex nearest the click (in the worldX/worldY plane) and, only when
+ * that click actually lands within the vertex's current on-screen radius
+ * (its drawn size, converted from pixels to world units at the vertex's
+ * depth -- i.e. the same tolerance a click needs to land inside the visible
+ * circle), highlights it together with its neighbors and incident edges via
+ * grRendererSetHighlight. A click that lands on no vertex clears any existing
+ * highlight (grRendererClearHighlight), the same as a face-pick miss.
+ * Replacing a highlight discards the previous one automatically -- no need
+ * to clear first. Only fires on an actual click (press and release without
+ * dragging); a click-and-drag pans/orbits instead and never reaches this
+ * action, the same drag-vs-click distinction grRendererBindMouse already
+ * documents. Bound to the left mouse button by default; rebind with
+ * grRendererBindMouse or replace with a no-op action name to disable.
+ */
+#define GR_ACTION_PICK_VERTEX "grender.pickVertex"
 
 /**
  * Binds @p key so that pressing it invokes the action named @p actionName on

@@ -148,6 +148,8 @@ if(GRENDER_BUILD_EXAMPLES AND TARGET graphvis)
     target_link_libraries(tutteDemo PRIVATE grender graphvis)
 
     add_executable(forceEmbedderDemo examples/forceEmbedderDemo.c)
+    target_compile_definitions(forceEmbedderDemo PRIVATE
+        GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
     target_link_libraries(forceEmbedderDemo PRIVATE grender graphvis)
 
     add_executable(textureMapDemo examples/textureMapDemo.c)

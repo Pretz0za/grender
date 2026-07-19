@@ -361,6 +361,8 @@ typedef struct grGlobalsUBO {
   float nodeStroke[4];
   /** x: radius, y: strokeWidth, z: sizeMode (0 px / 1 world), w: proj11. */
   float nodeParams[4];
+  /** x: minPixelRadius, y: maxPixelRadius (0 disables each), z/w: unused. */
+  float nodeSizeLimits[4];
   float edgeColor[4];
   /** x: width, y: sizeMode, z/w: unused. */
   float edgeParams[4];
@@ -413,6 +415,14 @@ struct grRenderer {
   WGPUBindGroup bindGroup;
   bool bindGroupDirty;
   bool hasNodeColors, hasNodeSizes, hasEdgeColors;
+  /** CPU mirror of the last grRendererSetNodeSizes upload, indexed by
+   *  parent-graph vertex id (only what the GPU buffer holds; not otherwise
+   *  readable back from the GPU). Used by vertex-pick hit-testing
+   *  (grenderActionPickVertex) so a per-vertex-sized node's actual on-screen
+   *  radius is honored instead of falling back to the global node style.
+   *  NULL/0 whenever hasNodeSizes is false. */
+  float *nodeSizesStaging;
+  size_t nodeSizesStagingCount;
 
   // highlight styling (subgraph lives on the attached gvizEmbeddedGraph)
   bool highlightActive;
@@ -446,6 +456,11 @@ struct grRenderer {
   grCamera camera;
   grCameraFrame cameraFrame;
   double contentScale;       /**< Framebuffer px per window point. */
+  double viewportHeightPx;   /**< Cached each frame (processInput); lets
+                                  action handlers convert a node's pixel
+                                  radius to world units, mirroring the
+                                  vertex shader's pxPerWorld (grShaders.h),
+                                  for hit-testing (see grenderActionPickVertex). */
   bool draggingPan, draggingOrbit;
   double dragLastX, dragLastY;
   double scrollAccum;

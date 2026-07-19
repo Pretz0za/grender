@@ -19,6 +19,8 @@
 
 static void grenderActionPickFace(gvizEmbeddedGraph *eg, void *userData,
                                   const gvizActionPayload *payload);
+static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
+                                    const gvizActionPayload *payload);
 
 // ------------------------------------------------------------------------------
 // Defaults
@@ -36,6 +38,8 @@ void grRendererDescInit(grRendererDesc *desc) {
       .radius = 3.0f,
       .strokeWidth = 0.0f,
       .sizeMode = GR_SIZE_PIXELS,
+      .minPixelRadius = 0.0f,
+      .maxPixelRadius = 0.0f,
   };
   desc->edgeStyle = (grEdgeStyle){
       .color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.55f),
@@ -496,6 +500,7 @@ void grRendererDestroy(grRenderer *r) {
 
   grTopologyRelease(&r->topo);
   free(r->posStaging);
+  free(r->nodeSizesStaging);
   gvizArrayRelease(&r->statsPrims);
   gvizArrayRelease(&r->statsSeriesRevisions);
   free(r->statsSeriesVisible);
@@ -732,6 +737,8 @@ int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
   r->graph = graph;
   gvizEmbeddedGraphAddAction(graph, GR_ACTION_PICK_FACE, grenderActionPickFace,
                              r);
+  gvizEmbeddedGraphAddAction(graph, GR_ACTION_PICK_VERTEX,
+                             grenderActionPickVertex, r);
   r->highlightActive = false;
   r->highlightDirty = false;
   if (dim == 3 || dim == 4)
@@ -804,8 +811,32 @@ int grRendererSetNodeColors(grRenderer *r, const uint32_t *rgba8,
 int grRendererSetNodeSizes(grRenderer *r, const float *radii, size_t count) {
   if (radii && (!r->graph || count != r->posCapacity))
     return -1;
-  return uploadAttribute(r, &r->nodeSizesBuf, radii, count * sizeof(float),
-                         &r->hasNodeSizes, "grender node sizes");
+
+  int res = uploadAttribute(r, &r->nodeSizesBuf, radii, count * sizeof(float),
+                            &r->hasNodeSizes, "grender node sizes");
+  if (res < 0)
+    return res;
+
+  if (!r->hasNodeSizes) {
+    free(r->nodeSizesStaging);
+    r->nodeSizesStaging = NULL;
+    r->nodeSizesStagingCount = 0;
+    return 0;
+  }
+
+  float *staging = realloc(r->nodeSizesStaging, count * sizeof(float));
+  if (!staging) {
+    // GPU upload already succeeded; hit-testing just falls back to the
+    // global node style radius until the next successful call.
+    free(r->nodeSizesStaging);
+    r->nodeSizesStaging = NULL;
+    r->nodeSizesStagingCount = 0;
+    return 0;
+  }
+  memcpy(staging, radii, count * sizeof(float));
+  r->nodeSizesStaging = staging;
+  r->nodeSizesStagingCount = count;
+  return 0;
 }
 
 int grRendererSetEdgeColors(grRenderer *r, const uint32_t *rgba8,
@@ -1062,6 +1093,105 @@ static void grenderActionPickFace(gvizEmbeddedGraph *eg, void *userData,
   gvizSubgraphRelease(&face);
 }
 
+/**
+ * World-space click tolerance for grenderActionPickVertex: the radius (in
+ * world units, at depth (x, y, z)) that vertex @p v is actually drawn at on
+ * screen right now -- honoring a per-vertex size from grRendererSetNodeSizes
+ * when one is active, exactly like the vertex shader does. Ports the shader's
+ * own pxPerWorld/radiusPx math (grShaders.h) to the CPU so a click only
+ * counts as landing "on" a vertex when it falls within the same circle the
+ * user sees, then converts that pixel radius back to world units for
+ * comparison against worldX/worldY (already unprojected onto the
+ * camera-target plane, same as pick-face).
+ */
+static double grHitTestVertexEpsilon(grRenderer *r, uint32_t v, double x,
+                                     double y, double z) {
+  const float *viewProj = r->cameraFrame.viewProj;
+  double clipW = (double)viewProj[3] * x + (double)viewProj[7] * y +
+                (double)viewProj[11] * z + (double)viewProj[15];
+  if (clipW < 1e-6)
+    clipW = 1e-6;
+  double pxPerWorld =
+      (double)r->cameraFrame.proj11 * r->viewportHeightPx / (2.0 * clipW);
+  if (pxPerWorld <= 0.0)
+    return 0.0;
+
+  double radius = (r->hasNodeSizes && r->nodeSizesStaging &&
+                   v < r->nodeSizesStagingCount)
+                      ? r->nodeSizesStaging[v]
+                      : r->nodeStyle.radius;
+  double radiusPx = radius;
+  if (r->nodeStyle.sizeMode == GR_SIZE_WORLD) {
+    radiusPx = radius * pxPerWorld;
+    if (r->nodeStyle.maxPixelRadius > 0.0f)
+      radiusPx = fmin(radiusPx, r->nodeStyle.maxPixelRadius);
+    radiusPx = fmax(radiusPx, r->nodeStyle.minPixelRadius);
+  }
+  return radiusPx / pxPerWorld;
+}
+
+static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
+                                    const gvizActionPayload *payload) {
+  grRenderer *r = userData;
+  if (!r || !payload || r->topo.nodeCount == 0)
+    return;
+
+  size_t dim = gvizEmbeddedGraphDim(eg);
+  const double *pos = gvizEmbeddedGraphPositions(eg);
+
+  // Picks the vertex whose drawn circle contains the click, preferring the
+  // most centrally-contained one when circles overlap (smaller vertices
+  // sitting on/near a larger one must still be selectable, so this can't
+  // just take the nearest center and test that one vertex's radius alone --
+  // per-vertex sizes vary, so the nearest center isn't necessarily the
+  // vertex whose circle actually reaches the click).
+  size_t best = SIZE_MAX;
+  double bestRatio2 = 0.0;
+  for (size_t i = 0; i < r->topo.nodeCount; i++) {
+    uint32_t v = r->topo.nodeIds[i];
+    const double *p = pos + (size_t)v * dim;
+    double dx = p[0] - payload->worldX;
+    double dy = p[1] - payload->worldY;
+    double d2 = dx * dx + dy * dy;
+
+    double epsilon = grHitTestVertexEpsilon(r, v, p[0], p[1],
+                                            dim >= 3 ? p[2] : 0.0);
+    if (epsilon <= 0.0)
+      continue;
+    double ratio2 = d2 / (epsilon * epsilon);
+    if (ratio2 > 1.0)
+      continue; // click falls outside this vertex's on-screen circle
+    if (best == SIZE_MAX || ratio2 < bestRatio2) {
+      best = v;
+      bestRatio2 = ratio2;
+    }
+  }
+  if (best == SIZE_MAX) {
+    grRendererClearHighlight(r);
+    return;
+  }
+  size_t nearest = best;
+
+  const gvizSubgraph *structure = gvizEmbeddedGraphStructure(eg);
+  gvizSubgraph pick = gvizSubgraphCreateEmpty(structure->g);
+  if (!pick.g)
+    return;
+
+  gvizSubgraphShowVertex(&pick, nearest);
+  gvizSubgraphNeighborIterator nit =
+      gvizSubgraphNeighborIteratorCreate(structure, nearest);
+  size_t v;
+  while (gvizSubgraphNeighborIterate(&nit, &v)) {
+    gvizSubgraphShowVertex(&pick, v);
+    highlightShowBoundaryEdge(&pick, nearest, v);
+  }
+  gvizSubgraphRebuild(&pick);
+
+  grRendererSetHighlight(r, &pick, GR_RGBA8(255, 210, 80, 255),
+                         GR_RGBA8(255, 180, 40, 255));
+  gvizSubgraphRelease(&pick);
+}
+
 void grRendererFitView(grRenderer *r) { r->fitRequested = true; }
 
 void grRendererRequestClose(grRenderer *r) { r->closeRequested = true; }
@@ -1115,6 +1245,8 @@ static void fitViewNow(grRenderer *r, double fbw, double fbh) {
 
 /** Applies built-in navigation and queues action dispatches. */
 static void processInput(grRenderer *r, double fbw, double fbh) {
+  r->viewportHeightPx = fbh;
+
   double cx, cy;
   glfwGetCursorPos(r->window, &cx, &cy);
   double cxPx = cx * r->contentScale, cyPx = cy * r->contentScale;
@@ -1226,6 +1358,8 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
         break;
       }
     }
+    if (!actionName && button == GR_MOUSE_BUTTON_LEFT)
+      actionName = GR_ACTION_PICK_VERTEX;
     if (!actionName || !r->graph)
       continue;
 
@@ -1261,6 +1395,10 @@ static void writeGlobals(grRenderer *r, double fbw, double fbh) {
   g.nodeParams[1] = r->nodeStyle.strokeWidth;
   g.nodeParams[2] = r->nodeStyle.sizeMode == GR_SIZE_WORLD ? 1.0f : 0.0f;
   g.nodeParams[3] = r->cameraFrame.proj11;
+  g.nodeSizeLimits[0] = r->nodeStyle.minPixelRadius;
+  g.nodeSizeLimits[1] = r->nodeStyle.maxPixelRadius;
+  g.nodeSizeLimits[2] = 0.0f;
+  g.nodeSizeLimits[3] = 0.0f;
 
   memcpy(g.edgeColor, &r->edgeStyle.color, sizeof(float) * 4);
   g.edgeParams[0] = r->edgeStyle.width;
