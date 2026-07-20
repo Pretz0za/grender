@@ -116,7 +116,8 @@ int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph);
  * Notifies the renderer that the *structure* of the attached graph changed
    * (vertices/edges added, removed, hidden or shown). Topology buffers are
    * rebuilt lazily before the next frame. Pure position changes and draw-mask
-   * updates (via gvizEmbeddedGraphSetDrawMask) never require this call.
+   * updates (via gvizEmbeddedGraphSetDrawMaskEdgePolicy and friends) never
+   * require this call.
    */
   void grRendererGraphStructureChanged(grRenderer *r);
 
@@ -191,7 +192,7 @@ enum {
 /**
  * Action name registered by grRendererSetGraph for 2D face picking and
  * highlighting. The payload worldX/worldY are filled from the click position.
- * Requires a planar combinatorial embedding (gvizEmbeddedGraphApplyPlanarEmbedding).
+ * Requires a planar combinatorial embedding (gvizPlanarApplyRotationToEmbedding).
  */
 #define GR_ACTION_PICK_FACE "grender.pickFace"
 

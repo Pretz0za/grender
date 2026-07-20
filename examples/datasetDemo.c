@@ -202,7 +202,7 @@ int main(int argc, char **argv) {
     gvizGraphRelease(&graph);
     return 1;
   }
-  gvizGRIPEmbedderConfigureK(&grip, 256, 256, 256, GVIZ_GRIP_K_CONSTANT);
+  gvizGRIPEmbedderConfigureK(&grip, 256, 256, GVIZ_GRIP_K_CONSTANT);
 
   printf("building MIS filtration...\n");
   gvizGRIPEmbedderBegin(&grip);
@@ -249,9 +249,9 @@ int main(int argc, char **argv) {
       if (grip.currLayer == 0)
         autoRefine = false;
       else
-        beginNewStage(&grip);
+        gvizGRIPEmbedderNextStage(&grip);
     } else {
-      runRefinementRound(&grip);
+      gvizGRIPEmbedderRefineRound(&grip);
     }
   }
 

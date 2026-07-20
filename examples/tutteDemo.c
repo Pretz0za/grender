@@ -30,6 +30,7 @@
 #include "ds/gvizGraph.h"
 #include "ds/gvizSubgraph.h"
 #include "embedders/gvizTutteEmbedder.h"
+#include "utils/graphLoader.h"
 #include "utils/graphs.h"
 
 #include <stdbool.h>

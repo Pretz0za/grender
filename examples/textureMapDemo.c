@@ -67,8 +67,9 @@
 
 #include "ds/gvizGraph.h"
 #include "ds/gvizSubgraph.h"
+#include "embedders/gvizPlanarEmbedder.h"
 #include "embedders/gvizSpringTutteEmbedder.h"
-#include "utils/graphs.h"
+#include "utils/graphLoader.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -216,11 +217,10 @@ static void actionReset(gvizEmbeddedGraph *eg, void *userData,
 // Returns 0 when state->faceSearch.face is valid, -1 if the mesh has no
 // faces at all.
 static int demoAdvanceFace(TexMapDemoState *ds) {
-  gvizEmbeddedGraph *eg = (gvizEmbeddedGraph *)ds->tutte;
-  int status = gvizEmbeddedGraphNextFace(eg, &ds->faceSearch);
+  int status = gvizPlanarNextFace(&ds->faceSearch);
   if (status == 1) {
     ds->faceSearch.nextFace = 0;
-    status = gvizEmbeddedGraphNextFace(eg, &ds->faceSearch);
+    status = gvizPlanarNextFace(&ds->faceSearch);
   }
   return status == 0 ? 0 : -1;
 }
@@ -228,7 +228,7 @@ static int demoAdvanceFace(TexMapDemoState *ds) {
 // Highlights whatever face gvizFaceSearchState currently points at.
 static void demoHighlightCurrentFace(TexMapDemoState *ds) {
   gvizSubgraph face = {0};
-  if (gvizEmbeddedGraphFaceSearchSubgraph(&ds->faceSearch, &face) != 0)
+  if (gvizPlanarFaceSearchSubgraph(&ds->faceSearch, &face) != 0)
     return;
   grRendererSetHighlight(ds->r, &face, GR_RGBA8(255, 210, 80, 255),
                          GR_RGBA8(255, 180, 40, 255));
@@ -293,7 +293,7 @@ int main(int argc, char **argv) {
 
   gvizEmbeddedGraph *eg = (gvizEmbeddedGraph *)&tutte;
 
-  int planar = gvizEmbeddedGraphApplyPlanarEmbedding(eg);
+  int planar = gvizPlanarApplyRotationToEmbedding(eg);
   if (planar < 0) {
     fprintf(stderr, planar == -2 ? "mesh topology is non-planar\n"
                                  : "planar embedding failed\n");
@@ -304,7 +304,7 @@ int main(int argc, char **argv) {
 
   TexMapDemoState ds = {0};
   ds.tutte = &tutte;
-  if (gvizEmbeddedGraphFaceSearchInit(eg, &ds.faceSearch) < 0) {
+  if (gvizPlanarFaceSearchInit(eg, &ds.faceSearch) < 0) {
     fprintf(stderr, "face enumeration failed\n");
     gvizSpringTutteEmbedderRelease(&tutte);
     gvizGraphRelease(&graph);
@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
       malloc(sizeof(double) * TEXMAP_SCATTER_ANCHOR_COUNT * posN);
   if (!scatterAnchors) {
     fprintf(stderr, "scatter anchor allocation failed\n");
-    gvizEmbeddedGraphFaceSearchRelease(&ds.faceSearch);
+    gvizPlanarFaceSearchRelease(&ds.faceSearch);
     gvizSpringTutteEmbedderRelease(&tutte);
     gvizGraphRelease(&graph);
     return 1;
@@ -352,7 +352,7 @@ int main(int argc, char **argv) {
   if (!r) {
     fprintf(stderr, "renderer creation failed\n");
     free(scatterAnchors);
-    gvizEmbeddedGraphFaceSearchRelease(&ds.faceSearch);
+    gvizPlanarFaceSearchRelease(&ds.faceSearch);
     gvizSpringTutteEmbedderRelease(&tutte);
     gvizGraphRelease(&graph);
     return 1;
@@ -362,7 +362,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     free(scatterAnchors);
-    gvizEmbeddedGraphFaceSearchRelease(&ds.faceSearch);
+    gvizPlanarFaceSearchRelease(&ds.faceSearch);
     gvizSpringTutteEmbedderRelease(&tutte);
     gvizGraphRelease(&graph);
     return 1;
@@ -376,7 +376,7 @@ int main(int argc, char **argv) {
             obj, imagePath);
     grRendererDestroy(r);
     free(scatterAnchors);
-    gvizEmbeddedGraphFaceSearchRelease(&ds.faceSearch);
+    gvizPlanarFaceSearchRelease(&ds.faceSearch);
     gvizSpringTutteEmbedderRelease(&tutte);
     gvizGraphRelease(&graph);
     return 1;
@@ -488,7 +488,7 @@ int main(int argc, char **argv) {
 
   grRendererDestroy(r);
   free(scatterAnchors);
-  gvizEmbeddedGraphFaceSearchRelease(&ds.faceSearch);
+  gvizPlanarFaceSearchRelease(&ds.faceSearch);
   gvizSpringTutteEmbedderRelease(&tutte);
   gvizGraphRelease(&graph);
   return 0;

@@ -62,8 +62,8 @@
 #error "GRENDER_GVIZ_DATA_DIR must be defined by CMake"
 #endif
 
-#define DEMO_GRAVITY_K_DEFAULT 0.05
-#define DEMO_GRAVITY_K_STEP 0.01
+#define DEMO_GRAVITY_K_DEFAULT 1.00
+#define DEMO_GRAVITY_K_STEP 0.10
 #define DEMO_THETA_STEP 0.1
 #define DEMO_THETA_MIN 0.1
 #define DEMO_EDGE_LENGTH_STEP 0.2

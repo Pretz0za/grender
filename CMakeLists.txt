@@ -131,6 +131,8 @@ endif()
 # ------------------------------------------------------------------------------
 if(GRENDER_BUILD_EXAMPLES AND TARGET graphvis)
     add_executable(gripDemo examples/gripDemo.c)
+    target_compile_definitions(gripDemo PRIVATE
+        GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
     target_link_libraries(gripDemo PRIVATE grender graphvis)
 
     add_executable(millionDemo examples/millionDemo.c)

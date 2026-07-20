@@ -4,6 +4,7 @@
 #include "ds/gvizArray.h"
 #include "ds/gvizGraph.h"
 #include "ds/gvizSubgraph.h"
+#include "embedders/gvizPlanarEmbedder.h"
 
 #include <webgpu/wgpu.h> // wgpu-native extensions (wgpuDevicePoll)
 
@@ -1082,8 +1083,8 @@ static void grenderActionPickFace(gvizEmbeddedGraph *eg, void *userData,
     return;
 
   gvizSubgraph face = {0};
-  if (gvizEmbeddedGraphFaceSubgraphAt(eg, payload->worldX, payload->worldY,
-                                     &face) != 0) {
+  if (gvizPlanarFaceSubgraphAt(eg, payload->worldX, payload->worldY,
+                               &face) != 0) {
     grRendererClearHighlight(r);
     return;
   }
