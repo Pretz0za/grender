@@ -334,7 +334,7 @@ int main(int argc, char **argv) {
     memcpy(scatterAnchors + i * posN, gvizEmbeddedGraphPositions(eg),
            sizeof(double) * posN);
   }
-  bool autoStep = true;
+  bool autoStep = false;
   gvizEmbeddedGraphAddAction(eg, "demo.toggleAuto", actionToggleAuto,
                              &autoStep);
 

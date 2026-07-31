@@ -60,6 +60,11 @@ void grCameraUnproject(const grCamera *cam, const grCameraFrame *frame,
 /** Frames an axis-aligned bounding box. */
 void grCameraFitBox(grCamera *cam, const double bmin[3], const double bmax[3],
                     double viewportWPx, double viewportHPx);
+/** Re-centers the camera on @p point (world space) without changing zoom
+ *  (distance) or orbit angle -- unlike grCameraFitBox, which also reframes
+ *  the zoom level to fit a box. Used by the console's "find" command to
+ *  center a vertex on screen while leaving the user's current zoom alone. */
+void grCameraCenterOn(grCamera *cam, const double point[3]);
 
 // ------------------------------------------------------------------------------
 // Topology extraction (the only code that walks gviz structures)
@@ -74,6 +79,11 @@ typedef struct grTopology {
   size_t nodeCount;
   uint32_t *edges;   /**< Flat (u, v) pairs of parent-graph vertex ids. */
   size_t edgeCount;
+  /** Whether the attached graph's parent gvizGraph is directed. When true,
+   *  each (u, v) pair in edges is stored as (from, to) rather than the
+   *  u < v-deduplicated pairs used for undirected graphs, and the edge
+   *  pipeline draws an arrowhead at v. */
+  bool directed;
 } grTopology;
 
 /**
@@ -103,12 +113,131 @@ typedef struct grStatsPrim {
 
 struct grRenderer;
 
+/** Advance of one character cell, in font pixels; and glyph height, in font
+ *  rows. Shared layout constants for the tiny bitmap font in grStats.c. */
+#define GR_FONT_ADVANCE 6.0
+#define GR_FONT_ROWS 7
+
 /**
  * Rebuilds the overlay primitive list (r->statsPrims) from the stat series of
  * the attached graph: one mini line chart per non-empty series, stacked in the
  * top-right corner. Only reads the graph through gvizEmbeddedGraphStatSeries*.
  */
 void grStatsOverlayBuild(struct grRenderer *r, double fbw, double fbh);
+
+/** Screen-space width, in pixels, of @p text set at @p px font-pixel size. */
+double grOverlayTextWidth(const char *text, double px);
+
+/** Pushes a filled rect into r->statsPrims. */
+void grOverlayPushRect(struct grRenderer *r, double x0, double y0, double x1,
+                       double y1, uint32_t color);
+
+/** Pushes an anti-aliased line segment into r->statsPrims. */
+void grOverlayPushLine(struct grRenderer *r, double x0, double y0, double x1,
+                       double y1, double halfWidth, uint32_t color);
+
+/** Pushes a thin rect frame (four edges) into r->statsPrims. */
+void grOverlayPushFrame(struct grRenderer *r, double x0, double y0, double x1,
+                        double y1, double thickness, uint32_t color);
+
+/** Draws @p text with its top-left corner at (x, y) into r->statsPrims;
+ *  @p px is the size of one font pixel. */
+void grOverlayPushText(struct grRenderer *r, double x, double y, double px,
+                       uint32_t color, const char *text);
+
+/** Like grOverlayPushText, but skips any glyph row entirely outside
+ *  [clipY0, clipY1) -- used to scroll text within a fixed-height panel
+ *  without spilling past its edges. */
+void grOverlayPushTextClipped(struct grRenderer *r, double x, double y,
+                              double px, uint32_t color, const char *text,
+                              double clipY0, double clipY1);
+
+/** Whether @p c has a glyph in the tiny bitmap font (case-insensitive).
+ *  grOverlayPushText silently skips characters without one, so callers doing
+ *  their own line-wrapping must not count those characters' width either --
+ *  otherwise wrapping reserves screen space for a character that never
+ *  actually draws anything. */
+bool grOverlayCharHasGlyph(char c);
+
+/** Fixed-width line buffer for grVertexOverlayLayout.lines: one word-wrapped,
+ *  whitespace-collapsed display line. */
+typedef char grVertexOverlayLine[96];
+
+/** Panel geometry and scroll extent for the vertex-info overlay, computed
+ *  without emitting any draw primitives. Shared by grRendererFrame's input
+ *  handling (to hit-test the mouse against the panel and clamp scroll input)
+ *  and by grVertexOverlayBuild (to actually draw it), so both agree on where
+ *  the panel is without duplicating layout math. */
+typedef struct grVertexOverlayLayout {
+  bool visible;
+  double x0, y0, x1, y1;       /**< Panel bounds, framebuffer pixels. */
+  double contentY0, contentY1; /**< Vertical clip range for scrollable text,
+                                     inside the padding and below the title. */
+  double lineH;
+  double maxScrollPx; /**< 0 if all lines fit without scrolling. */
+} grVertexOverlayLayout;
+
+/**
+ * Computes the vertex-info panel's bounds and re-wraps its text into
+ * r->vertexOverlayLines (of grVertexOverlayLine), without touching
+ * r->statsPrims. @p out->visible is false (all other fields zeroed) if no
+ * vertex is currently picked or it has no label.
+ */
+void grVertexOverlayComputeLayout(struct grRenderer *r, double fbw,
+                                  double fbh, grVertexOverlayLayout *out);
+
+/**
+ * Appends the vertex-info panel (the parent-graph vertex id and label of the
+ * last vertex picked via GR_ACTION_PICK_VERTEX) to r->statsPrims, if a
+ * picked vertex with a non-NULL label is set. Labels come from
+ * grRendererSetVertexLabels; this never reads gviz directly. The label is
+ * split on real newlines, whitespace-collapsed, and word-wrapped -- gviz's
+ * graph loader hands back pretty-printed JSON with one field per line, and
+ * this is what actually turns that into readable, non-overflowing text (see
+ * grVertexOverlayComputeLayout). Scrolls via r->vertexOverlayScrollPx when
+ * the wrapped text is taller than the panel.
+ */
+void grVertexOverlayBuild(struct grRenderer *r, double fbw, double fbh);
+
+// ------------------------------------------------------------------------------
+// Command console (stateless command line, e.g. "find <id>"; see grConsole.c)
+// ------------------------------------------------------------------------------
+
+/** Opens the console: shows the input bar and clears any leftover input/
+ *  result from a previous session. No-op if already open. */
+void grConsoleOpen(struct grRenderer *r);
+
+/** Closes the console, discarding the current (unsubmitted) input line. */
+void grConsoleClose(struct grRenderer *r);
+
+/**
+ * Consumes this frame's queued input (r->pendingConsoleEvents, in delivery
+ * order) as console text input: printable characters append to
+ * r->consoleInput, Backspace deletes, Enter runs the line (see grConsoleRun)
+ * and clears it, Escape closes the console. Drains the queue unconditionally,
+ * so any key/char event delivered while the console is open is consumed here
+ * and never reaches grRenderer's own navigation/action dispatch. Only
+ * meaningful (and only called) while r->consoleOpen.
+ */
+void grConsoleProcessInput(struct grRenderer *r);
+
+/**
+ * Parses @p line as "<command> [args...]" (whitespace-separated) and runs it
+ * against the console's built-in command table, writing a result or error
+ * message into r->consoleMessage for the next grConsoleBuild to display. An
+ * empty or all-whitespace line is a silent no-op. Exposed as its own entry
+ * point (rather than folded into grConsoleProcessInput) so a line can be run
+ * without going through the interactive input queue.
+ */
+void grConsoleRun(struct grRenderer *r, const char *line);
+
+/**
+ * Appends the console panel -- the input line with its prompt and cursor,
+ * plus the last command's result/error message -- to r->statsPrims, the same
+ * primitive list and instanced draw pass used by the stats and vertex-info
+ * overlays. No-op when the console is closed.
+ */
+void grConsoleBuild(struct grRenderer *r, double fbw, double fbh);
 
 /**
  * PCA-project @p n vertex-major points from @p srcDim to 3D into @p dst
@@ -348,6 +477,22 @@ typedef struct grPendingMouse {
   double yPx;
 } grPendingMouse;
 
+/**
+ * One console input event, in the chronological order GLFW delivered it:
+ * either a key press (only Enter/Escape/Backspace matter; others are
+ * ignored) or a typed character. Both onKey and onChar push into this same
+ * queue (in addition to onKey's own grPendingKey queue, used for navigation/
+ * action dispatch when the console is closed) specifically so
+ * grConsoleProcessInput can apply "type '3', then press Enter" in the order
+ * it actually happened -- draining two independently-ordered queues (keys,
+ * then chars) would instead let a same-frame Enter run against input that's
+ * missing the character typed just before it.
+ */
+typedef struct grPendingConsoleEvent {
+  bool isChar;
+  int32_t code; /**< GLFW key code if !isChar, Unicode codepoint if isChar. */
+} grPendingConsoleEvent;
+
 /** Must match struct Globals in grShaders.h (16-byte aligned rows). */
 typedef struct grGlobalsUBO {
   float viewProj[16];
@@ -356,7 +501,9 @@ typedef struct grGlobalsUBO {
   float viewport[2];
   uint32_t posDim;
   uint32_t flags; /**< bit0: per-node color, bit1: per-node size,
-                       bit2: per-edge color. */
+                       bit2: per-edge color, bit3: edge degree-alpha,
+                       bit4: edge weight-width, bit5: directed (draw
+                       arrowheads). */
   float nodeFill[4];
   float nodeStroke[4];
   /** x: radius, y: strokeWidth, z: sizeMode (0 px / 1 world), w: proj11. */
@@ -364,7 +511,8 @@ typedef struct grGlobalsUBO {
   /** x: minPixelRadius, y: maxPixelRadius (0 disables each), z/w: unused. */
   float nodeSizeLimits[4];
   float edgeColor[4];
-  /** x: width, y: sizeMode, z/w: unused. */
+  /** x: width, y: sizeMode, z: maxDegree (degree-alpha),
+   *  w: mean edge weight (weight-width). */
   float edgeParams[4];
 } grGlobalsUBO;
 
@@ -411,10 +559,15 @@ struct grRenderer {
   WGPUBuffer nodeSizesBuf;
   WGPUBuffer edgesBuf;
   WGPUBuffer edgeColorsBuf;
+  WGPUBuffer nodeDegreesBuf;
+  WGPUBuffer edgeWeightsBuf;
   size_t edgesBufCapacity; /**< In edges. */
   WGPUBindGroup bindGroup;
   bool bindGroupDirty;
-  bool hasNodeColors, hasNodeSizes, hasEdgeColors;
+  bool hasNodeColors, hasNodeSizes, hasEdgeColors, hasNodeDegrees;
+  bool hasEdgeWeights;
+  uint32_t maxNodeDegree; /**< Max value last uploaded via SetNodeDegrees. */
+  float meanEdgeWeight;   /**< Mean value last uploaded via SetEdgeWeights. */
   /** CPU mirror of the last grRendererSetNodeSizes upload, indexed by
    *  parent-graph vertex id (only what the GPU buffer holds; not otherwise
    *  readable back from the GPU). Used by vertex-pick hit-testing
@@ -434,11 +587,15 @@ struct grRenderer {
   grColor clearColor;
   grNodeStyle nodeStyle;
   grEdgeStyle edgeStyle;
+  bool edgeDegreeAlpha;
+  bool edgeWeightWidth;
 
   // stats overlay
   bool statsVisible;
   gvizArray statsPrims; /**< of grStatsPrim; CPU staging list, rebuilt when
-                             series revision or layout changes. */
+                             series revision, the picked vertex, or layout
+                             changes. Holds both the stats charts and the
+                             vertex-info panel (see grVertexOverlayBuild). */
   WGPUBuffer statsBuf;
   size_t statsBufCapacity; /**< In primitives. */
   gvizArray statsSeriesRevisions; /**< of uint64_t; cached
@@ -448,6 +605,40 @@ struct grRenderer {
   size_t statsMenuSeriesCount; /**< Last series count synced to the macOS menu. */
   double statsLayoutFbw, statsLayoutFbh, statsLayoutScale;
   bool statsOverlayDirty;
+
+  // vertex-info overlay (click-to-inspect vertex string data; appended to
+  // the stats overlay's prim list, buffer, and pipeline)
+  const char *const *vertexLabels; /**< Optional, set via
+                                        grRendererSetVertexLabels; not owned,
+                                        indexed by parent-graph vertex id. */
+  size_t vertexLabelsCount;
+  int64_t pickedVertexId; /**< Parent-graph id of the last vertex picked via
+                               GR_ACTION_PICK_VERTEX, or -1 if none. */
+  bool vertexOverlayDirty;
+  double vertexOverlayScrollPx; /**< Scroll offset into the wrapped label
+                                      text, in pixels; reset to 0 whenever a
+                                      different vertex is picked. */
+  gvizArray vertexOverlayLines; /**< of grVertexOverlayLine; rebuilt by
+                                      grVertexOverlayComputeLayout every time
+                                      it runs (including every frame, from
+                                      input handling, purely to hit-test the
+                                      panel -- the text is short enough that
+                                      re-wrapping it is not worth caching). */
+
+  // command console (stateless command line, e.g. "find <id>"; input handled
+  // by grConsoleProcessInput, commands by grConsoleRun, drawing by
+  // grConsoleBuild -- see grConsole.c)
+  bool consoleOpen;
+  char consoleInput[256];      /**< Current, unsubmitted input line. */
+  size_t consoleInputLen;
+  char consoleMessage[128];    /**< Result/error from the last run command,
+                                     empty if none yet. */
+  bool consoleMessageIsError;
+  gvizArray pendingConsoleEvents; /**< of grPendingConsoleEvent; queued by
+                                        onKey/onChar, drained by
+                                        grConsoleProcessInput while the
+                                        console is open, and discarded each
+                                        frame it isn't (see processInput). */
 
   // object overlay (rotating .obj mesh preview, independent of the graph)
   grObjOverlay objOverlay;

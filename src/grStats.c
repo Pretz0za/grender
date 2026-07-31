@@ -341,8 +341,8 @@ static int pushPrim(grRenderer *r, grStatsPrim prim) {
   return gvizArrayPush(&r->statsPrims, &prim);
 }
 
-static void pushRect(grRenderer *r, double x0, double y0, double x1, double y1,
-                     uint32_t color) {
+void grOverlayPushRect(grRenderer *r, double x0, double y0, double x1,
+                       double y1, uint32_t color) {
   pushPrim(r, (grStatsPrim){
                   .ab = {(float)x0, (float)y0, (float)x1, (float)y1},
                   .color = color,
@@ -350,8 +350,8 @@ static void pushRect(grRenderer *r, double x0, double y0, double x1, double y1,
               });
 }
 
-static void pushLine(grRenderer *r, double x0, double y0, double x1, double y1,
-                     double halfWidth, uint32_t color) {
+void grOverlayPushLine(grRenderer *r, double x0, double y0, double x1,
+                       double y1, double halfWidth, uint32_t color) {
   pushPrim(r, (grStatsPrim){
                   .ab = {(float)x0, (float)y0, (float)x1, (float)y1},
                   .color = color,
@@ -360,31 +360,34 @@ static void pushLine(grRenderer *r, double x0, double y0, double x1, double y1,
               });
 }
 
-static void pushFrame(grRenderer *r, double x0, double y0, double x1, double y1,
-                      double thickness, uint32_t color) {
-  pushRect(r, x0, y0, x1, y0 + thickness, color);
-  pushRect(r, x0, y1 - thickness, x1, y1, color);
-  pushRect(r, x0, y0, x0 + thickness, y1, color);
-  pushRect(r, x1 - thickness, y0, x1, y1, color);
+void grOverlayPushFrame(grRenderer *r, double x0, double y0, double x1,
+                        double y1, double thickness, uint32_t color) {
+  grOverlayPushRect(r, x0, y0, x1, y0 + thickness, color);
+  grOverlayPushRect(r, x0, y1 - thickness, x1, y1, color);
+  grOverlayPushRect(r, x0, y0, x0 + thickness, y1, color);
+  grOverlayPushRect(r, x1 - thickness, y0, x1, y1, color);
 }
 
-/** Advance of one character cell, in font pixels. */
-#define GR_FONT_ADVANCE 6.0
-#define GR_FONT_ROWS 7
-
-static double textWidth(const char *text, double px) {
+double grOverlayTextWidth(const char *text, double px) {
   return (double)strlen(text) * GR_FONT_ADVANCE * px;
 }
 
+bool grOverlayCharHasGlyph(char c) { return glyphRows(c) != NULL; }
+
 /** Draws @p text with its top-left corner at (x, y); @p px is the size of one
- *  font pixel. Horizontal runs of lit pixels are merged into single rects. */
-static void pushText(grRenderer *r, double x, double y, double px,
-                     uint32_t color, const char *text) {
+ *  font pixel. Horizontal runs of lit pixels are merged into single rects.
+ *  Glyph rows entirely outside [clipY0, clipY1) are skipped. */
+void grOverlayPushTextClipped(grRenderer *r, double x, double y, double px,
+                              uint32_t color, const char *text, double clipY0,
+                              double clipY1) {
   for (; *text; text++, x += GR_FONT_ADVANCE * px) {
     const char *rows = glyphRows(*text);
     if (!rows)
       continue;
     for (int row = 0; row < GR_FONT_ROWS; row++) {
+      double ry0 = y + row * px, ry1 = ry0 + px;
+      if (ry1 <= clipY0 || ry0 >= clipY1)
+        continue;
       int col = 0;
       while (col < 5) {
         if (rows[row * 5 + col] != '#') {
@@ -394,12 +397,16 @@ static void pushText(grRenderer *r, double x, double y, double px,
         int runEnd = col;
         while (runEnd < 5 && rows[row * 5 + runEnd] == '#')
           runEnd++;
-        pushRect(r, x + col * px, y + row * px, x + runEnd * px,
-                 y + (row + 1) * px, color);
+        grOverlayPushRect(r, x + col * px, ry0, x + runEnd * px, ry1, color);
         col = runEnd;
       }
     }
   }
+}
+
+void grOverlayPushText(grRenderer *r, double x, double y, double px,
+                       uint32_t color, const char *text) {
+  grOverlayPushTextClipped(r, x, y, px, color, text, -INFINITY, INFINITY);
 }
 
 // ------------------------------------------------------------------------------
@@ -478,19 +485,19 @@ static void buildChart(grRenderer *r, const gvizStatSeries *series,
   const double titleH = GR_FONT_ROWS * fontPx + 5.0 * s;
   const bool logScale = series->kind == GVIZ_STAT_CHART_LINE_LOG;
 
-  pushRect(r, x0, y0, x1, y1, bgColor);
+  grOverlayPushRect(r, x0, y0, x1, y1, bgColor);
 
   char buf[64];
-  pushText(r, x0 + pad, y0 + pad, fontPx, textColor, series->name);
+  grOverlayPushText(r, x0 + pad, y0 + pad, fontPx, textColor, series->name);
   if (series->count > 0) {
     snprintf(buf, sizeof(buf), "%.4g", series->samples[series->count - 1]);
-    pushText(r, x1 - pad - textWidth(buf, fontPx), y0 + pad, fontPx, lineColor,
-             buf);
+    grOverlayPushText(r, x1 - pad - grOverlayTextWidth(buf, fontPx), y0 + pad,
+                      fontPx, lineColor, buf);
   }
 
   double px0 = x0 + pad, px1 = x1 - pad;
   double py0 = y0 + pad + titleH, py1 = y1 - pad;
-  pushFrame(r, px0, py0, px1, py1, 1.0 * s, frameColor);
+  grOverlayPushFrame(r, px0, py0, px1, py1, 1.0 * s, frameColor);
 
   if (series->count == 0)
     return;
@@ -521,19 +528,21 @@ static void buildChart(grRenderer *r, const gvizStatSeries *series,
                    : (xLeft + xRight) * 0.5;
     double y = mapSampleY(v, lo, hi, logScale, yTop, yBottom);
     if (havePrev)
-      pushLine(r, prevX, prevY, x, y, 0.75 * s, lineColor);
+      grOverlayPushLine(r, prevX, prevY, x, y, 0.75 * s, lineColor);
     else
-      pushLine(r, x, y, x, y, 1.0 * s, lineColor); // isolated sample: dot
+      grOverlayPushLine(r, x, y, x, y, 1.0 * s,
+                        lineColor); // isolated sample: dot
     prevX = x;
     prevY = y;
     havePrev = true;
   }
 
   snprintf(buf, sizeof(buf), "%.3g", hi);
-  pushText(r, px0 + 3.0 * s, py0 + 3.0 * s, fontSmallPx, dimColor, buf);
+  grOverlayPushText(r, px0 + 3.0 * s, py0 + 3.0 * s, fontSmallPx, dimColor, buf);
   snprintf(buf, sizeof(buf), "%.3g", lo);
-  pushText(r, px0 + 3.0 * s, py1 - 3.0 * s - GR_FONT_ROWS * fontSmallPx,
-           fontSmallPx, dimColor, buf);
+  grOverlayPushText(r, px0 + 3.0 * s,
+                    py1 - 3.0 * s - GR_FONT_ROWS * fontSmallPx, fontSmallPx,
+                    dimColor, buf);
 }
 
 void grStatsOverlayBuild(grRenderer *r, double fbw, double fbh) {

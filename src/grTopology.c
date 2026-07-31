@@ -54,6 +54,7 @@ int grTopologyExtract(grTopology *topo, gvizEmbeddedGraph *graph) {
 
   topo->nodeCount = ni;
   topo->edgeCount = ei;
+  topo->directed = directed;
   return 0;
 }
 

@@ -20,12 +20,22 @@ static const char GR_WGSL_SOURCE[] =
     "  nodeParams : vec4f,\n" // x radius, y strokeWidth, z sizeMode, w proj11
     "  nodeSizeLimits : vec4f,\n" // x minPixelRadius, y maxPixelRadius (0 = off)
     "  edgeColor  : vec4f,\n"
-    "  edgeParams : vec4f,\n" // x width, y sizeMode
+    // x width, y sizeMode, z maxDegree (degree-alpha), w mean edge weight
+    "  edgeParams : vec4f,\n"
     "}\n"
     "\n"
-    "const FLAG_NODE_COLORS : u32 = 1u;\n"
-    "const FLAG_NODE_SIZES  : u32 = 2u;\n"
-    "const FLAG_EDGE_COLORS : u32 = 4u;\n"
+    "const FLAG_NODE_COLORS      : u32 = 1u;\n"
+    "const FLAG_NODE_SIZES       : u32 = 2u;\n"
+    "const FLAG_EDGE_COLORS      : u32 = 4u;\n"
+    "const FLAG_EDGE_DEGREE_ALPHA : u32 = 8u;\n"
+    "const FLAG_EDGE_WEIGHT_WIDTH : u32 = 16u;\n"
+    "const FLAG_DIRECTED         : u32 = 32u;\n"
+    "\n"
+    // Arrowhead size relative to the edge's own drawn half-width, so a
+    // thicker edge (wider edgeStyle.width or a weight-scaled edge) grows a
+    // proportionally bigger arrowhead instead of swallowing a fixed-size one.
+    "const ARROW_LENGTH_SCALE : f32 = 11.0;\n"
+    "const ARROW_WIDTH_SCALE  : f32 = 4.5;\n"
     "\n"
     // Screen-space overlay primitive; must match grStatsPrim in grInternal.h.
     "struct StatsPrim {\n"
@@ -44,6 +54,8 @@ static const char GR_WGSL_SOURCE[] =
     "@group(0) @binding(5) var<storage, read> edges      : array<u32>;\n"
     "@group(0) @binding(6) var<storage, read> edgeColors : array<u32>;\n"
     "@group(0) @binding(7) var<storage, read> statsPrims : array<StatsPrim>;\n"
+    "@group(0) @binding(8) var<storage, read> nodeDegrees : array<u32>;\n"
+    "@group(0) @binding(9) var<storage, read> edgeWeights : array<f32>;\n"
     "\n"
     "fn getPos(i : u32) -> vec3f {\n"
     "  let base = i * G.posDim;\n"
@@ -153,6 +165,72 @@ static const char GR_WGSL_SOURCE[] =
     "  if (len < 1e-6) { dir = vec2f(1.0, 0.0); } else { dir = dir / len; }\n"
     "  let normal = vec2f(-dir.y, dir.x);\n"
     "\n"
+    // Width at the v end, used to size the arrowhead (when directed) and to
+    // trim the shaft so it stops where the arrowhead begins, regardless of
+    // which vertex (shaft or arrowhead) is being emitted below.
+    "  var halfWidthAtB = G.edgeParams.x * 0.5;\n"
+    "  if (G.edgeParams.y > 0.5) {\n"
+    "    halfWidthAtB = halfWidthAtB * pxPerWorld(clipB.w);\n"
+    "  }\n"
+    "  if ((G.flags & FLAG_EDGE_WEIGHT_WIDTH) != 0u) {\n"
+    "    halfWidthAtB = halfWidthAtB * (edgeWeights[iid] / max(G.edgeParams.w, 1e-6));\n"
+    "  }\n"
+    "  let isDirected = (G.flags & FLAG_DIRECTED) != 0u;\n"
+    "  var arrowLen = 0.0;\n"
+    "  var tipPullback = 0.0;\n"
+    "  if (isDirected) {\n"
+    "    arrowLen = halfWidthAtB * ARROW_LENGTH_SCALE;\n"
+    // Same on-screen-radius computation as vsNode, for node b, so the
+    // arrowhead's tip lands just outside the destination node's drawn
+    // circle instead of underneath it (nodes draw on top of edges in 2D).
+    "    var nodeRadiusAtB = G.nodeParams.x;\n"
+    "    if ((G.flags & FLAG_NODE_SIZES) != 0u) { nodeRadiusAtB = nodeSizes[b]; }\n"
+    "    if (G.nodeParams.z > 0.5) {\n"
+    "      tipPullback = nodeRadiusAtB * pxPerWorld(clipB.w);\n"
+    "      if (G.nodeSizeLimits.y > 0.0) { tipPullback = min(tipPullback, G.nodeSizeLimits.y); }\n"
+    "      tipPullback = max(tipPullback, G.nodeSizeLimits.x);\n"
+    "    } else {\n"
+    "      tipPullback = nodeRadiusAtB;\n"
+    "    }\n"
+    "  }\n"
+    "  let arrowTip = screenB - dir * tipPullback;\n"
+    "  let arrowBase = arrowTip - dir * arrowLen;\n"
+    "\n"
+    "  var color = G.edgeColor;\n"
+    "  if ((G.flags & FLAG_EDGE_DEGREE_ALPHA) != 0u) {\n"
+	"    color.a = 1.0;\n"
+    "    let d = sqrt(f32(nodeDegrees[a]) * f32(nodeDegrees[b]));\n"
+    "    let t = log2(d + 1.0) / log2(max(G.edgeParams.z, 1.0) + 1.0);\n"
+    "    color.a *= mix(1.0, 0.01, pow(t, 0.5));\n"
+    "  }\n"
+    "  if ((G.flags & FLAG_EDGE_COLORS) != 0u) {\n"
+    "    let ec = unpackColor(edgeColors[iid]);\n"
+    "    if ((G.flags & FLAG_EDGE_DEGREE_ALPHA) != 0u) {\n"
+    // Highlight fills every edge slot: base style for ordinary edges, override
+    // color for highlighted ones. Only the override should beat degree-alpha.
+    "      let diff = abs(ec.rgb - G.edgeColor.rgb);\n"
+    "      if (any(diff > vec3f(2.0 / 255.0))) {\n"
+    "        color = vec4f(ec.rgb, 1.0);\n"
+    "      }\n"
+    "    } else {\n"
+    "      color = ec;\n"
+    "    }\n"
+    "  }\n"
+    "\n"
+    // vid 6..8: arrowhead triangle tipped just outside node b (arrowTip),
+    // base pulled further back by arrowLen. across is held at 0 with a
+    // small flat halfWidthPx so fsEdge's feathering is a no-op (full
+    // coverage) over the whole triangle -- only ever reached when
+    // isDirected (the CPU only issues 9 vertices per instance for directed
+    // graphs).
+    "  if (vid >= 6u) {\n"
+    "    var pos = arrowTip;\n"
+    "    if (vid == 7u) { pos = arrowBase - normal * halfWidthAtB * ARROW_WIDTH_SCALE; }\n"
+    "    if (vid == 8u) { pos = arrowBase + normal * halfWidthAtB * ARROW_WIDTH_SCALE; }\n"
+    "    let clip = vec4f(pos * 2.0 / G.viewport * clipB.w, clipB.zw);\n"
+    "    return EdgeOut(clip, 0.0, color, 0.5);\n"
+    "  }\n"
+    "\n"
     // vid 0..5 -> (end, side): triangles (A-,B-,B+),(A-,B+,A+)
     "  var end = 0.0;\n"
     "  if (vid == 1u || vid == 2u || vid == 4u) { end = 1.0; }\n"
@@ -164,15 +242,22 @@ static const char GR_WGSL_SOURCE[] =
     "  if (G.edgeParams.y > 0.5) {\n"
     "    halfWidthPx = halfWidthPx * pxPerWorld(clipEnd.w);\n"
     "  }\n"
+    // Thickness scales linearly with weight relative to the mean of all
+    // uploaded weights, so relative thickness directly shows relative weight
+    // (edgeParams.x/edgeStyle.width is the base thickness of an
+    // average-weight edge) instead of being compressed into a fixed range.
+    "  if ((G.flags & FLAG_EDGE_WEIGHT_WIDTH) != 0u) {\n"
+    "    halfWidthPx = halfWidthPx * (edgeWeights[iid] / max(G.edgeParams.w, 1e-6));\n"
+    "  }\n"
+    // Stop the shaft where the arrowhead begins (past node b's own radius
+    // when directed) so the two never overlap and double-blend under alpha.
+    "  var screenEndB = screenB;\n"
+    "  if (isDirected) { screenEndB = arrowBase; }\n"
     // Half-pixel feather margin.
     "  let quadHalf = halfWidthPx + 0.5;\n"
-    "  let screen = mix(screenA, screenB, end) + normal * side * quadHalf;\n"
+    "  let screen = mix(screenA, screenEndB, end) + normal * side * quadHalf;\n"
     "  let clip = vec4f(screen * 2.0 / G.viewport * clipEnd.w, clipEnd.zw);\n"
     "\n"
-    "  var color = G.edgeColor;\n"
-    "  if ((G.flags & FLAG_EDGE_COLORS) != 0u) {\n"
-    "    color = unpackColor(edgeColors[iid]);\n"
-    "  }\n"
     "  return EdgeOut(clip, side * quadHalf, color, halfWidthPx);\n"
     "}\n"
     "\n"

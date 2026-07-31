@@ -35,8 +35,18 @@
  *                                 ignored with -g/--graph)
  *   -g, --graph NAME              load <gviz-data>/NAME/data.gexf or
  *                                 data.edges instead of a random graph
+ *   -d, --directed                interpret the -g/--graph file's edges as
+ *                                 directed (default: undirected; ignored
+ *                                 without -g/--graph)
  *   -m, --model {linlog|fr}       force model (default linlog)
  *   -o, --screenshot PATH         save a .ppm screenshot after settling and exit
+ *       --degree-alpha            fade edges by max endpoint degree (default off)
+ *       --no-degree-alpha         disable degree-based edge opacity
+ *   -w, --edge-width WIDTH        base edge thickness (default 1.5); with
+ *                                 --edge-weight-width, this is the thickness
+ *                                 drawn for an average-weight edge
+ *       --edge-weight-width       scale edge thickness by edge weight (default off)
+ *       --no-edge-weight-width    disable weight-based edge thickness
  *   -h, --help                    print this help and exit
  */
 
@@ -205,24 +215,26 @@ static int fileExists(const char *path) {
 
 /**
  * Loads <GRENDER_GVIZ_DATA_DIR>/<name>/data.gexf if present, else
- * <GRENDER_GVIZ_DATA_DIR>/<name>/data.edges. @p out must be uninitialized on
- * entry, matching gvizGraphLoadFromGexfFile/gvizGraphLoadFromEdgesFile.
+ * <GRENDER_GVIZ_DATA_DIR>/<name>/data.edges, interpreting edges as directed
+ * iff @p directed is non-zero. @p out must be uninitialized on entry,
+ * matching gvizGraphLoadFromGexfFile/gvizGraphLoadFromEdgesFile.
  *
  * @return 0 on success, -1 if neither file exists or loading failed.
  */
-static int loadNamedGraph(const char *name, gvizGraph *out) {
+static int loadNamedGraph(const char *name, int directed, gvizGraph *out) {
   char path[1024];
 
   snprintf(path, sizeof(path), "%s/%s/data.gexf", GRENDER_GVIZ_DATA_DIR, name);
   if (fileExists(path)) {
     printf("loading %s...\n", path);
-    return gvizGraphLoadFromGexfFile(path, out);
+    return gvizGraphLoadFromGexfFile(path, directed, out);
   }
 
   snprintf(path, sizeof(path), "%s/%s/data.edges", GRENDER_GVIZ_DATA_DIR, name);
   if (fileExists(path)) {
     gvizEdgesFileOptions opts;
     gvizEdgesFileOptionsInit(&opts);
+    opts.directed = directed;
     printf("loading %s...\n", path);
     return gvizGraphLoadFromEdgesFile(path, &opts, out);
   }
@@ -246,8 +258,18 @@ static void printUsage(const char *prog) {
       "                              ignored with -g/--graph)\n"
       "  -g, --graph NAME            load <gviz-data>/NAME/data.gexf or\n"
       "                              data.edges instead of a random graph\n"
+      "  -d, --directed              interpret the -g/--graph file's edges as\n"
+      "                              directed (default: undirected; ignored\n"
+      "                              without -g/--graph)\n"
       "  -m, --model {linlog|fr}     force model (default linlog)\n"
       "  -o, --screenshot PATH       save a .ppm screenshot after settling and exit\n"
+      "      --degree-alpha          fade edges by max endpoint degree (default off)\n"
+      "      --no-degree-alpha       disable degree-based edge opacity\n"
+      "  -w, --edge-width WIDTH      base edge thickness (default 1.5); with\n"
+      "                              --edge-weight-width, this is the thickness\n"
+      "                              drawn for an average-weight edge\n"
+      "      --edge-weight-width     scale edge thickness by edge weight (default off)\n"
+      "      --no-edge-weight-width  disable weight-based edge thickness\n"
       "  -h, --help                  print this help and exit\n"
       "\n"
       "Controls:\n"
@@ -265,13 +287,26 @@ static void printUsage(const char *prog) {
       prog);
 }
 
+enum {
+  OPT_DEGREE_ALPHA = 256,
+  OPT_NO_DEGREE_ALPHA,
+  OPT_EDGE_WEIGHT_WIDTH,
+  OPT_NO_EDGE_WEIGHT_WIDTH,
+};
+
 static const struct option kLongOptions[] = {
     {"vertices", required_argument, NULL, 'n'},
     {"seed", required_argument, NULL, 's'},
     {"edge-connectivity", required_argument, NULL, 'e'},
     {"graph", required_argument, NULL, 'g'},
+    {"directed", no_argument, NULL, 'd'},
     {"model", required_argument, NULL, 'm'},
     {"screenshot", required_argument, NULL, 'o'},
+    {"degree-alpha", no_argument, NULL, OPT_DEGREE_ALPHA},
+    {"no-degree-alpha", no_argument, NULL, OPT_NO_DEGREE_ALPHA},
+    {"edge-width", required_argument, NULL, 'w'},
+    {"edge-weight-width", no_argument, NULL, OPT_EDGE_WEIGHT_WIDTH},
+    {"no-edge-weight-width", no_argument, NULL, OPT_NO_EDGE_WEIGHT_WIDTH},
     {"help", no_argument, NULL, 'h'},
     {NULL, 0, NULL, 0},
 };
@@ -281,12 +316,16 @@ int main(int argc, char **argv) {
   unsigned int seed = (unsigned int)time(NULL);
   double edgeConnectivity = 0.0;
   const char *graphName = NULL;
+  bool directed = false;
   gvizForceModelKind model = GVIZ_FORCE_MODEL_LINLOG;
   const char *screenshotPath = NULL;
+  bool degreeAlpha = false;
+  float edgeWidth = 1.5f;
+  bool edgeWeightWidth = false;
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "n:s:e:g:m:o:h", kLongOptions, NULL)) !=
-         -1) {
+  while ((opt = getopt_long(argc, argv, "n:s:e:g:dm:o:w:h", kLongOptions,
+                            NULL)) != -1) {
     switch (opt) {
     case 'n':
       N = (size_t)atoi(optarg);
@@ -300,6 +339,9 @@ int main(int argc, char **argv) {
     case 'g':
       graphName = optarg;
       break;
+    case 'd':
+      directed = true;
+      break;
     case 'm':
       if (parseModel(optarg, &model) < 0) {
         fprintf(stderr, "unknown model \"%s\", expected \"linlog\" or \"fr\"\n",
@@ -309,6 +351,21 @@ int main(int argc, char **argv) {
       break;
     case 'o':
       screenshotPath = optarg;
+      break;
+    case OPT_DEGREE_ALPHA:
+      degreeAlpha = true;
+      break;
+    case OPT_NO_DEGREE_ALPHA:
+      degreeAlpha = false;
+      break;
+    case 'w':
+      edgeWidth = strtof(optarg, NULL);
+      break;
+    case OPT_EDGE_WEIGHT_WIDTH:
+      edgeWeightWidth = true;
+      break;
+    case OPT_NO_EDGE_WEIGHT_WIDTH:
+      edgeWeightWidth = false;
       break;
     case 'h':
       printUsage(argv[0]);
@@ -327,10 +384,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "edge connectivity must be in [0, 1]\n");
     return 1;
   }
+  if (!graphName && directed) {
+    fprintf(stderr, "--directed requires -g/--graph\n");
+    return 1;
+  }
 
   gvizGraph graph;
   if (graphName) {
-    if (loadNamedGraph(graphName, &graph) < 0)
+    if (loadNamedGraph(graphName, directed, &graph) < 0)
       return 1;
   } else {
     graph = build_random_connected_graph(N, edgeConnectivity, seed);
@@ -344,6 +405,7 @@ int main(int argc, char **argv) {
   gvizForceEmbedderState fe = {0};
   if (gvizForceEmbedderInit(&fe, sg, 2, model) < 0) {
     fprintf(stderr, "force embedder init failed\n");
+    gvizGraphFreeVertexDataStrings(&graph);
     gvizGraphRelease(&graph);
     return 1;
   }
@@ -380,18 +442,27 @@ int main(int argc, char **argv) {
   /* World-space radius keeps nodes correctly sized relative to the layout at
    * any fixed zoom, but this LinLog layout drifts outward for a long time
    * before settling (a separate, pre-existing issue) -- as the camera fits a
-   * growing bounding box, the same world radius covers fewer pixels. Clamp
-   * the drawn size so nodes stay visible/legible regardless. */
+   * growing bounding box, the same world radius covers fewer pixels. Floor
+   * the drawn size so nodes stay visible/legible regardless (this also
+   * covers radiusBase == 0, where every node's world radius is exactly 0
+   * and the floor is what draws them as uniform dots). No ceiling: degree
+   * scales world radius by up to ~sqrt(maxDegree)*perDegree, and clamping
+   * pixel size breaks that relative sizing once any node's world radius
+   * would map past the ceiling -- nodes "catch up" to and visually merge
+   * with already-clamped hubs as base or zoom increases. */
   desc.nodeStyle.minPixelRadius = 2.0f;
-  desc.nodeStyle.maxPixelRadius = 40.0f;
+  desc.nodeStyle.maxPixelRadius = 0.0f;
   desc.nodeStyle.fillColor = GR_COLOR(0.55f, 0.78f, 1.0f, 1.0f);
   desc.edgeStyle.color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.45f);
-  desc.edgeStyle.width = 1.5f;
+  desc.edgeStyle.width = edgeWidth;
+  desc.edgeDegreeAlpha = degreeAlpha;
+  desc.edgeWeightWidth = edgeWeightWidth;
 
   grRenderer *r = grRendererCreate(&desc);
   if (!r) {
     fprintf(stderr, "renderer creation failed\n");
     gvizForceEmbedderRelease(&fe);
+    gvizGraphFreeVertexDataStrings(&graph);
     gvizGraphRelease(&graph);
     return 1;
   }
@@ -400,8 +471,22 @@ int main(int argc, char **argv) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     gvizForceEmbedderRelease(&fe);
+    gvizGraphFreeVertexDataStrings(&graph);
     gvizGraphRelease(&graph);
     return 1;
+  }
+
+  // Vertex string data (gexf attributes) is only present when -g/--graph
+  // loaded a .gexf file; entries are NULL otherwise, which the overlay
+  // simply skips. Freed alongside graph teardown below, once the renderer
+  // (the only reader of these pointers) is destroyed.
+  size_t vertexLabelCount = gvizEmbeddedGraphPositionCount(eg);
+  const char **vertexLabels =
+      malloc(sizeof(char *) * (vertexLabelCount ? vertexLabelCount : 1));
+  if (vertexLabels) {
+    for (size_t i = 0; i < vertexLabelCount; i++)
+      vertexLabels[i] = gvizGraphGetVertexData(&graph, i);
+    grRendererSetVertexLabels(r, vertexLabels, vertexLabelCount);
   }
 
   /* Degree is fixed for the embedder's lifetime, but radiusBase can change
@@ -412,12 +497,83 @@ int main(int argc, char **argv) {
   radiusControl.radii = malloc(sizeof(float) * fe.vertexCount);
   if (!radiusControl.radii) {
     fprintf(stderr, "radii allocation failed\n");
+    free(vertexLabels);
     grRendererDestroy(r);
     gvizForceEmbedderRelease(&fe);
+    gvizGraphFreeVertexDataStrings(&graph);
     gvizGraphRelease(&graph);
     return 1;
   }
   refreshNodeSizes(&fe, &radiusControl);
+
+  if (degreeAlpha) {
+    /* Compact fe.degree[i] -> parent-id indexed buffer for the edge shader. */
+    uint32_t *degrees = calloc(fe.vertexCount, sizeof(uint32_t));
+    if (!degrees) {
+      fprintf(stderr, "degrees allocation failed\n");
+      free(radiusControl.radii);
+      free(vertexLabels);
+      grRendererDestroy(r);
+      gvizForceEmbedderRelease(&fe);
+      gvizGraphFreeVertexDataStrings(&graph);
+      gvizGraphRelease(&graph);
+      return 1;
+    }
+    for (size_t i = 0; i < fe.vertexCount; i++)
+      degrees[fe.vertices[i]] = (uint32_t)fe.degree[i];
+    if (grRendererSetNodeDegrees(r, degrees, fe.vertexCount) < 0) {
+      fprintf(stderr, "node degrees upload failed\n");
+      free(degrees);
+      free(radiusControl.radii);
+      free(vertexLabels);
+      grRendererDestroy(r);
+      gvizForceEmbedderRelease(&fe);
+      gvizGraphFreeVertexDataStrings(&graph);
+      gvizGraphRelease(&graph);
+      return 1;
+    }
+    free(degrees);
+  }
+
+  if (edgeWeightWidth) {
+    /* Edge-buffer order: (u, v) pairs as produced by grRendererGetEdges,
+     * with weights looked up on the underlying gvizGraph. */
+    size_t edgeCount = grRendererEdgeCount(r);
+    uint32_t *edges = calloc(edgeCount ? edgeCount : 1, 2 * sizeof(uint32_t));
+    float *weights = calloc(edgeCount ? edgeCount : 1, sizeof(float));
+    if (!edges || !weights) {
+      fprintf(stderr, "edge weights allocation failed\n");
+      free(edges);
+      free(weights);
+      free(radiusControl.radii);
+      free(vertexLabels);
+      grRendererDestroy(r);
+      gvizForceEmbedderRelease(&fe);
+      gvizGraphFreeVertexDataStrings(&graph);
+      gvizGraphRelease(&graph);
+      return 1;
+    }
+    grRendererGetEdges(r, edges);
+    for (size_t i = 0; i < edgeCount; i++) {
+      double w = 1.0;
+      gvizGraphGetEdgeWeight(&graph, edges[2 * i], edges[2 * i + 1], &w);
+      weights[i] = (float)w;
+    }
+    if (grRendererSetEdgeWeights(r, weights, edgeCount) < 0) {
+      fprintf(stderr, "edge weights upload failed\n");
+      free(edges);
+      free(weights);
+      free(radiusControl.radii);
+      free(vertexLabels);
+      grRendererDestroy(r);
+      gvizForceEmbedderRelease(&fe);
+      gvizGraphFreeVertexDataStrings(&graph);
+      gvizGraphRelease(&graph);
+      return 1;
+    }
+    free(edges);
+    free(weights);
+  }
 
   grRendererBindKey(r, 'R', "forceEmbedder.step");
   grRendererBindKey(r, GR_KEY_SPACE, "demo.toggleAuto");
@@ -437,7 +593,7 @@ int main(int argc, char **argv) {
 
   while (grRendererFrame(r)) {
     if (autoStep) {
-      for (size_t i = 0; i < 20; i++)
+      for (size_t i = 0; i < 10; i++)
         gvizForceEmbedderStep(&fe);
     }
 
@@ -457,7 +613,9 @@ int main(int argc, char **argv) {
 
   free(radiusControl.radii);
   grRendererDestroy(r);
+  free(vertexLabels);
   gvizForceEmbedderRelease(&fe);
+  gvizGraphFreeVertexDataStrings(&graph);
   gvizGraphRelease(&graph);
   return 0;
 }

@@ -207,7 +207,7 @@ static int loadNamedGraph(const char *name, gvizGraph *out) {
   snprintf(path, sizeof(path), "%s/%s/data.gexf", GRENDER_GVIZ_DATA_DIR, name);
   if (fileExists(path)) {
     printf("loading %s...\n", path);
-    return gvizGraphLoadFromGexfFile(path, out);
+    return gvizGraphLoadFromGexfFile(path, /*directed=*/0, out);
   }
 
   snprintf(path, sizeof(path), "%s/%s/data.edges", GRENDER_GVIZ_DATA_DIR, name);
@@ -458,6 +458,7 @@ int main(int argc, char **argv) {
     gvizGRIPEmbedderConfigureKnnCapacity(&grip, knnCapacity);
   if (gvizGRIPEmbedderInit(&grip, sg, diameter, dim) < 0) {
     fprintf(stderr, "GRIP init failed\n");
+    gvizGraphFreeVertexDataStrings(&graph);
     gvizGraphRelease(&graph);
     return 1;
   }
@@ -481,6 +482,7 @@ int main(int argc, char **argv) {
   if (!r) {
     fprintf(stderr, "renderer creation failed\n");
     gvizGRIPEmbedderRelease(&grip);
+    gvizGraphFreeVertexDataStrings(&graph);
     gvizGraphRelease(&graph);
     return 1;
   }
@@ -488,8 +490,22 @@ int main(int argc, char **argv) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     gvizGRIPEmbedderRelease(&grip);
+    gvizGraphFreeVertexDataStrings(&graph);
     gvizGraphRelease(&graph);
     return 1;
+  }
+
+  // Vertex string data (gexf attributes) is only present when -g/--graph
+  // loaded a .gexf file; entries are NULL otherwise, which the overlay
+  // simply skips. Freed alongside graph teardown below, once the renderer
+  // (the only reader of these pointers) is destroyed.
+  size_t vertexLabelCount = gvizEmbeddedGraphPositionCount(eg);
+  const char **vertexLabels =
+      malloc(sizeof(char *) * (vertexLabelCount ? vertexLabelCount : 1));
+  if (vertexLabels) {
+    for (size_t i = 0; i < vertexLabelCount; i++)
+      vertexLabels[i] = gvizGraphGetVertexData(&graph, i);
+    grRendererSetVertexLabels(r, vertexLabels, vertexLabelCount);
   }
 
   grRendererBindKey(r, 'R', "grip.refineRound");
@@ -522,7 +538,9 @@ int main(int argc, char **argv) {
   }
 
   grRendererDestroy(r);
+  free(vertexLabels);
   gvizGRIPEmbedderRelease(&grip);
+  gvizGraphFreeVertexDataStrings(&graph);
   gvizGraphRelease(&graph);
   return 0;
 }

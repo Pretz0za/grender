@@ -31,9 +31,9 @@ int main(int argc, char **argv) {
   for (size_t y = 0; y < gridH; y++)
     for (size_t x = 0; x < gridW; x++) {
       if (x + 1 < gridW)
-        gvizGraphAddEdge(&graph, y * gridW + x, y * gridW + x + 1);
+        gvizGraphAddEdge(&graph, y * gridW + x, y * gridW + x + 1, 1.0);
       if (y + 1 < gridH)
-        gvizGraphAddEdge(&graph, y * gridW + x, (y + 1) * gridW + x);
+        gvizGraphAddEdge(&graph, y * gridW + x, (y + 1) * gridW + x, 1.0);
     }
   gvizGraphBuildLayout(&graph);
   gvizSubgraph sg = gvizSubgraphCreateFull(&graph);

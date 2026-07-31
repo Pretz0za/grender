@@ -86,6 +86,23 @@ typedef struct grRendererDesc {
   grNodeStyle nodeStyle;
   grEdgeStyle edgeStyle;
   bool vsync;          /**< true: FIFO present (default), false: immediate. */
+  /**
+   * When true (and node degrees have been uploaded via
+   * grRendererSetNodeDegrees), the edge shader scales each edge's alpha by
+   * the higher degree of its endpoints so hub edges fade. Per-edge colors
+   * (including highlights) are unaffected and keep their uploaded alpha.
+   * Off by default; can also be toggled with grRendererSetEdgeDegreeAlpha.
+   */
+  bool edgeDegreeAlpha;
+  /**
+   * When true (and weights have been uploaded via grRendererSetEdgeWeights),
+   * the edge shader scales each edge's drawn width by its weight relative to
+   * the mean of all uploaded weights, so e.g. an edge weighing twice the mean
+   * is drawn twice as thick -- edgeStyle.width is the base thickness an
+   * average-weight edge is drawn at. Off by default; can also be toggled
+   * with grRendererSetEdgeWeightWidth.
+   */
+  bool edgeWeightWidth;
 } grRendererDesc;
 
 /** Fills @p desc with sensible defaults (dark background, white nodes). */
@@ -128,6 +145,33 @@ void grRendererSetNodeStyle(grRenderer *r, const grNodeStyle *style);
 void grRendererSetEdgeStyle(grRenderer *r, const grEdgeStyle *style);
 
 /**
+ * Enables or disables shader-side degree-based edge opacity. When enabled
+ * (and degrees are present via grRendererSetNodeDegrees), each edge's alpha
+ * is scaled from the geometric mean of its endpoint degrees (log-normalized
+ * by the graph max degree). Highlighted edges (per-edge colors that differ
+ * from the global edge style) bypass the fade and are drawn at alpha 1.0;
+ * ordinary edges keep fading even while a highlight is active. Off by default.
+ */
+void grRendererSetEdgeDegreeAlpha(grRenderer *r, bool enabled);
+
+/** Returns whether degree-based edge opacity is currently enabled. */
+bool grRendererEdgeDegreeAlpha(const grRenderer *r);
+
+/**
+ * Enables or disables shader-side weight-based edge thickness. When enabled
+ * (and weights are present via grRendererSetEdgeWeights), each edge's drawn
+ * width is edgeStyle.width scaled by that edge's weight divided by the mean
+ * of all uploaded weights -- so relative thickness directly reflects
+ * relative weight (an edge weighing twice the mean is drawn twice as thick),
+ * with edgeStyle.width acting as the configurable base thickness for an
+ * average-weight edge. Off by default.
+ */
+void grRendererSetEdgeWeightWidth(grRenderer *r, bool enabled);
+
+/** Returns whether weight-based edge thickness is currently enabled. */
+bool grRendererEdgeWeightWidth(const grRenderer *r);
+
+/**
  * Uploads per-node fill colors (GR_RGBA8 packed), indexed by parent-graph
  * vertex id; @p count must equal gvizEmbeddedGraphPositionCount(). Pass NULL
  * to revert to the global style. The data is copied to the GPU; the caller
@@ -141,12 +185,48 @@ int grRendererSetNodeColors(grRenderer *r, const uint32_t *rgba8, size_t count);
 int grRendererSetNodeSizes(grRenderer *r, const float *radii, size_t count);
 
 /**
+ * Per-vertex subgraph degrees (uint32), indexed by parent-graph vertex id
+ * with the same count rules as grRendererSetNodeColors. Used by the edge
+ * shader when edge-degree-alpha is enabled. Pass NULL to clear. The caller
+ * keeps ownership; values are copied to the GPU.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int grRendererSetNodeDegrees(grRenderer *r, const uint32_t *degrees,
+                             size_t count);
+
+/**
+ * Optional per-vertex string labels, indexed by parent-graph vertex id, same
+ * count rules as grRendererSetNodeColors. When set, clicking a vertex (the
+ * default GR_ACTION_PICK_VERTEX binding) shows that vertex's label in an
+ * overlay panel; a vertex with a NULL label, or a click that hits nothing,
+ * clears the panel. The renderer does not take ownership or copy the
+ * strings -- entries must stay valid for as long as they might be
+ * displayed, i.e. until this is called again or the renderer is destroyed.
+ * Pass NULL to clear.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int grRendererSetVertexLabels(grRenderer *r, const char *const *labels,
+                              size_t count);
+
+/**
  * Per-edge colors, indexed in edge-buffer order: the order edges are produced
  * by iterating subgraph vertices in increasing id and their neighbor
  * iterators (undirected edges appear once, with u < v). Use
  * grRendererEdgeCount / grRendererGetEdges to inspect that order.
  */
 int grRendererSetEdgeColors(grRenderer *r, const uint32_t *rgba8, size_t count);
+
+/**
+ * Per-edge weights, indexed the same way as grRendererSetEdgeColors (edge-
+ * buffer order; see grRendererGetEdges). Used by the edge shader when
+ * edge-weight-width is enabled; values should be positive. Pass NULL to
+ * clear.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int grRendererSetEdgeWeights(grRenderer *r, const float *weights, size_t count);
 
 /** Number of edges in the current topology buffer. */
 size_t grRendererEdgeCount(const grRenderer *r);
@@ -167,6 +247,7 @@ enum {
   GR_KEY_ESCAPE = 256,
   GR_KEY_ENTER = 257,
   GR_KEY_TAB = 258,
+  GR_KEY_BACKSPACE = 259,
   GR_KEY_RIGHT = 262,
   GR_KEY_LEFT = 263,
   GR_KEY_DOWN = 264,
@@ -203,14 +284,18 @@ enum {
  * (its drawn size, converted from pixels to world units at the vertex's
  * depth -- i.e. the same tolerance a click needs to land inside the visible
  * circle), highlights it together with its neighbors and incident edges via
- * grRendererSetHighlight. A click that lands on no vertex clears any existing
- * highlight (grRendererClearHighlight), the same as a face-pick miss.
- * Replacing a highlight discards the previous one automatically -- no need
- * to clear first. Only fires on an actual click (press and release without
- * dragging); a click-and-drag pans/orbits instead and never reaches this
- * action, the same drag-vs-click distinction grRendererBindMouse already
- * documents. Bound to the left mouse button by default; rebind with
- * grRendererBindMouse or replace with a no-op action name to disable.
+ * grRendererSetHighlight. On a directed graph, a plain click highlights only
+ * the picked vertex's out-neighbors and out-edges; holding Shift flips this
+ * to in-neighbors and in-edges instead (Shift is a no-op on undirected
+ * graphs, where every edge already highlights both ways). A click that lands
+ * on no vertex clears any existing highlight (grRendererClearHighlight), the
+ * same as a face-pick miss. Replacing a highlight discards the previous one
+ * automatically -- no need to clear first. Only fires on an actual click
+ * (press and release without dragging); a click-and-drag pans/orbits instead
+ * and never reaches this action, the same drag-vs-click distinction
+ * grRendererBindMouse already documents. Bound to the left mouse button by
+ * default; rebind with grRendererBindMouse or replace with a no-op action
+ * name to disable.
  */
 #define GR_ACTION_PICK_VERTEX "grender.pickVertex"
 
@@ -330,6 +415,36 @@ bool grRendererStatSeriesShown(const grRenderer *r, size_t idx);
  * on the embedded graph. No-op when @p idx is out of bounds.
  */
 void grRendererShowStatSeries(grRenderer *r, size_t idx, bool show);
+
+// COMMAND CONSOLE: ----------------------------------------------------------
+//
+// A stateless, in-window command line for driving renderer-level actions by
+// typing them instead of clicking: press the backtick key (GR_CONSOLE_TOGGLE_
+// KEY) to open a single input bar at the bottom of the window, type a command,
+// press Enter to run it immediately (there is no session state beyond the
+// current line -- each command is a one-shot dispatch), or Escape to close
+// without running anything. Built-in commands:
+//
+//   find <id>   Clears the current highlight, highlights vertex <id> alone,
+//               and centers the camera on it (zoom/orbit angle unchanged).
+//
+// New commands are added in grConsole.c's command table, independent of the
+// rest of the renderer.
+
+/** Key that opens/closes the console (GLFW's grave-accent/backtick key,
+ *  ASCII '`'). Not user-rebindable, like the stats (S) and texture-image (I)
+ *  toggle keys -- pass it to grRendererBindKey/grRendererBindMouse and it
+ *  will simply never fire, since the console intercepts it first. */
+#define GR_CONSOLE_TOGGLE_KEY 96
+
+/** Shows or hides the command console. Hidden by default; also toggled by
+ *  GR_CONSOLE_TOGGLE_KEY. Hiding discards the current (unsubmitted) input
+ *  line but leaves the last command's effects (highlight, camera, ...) in
+ *  place. */
+void grRendererShowConsole(grRenderer *r, bool show);
+
+/** Returns whether the console is currently open. */
+bool grRendererConsoleShown(const grRenderer *r);
 
 // OBJECT OVERLAY: -----------------------------------------------------------
 //

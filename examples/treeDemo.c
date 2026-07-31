@@ -43,7 +43,7 @@ static int addKarySubtree(gvizGraph *g, size_t parent, size_t branching,
     size_t child = gvizGraphSize(g);
     if (gvizGraphAddVertex(g, NULL, NULL, NULL) < 0)
       return -1;
-    if (gvizGraphAddEdge(g, parent, child) < 0)
+    if (gvizGraphAddEdge(g, parent, child, 1.0) < 0)
       return -1;
     if (addKarySubtree(g, child, branching, remainingDepth - 1) < 0)
       return -1;
