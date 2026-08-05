@@ -148,34 +148,34 @@ endif()
 # Examples
 # ------------------------------------------------------------------------------
 if(GRENDER_BUILD_EXAMPLES AND TARGET gviz)
-    add_executable(gripDemo examples/gripDemo.c)
+    add_executable(gripDemo examples/gripDemo.cpp)
     target_compile_definitions(gripDemo PRIVATE
         GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
     target_link_libraries(gripDemo PRIVATE grender gviz)
 
-    add_executable(millionDemo examples/millionDemo.c)
+    add_executable(millionDemo examples/millionDemo.cpp)
     target_link_libraries(millionDemo PRIVATE grender gviz)
 
-    add_executable(datasetDemo examples/datasetDemo.c)
+    add_executable(datasetDemo examples/datasetDemo.cpp)
     target_compile_definitions(datasetDemo PRIVATE
         GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
     target_link_libraries(datasetDemo PRIVATE grender gviz)
 
-    add_executable(treeDemo examples/treeDemo.c)
+    add_executable(treeDemo examples/treeDemo.cpp)
     target_link_libraries(treeDemo PRIVATE grender gviz)
 
-    add_executable(tutteDemo examples/tutteDemo.c)
+    add_executable(tutteDemo examples/tutteDemo.cpp)
     target_link_libraries(tutteDemo PRIVATE grender gviz)
 
-    add_executable(forceEmbedderDemo examples/forceEmbedderDemo.c)
+    add_executable(forceEmbedderDemo examples/forceEmbedderDemo.cpp)
     target_compile_definitions(forceEmbedderDemo PRIVATE
         GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
     target_link_libraries(forceEmbedderDemo PRIVATE grender gviz)
 
-    add_executable(textureMapDemo examples/textureMapDemo.c)
+    add_executable(textureMapDemo examples/textureMapDemo.cpp)
     target_link_libraries(textureMapDemo PRIVATE grender gviz)
 
-    add_executable(textureMapUnitTest examples/textureMapUnitTest.c)
+    add_executable(textureMapUnitTest examples/textureMapUnitTest.cpp)
     target_include_directories(textureMapUnitTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(textureMapUnitTest PRIVATE grender gviz)
 endif()

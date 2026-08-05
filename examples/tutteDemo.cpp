@@ -24,84 +24,53 @@
  * bottom-left corner, independent of the main 2D Tutte view and its camera.
  */
 
-#include "algorithms/search/gvizConnectedComponents.h"
 #include "grender/grender.h"
 
-#include "ds/gvizGraph.h"
-#include "ds/gvizSubgraph.h"
-#include "embedders/gvizTutteEmbedder.h"
-#include "utils/graphLoader.h"
-#include "utils/graphs.h"
+#include "gviz.hpp"
 
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
+#include <vector>
 
-static void actionToggleAuto(gvizEmbeddedGraph *eg, void *userData,
-                             const gvizActionPayload *payload) {
+static void actionToggleAuto(gviz::layout::EmbeddedGraph &eg, void *userData,
+                             const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  bool *autoStep = userData;
+  bool *autoStep = (bool *)userData;
   *autoStep = !*autoStep;
   printf("auto step: %s\n", *autoStep ? "on" : "off");
 }
 
-static int largestComponentSubgraph(const gvizGraph *graph, gvizSubgraph *out) {
-  size_t n = gvizGraphSize(graph);
-  gvizSubgraph full = gvizSubgraphCreateFull(graph);
+// Unused by main() below (also true of the old C original) but kept as a
+// faithful port: builds a vertex-induced subgraph over the largest connected
+// component of @p graph.
+static gviz::Subgraph largestComponentSubgraph(const gviz::Graph &graph) {
+  size_t n = graph.Size();
+  gviz::Subgraph full = gviz::Subgraph::CreateFull(graph);
 
-  size_t *labels = malloc(n * sizeof(size_t));
-  if (!labels) {
-    gvizSubgraphRelease(&full);
-    return -1;
-  }
+  gviz::search::Components result = gviz::search::ConnectedComponents(full);
+  if (result.count == 0)
+    throw std::runtime_error("graph has no connected components");
 
-  size_t count = 0;
-  if (gvizConnectedComponents(&full, labels, &count) < 0) {
-    free(labels);
-    gvizSubgraphRelease(&full);
-    return -1;
-  }
-  gvizSubgraphRelease(&full);
-
-  if (count == 0) {
-    free(labels);
-    return -1;
-  }
-
-  size_t *sizes = calloc(count, sizeof(size_t));
-  if (!sizes) {
-    free(labels);
-    return -1;
-  }
-  gvizConnectedComponentSizes(labels, n, count, sizes);
+  std::vector<size_t> sizes =
+      gviz::search::ConnectedComponentSizes(result.labels, result.count);
 
   size_t largest = 0;
-  for (size_t c = 1; c < count; c++) {
+  for (size_t c = 1; c < result.count; c++) {
     if (sizes[c] > sizes[largest])
       largest = c;
   }
 
-  printf("components=%zu largest=%zu (%.1f%% of vertices)\n", count,
+  printf("components=%zu largest=%zu (%.1f%% of vertices)\n", result.count,
          sizes[largest], 100.0 * (double)sizes[largest] / (double)n);
 
-  gvizVertexSubset vs = gvizVertexSubsetCreateEmpty(graph);
-  if (!vs) {
-    free(labels);
-    free(sizes);
-    return -1;
-  }
-
+  gviz::Subgraph vs = gviz::Subgraph::CreateVertexInduced(graph);
   for (size_t v = 0; v < n; v++) {
-    if (labels[v] == largest)
-      gvizVertexSubsetShowVertex(vs, v);
+    if (result.labels[v] == largest)
+      vs.ShowVertex(v);
   }
-
-  free(labels);
-  free(sizes);
-
-  *out = gvizSubgraphCreateVertexInduced(graph, vs);
-  return 0;
+  return vs;
 }
 
 int main(int argc, char **argv) {
@@ -115,33 +84,33 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  gvizGraph graph;
-  if (obj) {
-    gvizGraphLoadFromObjFile(obj, &graph);
-  } else {
-    graph = build_rect_mesh(rows, cols);
-  }
-  gvizGraphBuildLayout(&graph);
+  gviz::Graph graph = [&]() -> gviz::Graph {
+    if (obj) {
+      try {
+        return gviz::io::LoadFromObjFile(obj);
+      } catch (const std::exception &e) {
+        fprintf(stderr, "failed to load '%s': %s\n", obj, e.what());
+        exit(1);
+      }
+    }
+    return gviz::graphs::BuildRectMesh(rows, cols);
+  }();
+  graph.BuildLayout();
 
-  gvizSubgraph sg = gvizSubgraphCreateFull(&graph);
-  gvizTutteState tutte = {0};
-  if (gvizTutteEmbedderInit(&tutte, sg, 2, 0) < 0) {
-    fprintf(stderr, "Tutte init failed\n");
-    gvizGraphRelease(&graph);
+  gviz::Subgraph sg = gviz::Subgraph::CreateFull(graph);
+  std::optional<gviz::layout::Tutte> tutte;
+  tutte.emplace(graph, std::move(sg), 2);
+
+  try {
+    tutte->Begin();
+  } catch (const std::exception &e) {
+    fprintf(stderr, "Tutte begin failed (graph may be non-planar): %s\n",
+            e.what());
     return 1;
   }
 
-  if (gvizTutteEmbedderBegin(&tutte) < 0) {
-    fprintf(stderr, "Tutte begin failed (graph may be non-planar)\n");
-    gvizTutteEmbedderRelease(&tutte);
-    gvizGraphRelease(&graph);
-    return 1;
-  }
-
-  gvizEmbeddedGraph *eg = (gvizEmbeddedGraph *)&tutte;
   bool autoStep = true;
-  gvizEmbeddedGraphAddAction(eg, "demo.toggleAuto", actionToggleAuto,
-                             &autoStep);
+  tutte->AddAction("demo.toggleAuto", actionToggleAuto, &autoStep);
 
   grRendererDesc desc;
   grRendererDescInit(&desc);
@@ -155,16 +124,12 @@ int main(int argc, char **argv) {
   grRenderer *r = grRendererCreate(&desc);
   if (!r) {
     fprintf(stderr, "renderer creation failed\n");
-    gvizTutteEmbedderRelease(&tutte);
-    gvizGraphRelease(&graph);
     return 1;
   }
 
-  if (grRendererSetGraph(r, eg) < 0) {
+  if (grRendererSetGraph(r, *tutte, &graph) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
-    gvizTutteEmbedderRelease(&tutte);
-    gvizGraphRelease(&graph);
     return 1;
   }
 
@@ -180,10 +145,10 @@ int main(int argc, char **argv) {
   size_t totalSteps = 0;
 
   while (grRendererFrame(r)) {
-    if (autoStep && !tutte.converged) {
+    if (autoStep && !tutte->Converged()) {
       double dt = grRendererDeltaTime(r);
       for (size_t i = 0; i < 20; i++) {
-        gvizTutteEmbedderStep(&tutte, dt);
+        tutte->Step(dt);
       }
     }
 
@@ -202,7 +167,5 @@ int main(int argc, char **argv) {
   }
 
   grRendererDestroy(r);
-  gvizTutteEmbedderRelease(&tutte);
-  gvizGraphRelease(&graph);
   return 0;
 }

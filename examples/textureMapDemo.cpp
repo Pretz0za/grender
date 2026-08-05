@@ -14,14 +14,14 @@
  * doc comment for why that correspondence holds).
  *
  * Spring-Tutte does not start relaxing right away. Vertices begin scattered
- * at random positions (gvizEmbeddedGraphRandomizePositions, the same helper
- * gvizFRPairwiseEmbedder uses) and idle there, gently oscillating between a
- * few random anchors, while the user cycles through the mesh's combinatorial
- * faces with the right arrow key and highlights one. Pressing B on a
- * highlighted face pins it as the initial outer boundary and relaxation
- * begins from then on, at which point control reverts to the usual
- * step/fix-boundary/move-image flow. Because it's a damped spring (not a
- * direct barycenter blend), interior vertices can overshoot their
+ * at random positions (EmbeddedGraph::RandomizePositions, the same helper
+ * the FR-pairwise embedder uses) and idle there, gently oscillating between
+ * a few random anchors, while the user cycles through the mesh's
+ * combinatorial faces with the right arrow key and highlights one. Pressing
+ * B on a highlighted face pins it as the initial outer boundary and
+ * relaxation begins from then on, at which point control reverts to the
+ * usual step/fix-boundary/move-image flow. Because it's a damped spring
+ * (not a direct barycenter blend), interior vertices can overshoot their
  * equilibrium and spring back before settling; K/J and ;/' retune that feel
  * live.
  *
@@ -65,52 +65,64 @@
 
 #include "grender/grender.h"
 
-#include "ds/gvizGraph.h"
-#include "ds/gvizSubgraph.h"
-#include "embedders/gvizPlanarEmbedder.h"
-#include "embedders/gvizSpringTutteEmbedder.h"
-#include "utils/graphLoader.h"
+#include "gviz.hpp"
 
-#include <math.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <optional>
+#include <span>
+#include <vector>
 
 // The scatter phase seeds vertices inside the same size box as the convex
 // polygon spring-Tutte later pins the boundary to (see
-// gvizSpringTutteFixConvexPolygon's radius of 200.0 in
-// gvizSpringTutteEmbedder.c), so confirming a face doesn't cause a jarring
-// jump in scale.
+// SpringTutte::FixConvexPolygon's radius of 200.0), so confirming a face
+// doesn't cause a jarring jump in scale.
 #define TEXMAP_SCATTER_BOX_EXTENT 200.0
 #define TEXMAP_SCATTER_ANCHOR_COUNT 3
 #define TEXMAP_SCATTER_PERIOD_SECS 2.5
 
-typedef struct {
-  grRenderer *r;
-  gvizSpringTutteState *tutte;
-  grTextureMap *tm;
-  gvizFaceSearchState faceSearch;
-  double scatterElapsed;
+/*
+ * SpringTutte::Begun() only ever latches true (via Begin()/FixOuterFace())
+ * and has no public way back to false -- the old C demo reset this by
+ * writing tutte.begun = 0 directly on the shared struct, a capability the
+ * ported class deliberately doesn't expose (see SpringTutte.hpp: "there is
+ * no partially-begun state to protect against"). This demo tracks its own
+ * `relaxing` flag instead, driving the scatter-vs-relax branch itself; the
+ * underlying embedder stays "begun" forever after the first fix, but
+ * FixOuterFace() supports being called again to re-pin a different
+ * boundary, so re-picking a face after a reset still works correctly even
+ * though the class's own Begun() no longer round-trips to false.
+ */
+typedef struct TexMapDemoState {
+  grRenderer *r = nullptr;
+  gviz::Graph *graph = nullptr;
+  gviz::layout::SpringTutte *tutte = nullptr;
+  grTextureMap *tm = nullptr;
+  gviz::layout::FaceEnumerator *enumerator = nullptr;
+  size_t currentFaceIndex = 0;
+  double scatterElapsed = 0.0;
+  bool relaxing = false;
 } TexMapDemoState;
 
-static void actionToggleAuto(gvizEmbeddedGraph *eg, void *userData,
-                             const gvizActionPayload *payload) {
+static void actionToggleAuto(gviz::layout::EmbeddedGraph &eg, void *userData,
+                             const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  bool *autoStep = userData;
+  bool *autoStep = (bool *)userData;
   *autoStep = !*autoStep;
   printf("auto step: %s\n", *autoStep ? "on" : "off");
 }
 
 // grRenderer's built-in 'S' binding only toggles the stats overlay; here it's
 // tied to the object-overlay panel too so hiding one hides both.
-static void actionToggleStats(gvizEmbeddedGraph *eg, void *userData,
-                              const gvizActionPayload *payload) {
+static void actionToggleStats(gviz::layout::EmbeddedGraph &eg, void *userData,
+                              const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  grRenderer *r = userData;
+  grRenderer *r = (grRenderer *)userData;
   bool show = !grRendererStatsShown(r);
   grRendererShowStats(r, show);
   grRendererShowObjOverlay(r, show);
@@ -126,113 +138,122 @@ static void actionToggleStats(gvizEmbeddedGraph *eg, void *userData,
 #define TEXMAP_SCALE_STEP_FACTOR 1.1
 #define TEXMAP_SPRING_PARAM_STEP_FACTOR 1.15
 
-static void actionMoveUp(gvizEmbeddedGraph *eg, void *userData,
-                         const gvizActionPayload *payload) {
+static void actionMoveUp(gviz::layout::EmbeddedGraph &eg, void *userData,
+                         const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
   double cx, cy, hw, hh;
-  grTextureMapGetImageRect(userData, &cx, &cy, &hw, &hh);
-  grTextureMapMoveImage(userData, 0.0, hh * TEXMAP_MOVE_STEP_FRACTION);
+  grTextureMapGetImageRect((grTextureMap *)userData, &cx, &cy, &hw, &hh);
+  grTextureMapMoveImage((grTextureMap *)userData, 0.0, hh * TEXMAP_MOVE_STEP_FRACTION);
 }
-static void actionMoveDown(gvizEmbeddedGraph *eg, void *userData,
-                           const gvizActionPayload *payload) {
+static void actionMoveDown(gviz::layout::EmbeddedGraph &eg, void *userData,
+                           const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
   double cx, cy, hw, hh;
-  grTextureMapGetImageRect(userData, &cx, &cy, &hw, &hh);
-  grTextureMapMoveImage(userData, 0.0, -hh * TEXMAP_MOVE_STEP_FRACTION);
+  grTextureMapGetImageRect((grTextureMap *)userData, &cx, &cy, &hw, &hh);
+  grTextureMapMoveImage((grTextureMap *)userData, 0.0, -hh * TEXMAP_MOVE_STEP_FRACTION);
 }
-static void actionMoveLeft(gvizEmbeddedGraph *eg, void *userData,
-                           const gvizActionPayload *payload) {
+static void actionMoveLeft(gviz::layout::EmbeddedGraph &eg, void *userData,
+                           const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
   double cx, cy, hw, hh;
-  grTextureMapGetImageRect(userData, &cx, &cy, &hw, &hh);
-  grTextureMapMoveImage(userData, -hw * TEXMAP_MOVE_STEP_FRACTION, 0.0);
+  grTextureMapGetImageRect((grTextureMap *)userData, &cx, &cy, &hw, &hh);
+  grTextureMapMoveImage((grTextureMap *)userData, -hw * TEXMAP_MOVE_STEP_FRACTION, 0.0);
 }
-static void actionGrow(gvizEmbeddedGraph *eg, void *userData,
-                       const gvizActionPayload *payload) {
+static void actionGrow(gviz::layout::EmbeddedGraph &eg, void *userData,
+                       const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  grTextureMapScaleImage(userData, TEXMAP_SCALE_STEP_FACTOR);
+  grTextureMapScaleImage((grTextureMap *)userData, TEXMAP_SCALE_STEP_FACTOR);
 }
-static void actionShrink(gvizEmbeddedGraph *eg, void *userData,
-                         const gvizActionPayload *payload) {
+static void actionShrink(gviz::layout::EmbeddedGraph &eg, void *userData,
+                         const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  grTextureMapScaleImage(userData, 1.0 / TEXMAP_SCALE_STEP_FACTOR);
+  grTextureMapScaleImage((grTextureMap *)userData, 1.0 / TEXMAP_SCALE_STEP_FACTOR);
 }
-static void actionStiffnessUp(gvizEmbeddedGraph *eg, void *userData,
-                              const gvizActionPayload *payload) {
+static void actionStiffnessUp(gviz::layout::EmbeddedGraph &eg, void *userData,
+                              const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  gvizSpringTutteState *tutte = userData;
-  gvizSpringTutteEmbedderConfigure(
-      tutte, tutte->stiffness * TEXMAP_SPRING_PARAM_STEP_FACTOR, 0);
-  printf("stiffness: %.2f\n", tutte->stiffness);
+  auto *tutte = (gviz::layout::SpringTutte *)userData;
+  tutte->Configure(tutte->Stiffness() * TEXMAP_SPRING_PARAM_STEP_FACTOR, 0);
+  printf("stiffness: %.2f\n", tutte->Stiffness());
 }
-static void actionStiffnessDown(gvizEmbeddedGraph *eg, void *userData,
-                                const gvizActionPayload *payload) {
+static void actionStiffnessDown(gviz::layout::EmbeddedGraph &eg, void *userData,
+                                const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  gvizSpringTutteState *tutte = userData;
-  gvizSpringTutteEmbedderConfigure(
-      tutte, tutte->stiffness / TEXMAP_SPRING_PARAM_STEP_FACTOR, 0);
-  printf("stiffness: %.2f\n", tutte->stiffness);
+  auto *tutte = (gviz::layout::SpringTutte *)userData;
+  tutte->Configure(tutte->Stiffness() / TEXMAP_SPRING_PARAM_STEP_FACTOR, 0);
+  printf("stiffness: %.2f\n", tutte->Stiffness());
 }
-static void actionDampingUp(gvizEmbeddedGraph *eg, void *userData,
-                            const gvizActionPayload *payload) {
+static void actionDampingUp(gviz::layout::EmbeddedGraph &eg, void *userData,
+                            const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  gvizSpringTutteState *tutte = userData;
-  gvizSpringTutteEmbedderConfigure(
-      tutte, 0, tutte->damping * TEXMAP_SPRING_PARAM_STEP_FACTOR);
-  printf("damping: %.2f\n", tutte->damping);
+  auto *tutte = (gviz::layout::SpringTutte *)userData;
+  tutte->Configure(0, tutte->Damping() * TEXMAP_SPRING_PARAM_STEP_FACTOR);
+  printf("damping: %.2f\n", tutte->Damping());
 }
-static void actionDampingDown(gvizEmbeddedGraph *eg, void *userData,
-                              const gvizActionPayload *payload) {
+static void actionDampingDown(gviz::layout::EmbeddedGraph &eg, void *userData,
+                              const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  gvizSpringTutteState *tutte = userData;
-  gvizSpringTutteEmbedderConfigure(
-      tutte, 0, tutte->damping / TEXMAP_SPRING_PARAM_STEP_FACTOR);
-  printf("damping: %.2f\n", tutte->damping);
+  auto *tutte = (gviz::layout::SpringTutte *)userData;
+  tutte->Configure(0, tutte->Damping() / TEXMAP_SPRING_PARAM_STEP_FACTOR);
+  printf("damping: %.2f\n", tutte->Damping());
 }
 // 0 resets everything back to the pre-pick state: the image rect snaps back
 // to its initial fit, any highlighted face is cleared, and the graph goes
-// back to the jumbled/oscillating layout (begun = 0) so a new boundary face
-// can be picked.
-static void actionReset(gvizEmbeddedGraph *eg, void *userData,
-                        const gvizActionPayload *payload) {
+// back to the jumbled/oscillating layout (ds->relaxing = false) so a new
+// boundary face can be picked. See TexMapDemoState's doc comment for why
+// this is a demo-local flag rather than the embedder's own Begun().
+static void actionReset(gviz::layout::EmbeddedGraph &eg, void *userData,
+                        const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  TexMapDemoState *ds = userData;
+  TexMapDemoState *ds = (TexMapDemoState *)userData;
   grTextureMapResetImage(ds->tm);
   grRendererClearHighlight(ds->r);
-  ds->tutte->begun = 0;
+  ds->relaxing = false;
   ds->scatterElapsed = 0.0;
 }
 
-// Advances the face iterator by one face, wrapping around once exhausted.
-// Returns 0 when state->faceSearch.face is valid, -1 if the mesh has no
-// faces at all.
-static int demoAdvanceFace(TexMapDemoState *ds) {
-  int status = gvizPlanarNextFace(&ds->faceSearch);
-  if (status == 1) {
-    ds->faceSearch.nextFace = 0;
-    status = gvizPlanarNextFace(&ds->faceSearch);
-  }
-  return status == 0 ? 0 : -1;
+// Bound to 'B' in place of the embedder's own "springTutte.fixOuterFace"
+// action so this demo can also flip its own `relaxing` flag on success (see
+// TexMapDemoState's doc comment).
+static void actionFixOuterFace(gviz::layout::EmbeddedGraph &eg, void *userData,
+                               const gviz::layout::ActionPayload &payload) {
+  (void)eg;
+  (void)payload;
+  TexMapDemoState *ds = (TexMapDemoState *)userData;
+  if (ds->tutte->FixOuterFace())
+    ds->relaxing = true;
 }
 
-// Highlights whatever face gvizFaceSearchState currently points at.
+// Advances the face cursor by one face, wrapping around once exhausted.
+// Returns 0 when ds->currentFaceIndex is valid, -1 if the mesh has no faces
+// at all.
+static int demoAdvanceFace(TexMapDemoState *ds) {
+  std::vector<std::vector<size_t>> &faces = ds->enumerator->Faces();
+  if (faces.empty())
+    return -1;
+  ds->currentFaceIndex = (ds->currentFaceIndex + 1) % faces.size();
+  return 0;
+}
+
+// Highlights whatever face the cursor currently points at.
 static void demoHighlightCurrentFace(TexMapDemoState *ds) {
-  gvizSubgraph face = {0};
-  if (gvizPlanarFaceSearchSubgraph(&ds->faceSearch, &face) != 0)
+  std::vector<std::vector<size_t>> &faces = ds->enumerator->Faces();
+  if (ds->currentFaceIndex >= faces.size())
     return;
-  grRendererSetHighlight(ds->r, &face, GR_RGBA8(255, 210, 80, 255),
+  gviz::Subgraph face =
+      gviz::layout::FaceSubgraph(*ds->graph, faces[ds->currentFaceIndex]);
+  grRendererSetHighlight(ds->r, face, GR_RGBA8(255, 210, 80, 255),
                          GR_RGBA8(255, 180, 40, 255));
-  gvizSubgraphRelease(&face);
 }
 
 // Right-arrow binding: cycles to the next face, of any size, and highlights
@@ -247,12 +268,12 @@ static void demoCycleFace(TexMapDemoState *ds) {
 
 // Before the boundary is fixed, the right arrow cycles the face highlight
 // instead of moving the (not yet meaningful) image rectangle.
-static void actionNextFaceOrMoveRight(gvizEmbeddedGraph *eg, void *userData,
-                                      const gvizActionPayload *payload) {
+static void actionNextFaceOrMoveRight(gviz::layout::EmbeddedGraph &eg, void *userData,
+                                      const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  TexMapDemoState *ds = userData;
-  if (!ds->tutte->begun) {
+  TexMapDemoState *ds = (TexMapDemoState *)userData;
+  if (!ds->relaxing) {
     demoCycleFace(ds);
     return;
   }
@@ -275,68 +296,82 @@ int main(int argc, char **argv) {
   // diffed against a first (plain) run to show the textured region moving.
   bool doMoveDemo = argc > 4;
 
-  gvizGraph graph;
-  if (gvizGraphLoadFromObjFile(obj, &graph) < 0) {
-    fprintf(stderr, "failed to load obj '%s'\n", obj);
+  gviz::Graph graph = [&]() -> gviz::Graph {
+    try {
+      return gviz::io::LoadFromObjFile(obj);
+    } catch (const std::exception &e) {
+      fprintf(stderr, "failed to load obj '%s': %s\n", obj, e.what());
+      exit(1);
+    }
+  }();
+  graph.BuildLayout();
+
+  gviz::Subgraph sg = gviz::Subgraph::CreateFull(graph);
+
+  try {
+    gviz::layout::ApplyPlanarRotation(graph, sg);
+  } catch (const gviz::NotPlanarError &e) {
+    fprintf(stderr, "mesh topology is non-planar: %s\n", e.what());
     return 1;
-  }
-  gvizGraphBuildLayout(&graph);
-
-  gvizSubgraph sg = gvizSubgraphCreateFull(&graph);
-  gvizSpringTutteState tutte = {0};
-  if (gvizSpringTutteEmbedderInit(&tutte, sg, 2, 0) < 0) {
-    fprintf(stderr, "spring-Tutte init failed\n");
-    gvizGraphRelease(&graph);
-    return 1;
-  }
-  gvizSpringTutteEmbedderConfigure(&tutte, 20, 0.5);
-
-  gvizEmbeddedGraph *eg = (gvizEmbeddedGraph *)&tutte;
-
-  int planar = gvizPlanarApplyRotationToEmbedding(eg);
-  if (planar < 0) {
-    fprintf(stderr, planar == -2 ? "mesh topology is non-planar\n"
-                                 : "planar embedding failed\n");
-    gvizSpringTutteEmbedderRelease(&tutte);
-    gvizGraphRelease(&graph);
+  } catch (const gviz::LayoutError &e) {
+    fprintf(stderr, "planar embedding failed: %s\n", e.what());
     return 1;
   }
 
-  TexMapDemoState ds = {0};
+  gviz::layout::FaceEnumerator enumerator(graph, sg);
+
+  std::optional<gviz::layout::SpringTutte> tutteOpt;
+  try {
+    tutteOpt.emplace(graph, std::move(sg), 2);
+  } catch (const std::exception &e) {
+    fprintf(stderr, "spring-Tutte init failed: %s\n", e.what());
+    return 1;
+  }
+  gviz::layout::SpringTutte &tutte = *tutteOpt;
+  tutte.Configure(20, 0.5);
+
+  // FixOuterFace() requires IsPlanarEmbedded() to already be true, but that
+  // protected flag can only be set from inside the EmbeddedGraph hierarchy
+  // (see EmbeddedGraph.hpp's SetPlanarEmbedded doc) -- the free-standing
+  // ApplyPlanarRotation() call above operates on the raw Graph/Subgraph and
+  // has no standing to set it (see Planar.hpp's file-level note on why
+  // gvizPlanarApplyRotationToEmbedding wasn't ported as a free function).
+  // Only Begin() can flip it, but Begin() also immediately pins an arbitrary
+  // (largest-face) boundary and seeds interior vertices -- so it's run here,
+  // once, purely to satisfy that precondition; every frame until the user
+  // fixes their own chosen boundary (ds.relaxing == false below), the
+  // scatter-phase loop unconditionally overwrites every vertex's position,
+  // so Begin()'s own initial pin is never actually visible.
+  try {
+    tutte.Begin();
+  } catch (const std::exception &e) {
+    fprintf(stderr, "spring-Tutte begin failed: %s\n", e.what());
+    return 1;
+  }
+
+  TexMapDemoState ds;
   ds.tutte = &tutte;
-  if (gvizPlanarFaceSearchInit(eg, &ds.faceSearch) < 0) {
-    fprintf(stderr, "face enumeration failed\n");
-    gvizSpringTutteEmbedderRelease(&tutte);
-    gvizGraphRelease(&graph);
-    return 1;
-  }
+  ds.graph = &graph;
+  ds.enumerator = &enumerator;
+
   // Scatter phase: seed a handful of random anchors per vertex (same random
-  // box placement gvizFRPairwiseEmbedder uses) and idle-oscillate between
+  // box placement the FR-pairwise embedder uses) and idle-oscillate between
   // them until the user fixes the initial boundary.
-  size_t vcount = gvizGraphSize(&graph);
-  size_t dim = gvizEmbeddedGraphDim(eg);
+  size_t vcount = graph.Size();
+  size_t dim = tutte.Dim();
   size_t posN = vcount * dim;
-  double *scatterAnchors =
-      malloc(sizeof(double) * TEXMAP_SCATTER_ANCHOR_COUNT * posN);
-  if (!scatterAnchors) {
-    fprintf(stderr, "scatter anchor allocation failed\n");
-    gvizPlanarFaceSearchRelease(&ds.faceSearch);
-    gvizSpringTutteEmbedderRelease(&tutte);
-    gvizGraphRelease(&graph);
-    return 1;
-  }
+  std::vector<double> scatterAnchors(TEXMAP_SCATTER_ANCHOR_COUNT * posN);
   srand((unsigned int)time(NULL));
   for (size_t i = 0; i < TEXMAP_SCATTER_ANCHOR_COUNT; i++) {
     unsigned int seed = (unsigned int)rand();
     if (seed == 0)
       seed = 1;
-    gvizEmbeddedGraphRandomizePositions(eg, TEXMAP_SCATTER_BOX_EXTENT, seed);
-    memcpy(scatterAnchors + i * posN, gvizEmbeddedGraphPositions(eg),
-           sizeof(double) * posN);
+    tutte.RandomizePositions(TEXMAP_SCATTER_BOX_EXTENT, seed);
+    std::span<const double> pos = tutte.Positions();
+    memcpy(scatterAnchors.data() + i * posN, pos.data(), sizeof(double) * posN);
   }
   bool autoStep = false;
-  gvizEmbeddedGraphAddAction(eg, "demo.toggleAuto", actionToggleAuto,
-                             &autoStep);
+  tutte.AddAction("demo.toggleAuto", actionToggleAuto, &autoStep);
 
   grRendererDesc desc;
   grRendererDescInit(&desc);
@@ -351,34 +386,22 @@ int main(int argc, char **argv) {
   grRenderer *r = grRendererCreate(&desc);
   if (!r) {
     fprintf(stderr, "renderer creation failed\n");
-    free(scatterAnchors);
-    gvizPlanarFaceSearchRelease(&ds.faceSearch);
-    gvizSpringTutteEmbedderRelease(&tutte);
-    gvizGraphRelease(&graph);
     return 1;
   }
 
-  if (grRendererSetGraph(r, eg) < 0) {
+  if (grRendererSetGraph(r, tutte, &graph) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
-    free(scatterAnchors);
-    gvizPlanarFaceSearchRelease(&ds.faceSearch);
-    gvizSpringTutteEmbedderRelease(&tutte);
-    gvizGraphRelease(&graph);
     return 1;
   }
 
-  grTextureMap *tm = grRendererLoadTextureMap(r, eg, obj, imagePath);
+  grTextureMap *tm = grRendererLoadTextureMap(r, tutte, obj, imagePath);
   if (!tm) {
     fprintf(stderr,
             "texture map load failed for obj '%s' / image '%s' (vertex-count "
             "mismatch, bad image, or non-2D embedding)\n",
             obj, imagePath);
     grRendererDestroy(r);
-    free(scatterAnchors);
-    gvizPlanarFaceSearchRelease(&ds.faceSearch);
-    gvizSpringTutteEmbedderRelease(&tutte);
-    gvizGraphRelease(&graph);
     return 1;
   }
   // The image rect isn't meaningful yet during the scatter/pick phase, and
@@ -390,25 +413,22 @@ int main(int argc, char **argv) {
   ds.r = r;
   ds.tm = tm;
 
-  gvizEmbeddedGraphAddAction(eg, "texmap.moveUp", actionMoveUp, tm);
-  gvizEmbeddedGraphAddAction(eg, "texmap.moveDown", actionMoveDown, tm);
-  gvizEmbeddedGraphAddAction(eg, "texmap.moveLeft", actionMoveLeft, tm);
-  gvizEmbeddedGraphAddAction(eg, "texmap.moveRight", actionNextFaceOrMoveRight,
-                             &ds);
-  gvizEmbeddedGraphAddAction(eg, "texmap.grow", actionGrow, tm);
-  gvizEmbeddedGraphAddAction(eg, "texmap.shrink", actionShrink, tm);
-  gvizEmbeddedGraphAddAction(eg, "texmap.reset", actionReset, &ds);
-  gvizEmbeddedGraphAddAction(eg, "demo.toggleStats", actionToggleStats, r);
-  gvizEmbeddedGraphAddAction(eg, "texmap.stiffnessUp", actionStiffnessUp,
-                             &tutte);
-  gvizEmbeddedGraphAddAction(eg, "texmap.stiffnessDown", actionStiffnessDown,
-                             &tutte);
-  gvizEmbeddedGraphAddAction(eg, "texmap.dampingUp", actionDampingUp, &tutte);
-  gvizEmbeddedGraphAddAction(eg, "texmap.dampingDown", actionDampingDown,
-                             &tutte);
+  tutte.AddAction("texmap.moveUp", actionMoveUp, tm);
+  tutte.AddAction("texmap.moveDown", actionMoveDown, tm);
+  tutte.AddAction("texmap.moveLeft", actionMoveLeft, tm);
+  tutte.AddAction("texmap.moveRight", actionNextFaceOrMoveRight, &ds);
+  tutte.AddAction("texmap.grow", actionGrow, tm);
+  tutte.AddAction("texmap.shrink", actionShrink, tm);
+  tutte.AddAction("texmap.reset", actionReset, &ds);
+  tutte.AddAction("texmap.fixOuterFace", actionFixOuterFace, &ds);
+  tutte.AddAction("demo.toggleStats", actionToggleStats, r);
+  tutte.AddAction("texmap.stiffnessUp", actionStiffnessUp, &tutte);
+  tutte.AddAction("texmap.stiffnessDown", actionStiffnessDown, &tutte);
+  tutte.AddAction("texmap.dampingUp", actionDampingUp, &tutte);
+  tutte.AddAction("texmap.dampingDown", actionDampingDown, &tutte);
 
   grRendererBindKey(r, 'R', "springTutte.step");
-  grRendererBindKey(r, 'B', "springTutte.fixOuterFace");
+  grRendererBindKey(r, 'B', "texmap.fixOuterFace");
   grRendererBindKey(r, 'S', "demo.toggleStats");
   grRendererBindKey(r, GR_KEY_SPACE, "demo.toggleAuto");
   grRendererBindKey(r, 'K', "texmap.stiffnessUp");
@@ -432,7 +452,9 @@ int main(int argc, char **argv) {
     // Skip the interactive scatter/pick phase: highlight the first
     // enumerated face and fix it immediately so relaxation can auto-run.
     demoCycleFace(&ds);
-    if (gvizSpringTutteEmbedderFixOuterFace(&tutte) < 0)
+    if (ds.tutte->FixOuterFace())
+      ds.relaxing = true;
+    else
       fprintf(stderr,
               "warning: failed to auto-fix initial boundary for screenshot\n");
   }
@@ -441,7 +463,7 @@ int main(int argc, char **argv) {
   grRendererShowObjOverlay(r, false);
 
   while (grRendererFrame(r)) {
-    if (!tutte.begun) {
+    if (!ds.relaxing) {
       ds.scatterElapsed += grRendererDeltaTime(r);
       double phase = fmod(ds.scatterElapsed / TEXMAP_SCATTER_PERIOD_SECS,
                           (double)TEXMAP_SCATTER_ANCHOR_COUNT);
@@ -451,16 +473,16 @@ int main(int argc, char **argv) {
       double s = t * t * (3.0 - 2.0 * t); // smoothstep ease in/out
       double pos[2];
       for (size_t u = 0; u < vcount; u++) {
-        const double *a = scatterAnchors + idx0 * posN + u * dim;
-        const double *b = scatterAnchors + idx1 * posN + u * dim;
+        const double *a = scatterAnchors.data() + idx0 * posN + u * dim;
+        const double *b = scatterAnchors.data() + idx1 * posN + u * dim;
         pos[0] = a[0] + (b[0] - a[0]) * s;
         pos[1] = a[1] + (b[1] - a[1]) * s;
-        gvizEmbeddedGraphSetVPosition(eg, u, pos);
+        tutte.SetVPosition(u, pos);
       }
-    } else if (autoStep && !tutte.converged) {
+    } else if (autoStep && !tutte.Converged()) {
       double dt = grRendererDeltaTime(r);
       for (size_t i = 0; i < 20; i++) {
-        gvizSpringTutteEmbedderStep(&tutte, dt);
+        tutte.Step(dt);
       }
     }
 
@@ -487,9 +509,5 @@ int main(int argc, char **argv) {
   }
 
   grRendererDestroy(r);
-  free(scatterAnchors);
-  gvizPlanarFaceSearchRelease(&ds.faceSearch);
-  gvizSpringTutteEmbedderRelease(&tutte);
-  gvizGraphRelease(&graph);
   return 0;
 }

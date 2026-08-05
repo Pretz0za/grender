@@ -1,13 +1,13 @@
 /**
  * Live Barnes-Hut force embedding demo, using gviz's configurable
- * gvizForceEmbedder framework (LinLog or Fruchterman-Reingold, gravity,
- * Barnes-Hut approximation).
+ * gviz::layout::ForceAtlas framework (LinLog or Fruchterman-Reingold,
+ * gravity, Barnes-Hut approximation).
  *
  * A random spanning-tree-plus-extra-edges graph (edge connectivity
  * configurable) is laid out while grender draws every frame. The embedder
  * registers "forceEmbedder.step" on its embedded graph; this app merely
  * binds a key to that name without knowing what it does. Node radii are
- * scaled by degree via gvizForceEmbedderConfigureRadius, and the per-vertex
+ * scaled by degree via ForceAtlas::ConfigureRadius, and the per-vertex
  * radii are handed to grRendererSetNodeSizes so what's drawn matches the
  * circles the physics can be told to keep apart. Overlap prevention (which
  * makes repulsion actually respect those radii) starts off and is toggled
@@ -17,7 +17,7 @@
  * With -G/--grow the graph is dynamic: the embedder is built over a
  * whole-graph vertex-induced view (no up-front edge-bitset layout), and 'A'
  * adds a vertex wired to one or two random existing vertices directly on
- * the gvizGraph, committed with gvizForceEmbedderSync -- the new vertex
+ * the gviz::Graph, committed with ForceAtlas::Sync -- the new vertex
  * appears already placed near its neighbors, visible and simulated in the
  * same frame (gviz's commit model: nothing downstream of the graph sees a
  * mutation until Sync). Everything else works as in static mode:
@@ -66,23 +66,21 @@
  *   -h, --help                    print this help and exit
  */
 
-#include "embedders/gvizEmbeddedGraph.h"
 #include "grender/grender.h"
 
-#include "ds/gvizGraph.h"
-#include "ds/gvizSubgraph.h"
-#include "embedders/gvizForceEmbedder.h"
-#include "utils/graphLoader.h"
-#include "utils/graphs.h"
+#include "gviz.hpp"
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <getopt.h>
-#include <math.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <memory>
+#include <optional>
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <vector>
 
 #ifndef GRENDER_GVIZ_DATA_DIR
 #error "GRENDER_GVIZ_DATA_DIR must be defined by CMake"
@@ -99,117 +97,144 @@
 #define DEMO_RADIUS_BASE_STEP 0.1
 #define DEMO_RADIUS_BASE_MIN 0.0
 
-/* Renderer + scratch buffer needed to re-upload node sizes after a live
- * radius change; gvizEmbeddedGraphAddAction's userData is the natural way to
- * hand these to an action handler, since the handler only otherwise gets the
- * embedded graph itself. */
-typedef struct RadiusControl {
-  grRenderer *r;
-  float *radii; /* scratch, sized fe.vertexCount, reused across updates */
-} RadiusControl;
+using gviz::layout::ForceAtlas;
 
-static void refreshNodeSizes(gvizForceEmbedderState *state, RadiusControl *ctl) {
-  for (size_t i = 0; i < state->vertexCount; i++)
-    ctl->radii[state->vertices[i]] = (float)gvizForceEmbedderVertexRadius(state, i);
-  grRendererSetNodeSizes(ctl->r, ctl->radii, state->vertexCount);
+/*
+ * Renderer + scratch buffer + shadow config state needed by the live-tuning
+ * action handlers. The old C ForceAtlas struct exposed gravityK/edgeLength/
+ * theta/radiusBase/radiusPerDegree as plain fields the demo read back
+ * directly for its printf readouts; the ported ForceAtlas class only offers
+ * one-way Configure*() setters (see ForceAtlas.hpp), so this demo keeps its
+ * own shadow copy of whatever it last configured instead -- a self-contained
+ * demo-only adaptation, not a gap the renderer or gviz need to fill.
+ */
+typedef struct DemoConfig {
+  grRenderer *r = nullptr;
+  std::vector<float> radii; // scratch, sized to vertex count, reused across updates
+  double gravityK = DEMO_GRAVITY_K_DEFAULT;
+  double edgeLength = ForceAtlas::kEdgeLengthDefault;
+  double theta = ForceAtlas::kThetaDefault;
+  double radiusBase = DEMO_RADIUS_BASE;
+  double radiusPerDegree = DEMO_RADIUS_PER_DEGREE;
+} DemoConfig;
+
+/*
+ * ForceAtlas doesn't expose its compact-index -> raw-vertex-id table
+ * (vertices_ was a private old-C-struct field this demo used to read
+ * directly): this demo always keeps every graph vertex admitted into a
+ * dense [0, PositionCount()) subgraph (full mode, or a vertex-induced
+ * "grow" mode that shows every vertex as it's added), so compact index i
+ * and raw vertex id i coincide here, and PositionCount() stands in for the
+ * old vertexCount. That equivalence is specific to this demo's usage, not a
+ * general library guarantee.
+ */
+static void refreshNodeSizes(ForceAtlas &fa, DemoConfig &ctl) {
+  size_t n = fa.PositionCount();
+  if (ctl.radii.size() < n)
+    ctl.radii.resize(n);
+  for (size_t i = 0; i < n; i++)
+    ctl.radii[i] = (float)fa.VertexRadius(i);
+  grRendererSetNodeSizes(ctl.r, ctl.radii.data(), n);
 }
 
-static void actionToggleAuto(gvizEmbeddedGraph *eg, void *userData,
-                             const gvizActionPayload *payload) {
+static void actionToggleAuto(gviz::layout::EmbeddedGraph &eg, void *userData,
+                             const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  bool *autoStep = userData;
+  bool *autoStep = (bool *)userData;
   *autoStep = !*autoStep;
   printf("auto step: %s\n", *autoStep ? "on" : "off");
 }
 
-static void actionGravityUp(gvizEmbeddedGraph *eg, void *userData,
-                            const gvizActionPayload *payload) {
+static void actionGravityUp(gviz::layout::EmbeddedGraph &eg, void *userData,
+                            const gviz::layout::ActionPayload &payload) {
+  (void)payload;
+  DemoConfig *cfg = (DemoConfig *)userData;
+  auto &fa = static_cast<ForceAtlas &>(eg);
+  cfg->gravityK += DEMO_GRAVITY_K_STEP;
+  fa.ConfigureGravity(cfg->gravityK);
+  printf("gravity k: %f\n", cfg->gravityK);
+}
+
+static void actionGravityDown(gviz::layout::EmbeddedGraph &eg, void *userData,
+                              const gviz::layout::ActionPayload &payload) {
+  (void)payload;
+  DemoConfig *cfg = (DemoConfig *)userData;
+  auto &fa = static_cast<ForceAtlas &>(eg);
+  cfg->gravityK = fmax(cfg->gravityK - DEMO_GRAVITY_K_STEP, 0.0);
+  fa.ConfigureGravity(cfg->gravityK);
+  printf("gravity k: %f\n", cfg->gravityK);
+}
+
+static void actionEdgeLengthUp(gviz::layout::EmbeddedGraph &eg, void *userData,
+                               const gviz::layout::ActionPayload &payload) {
+  (void)payload;
+  DemoConfig *cfg = (DemoConfig *)userData;
+  auto &fa = static_cast<ForceAtlas &>(eg);
+  cfg->edgeLength += DEMO_EDGE_LENGTH_STEP;
+  fa.Configure(cfg->edgeLength, 0);
+  printf("edge length: %f\n", cfg->edgeLength);
+}
+
+static void actionEdgeLengthDown(gviz::layout::EmbeddedGraph &eg, void *userData,
+                                 const gviz::layout::ActionPayload &payload) {
+  (void)payload;
+  DemoConfig *cfg = (DemoConfig *)userData;
+  auto &fa = static_cast<ForceAtlas &>(eg);
+  cfg->edgeLength = fmax(cfg->edgeLength - DEMO_EDGE_LENGTH_STEP, DEMO_EDGE_LENGTH_MIN);
+  fa.Configure(cfg->edgeLength, 0);
+  printf("edge length: %f\n", cfg->edgeLength);
+}
+
+static void actionThetaUp(gviz::layout::EmbeddedGraph &eg, void *userData,
+                          const gviz::layout::ActionPayload &payload) {
+  (void)payload;
+  DemoConfig *cfg = (DemoConfig *)userData;
+  auto &fa = static_cast<ForceAtlas &>(eg);
+  cfg->theta += DEMO_THETA_STEP;
+  fa.ConfigureBarnesHut(cfg->theta, 0);
+  printf("theta: %f\n", cfg->theta);
+}
+
+static void actionThetaDown(gviz::layout::EmbeddedGraph &eg, void *userData,
+                            const gviz::layout::ActionPayload &payload) {
+  (void)payload;
+  DemoConfig *cfg = (DemoConfig *)userData;
+  auto &fa = static_cast<ForceAtlas &>(eg);
+  cfg->theta = fmax(cfg->theta - DEMO_THETA_STEP, DEMO_THETA_MIN);
+  fa.ConfigureBarnesHut(cfg->theta, 0);
+  printf("theta: %f\n", cfg->theta);
+}
+
+static void actionRadiusBaseUp(gviz::layout::EmbeddedGraph &eg, void *userData,
+                               const gviz::layout::ActionPayload &payload) {
+  (void)payload;
+  DemoConfig *cfg = (DemoConfig *)userData;
+  auto &fa = static_cast<ForceAtlas &>(eg);
+  cfg->radiusBase += DEMO_RADIUS_BASE_STEP;
+  fa.ConfigureRadius(cfg->radiusBase, cfg->radiusPerDegree);
+  refreshNodeSizes(fa, *cfg);
+  printf("radius base: %f\n", cfg->radiusBase);
+}
+
+static void actionRadiusBaseDown(gviz::layout::EmbeddedGraph &eg, void *userData,
+                                 const gviz::layout::ActionPayload &payload) {
+  (void)payload;
+  DemoConfig *cfg = (DemoConfig *)userData;
+  auto &fa = static_cast<ForceAtlas &>(eg);
+  cfg->radiusBase = fmax(cfg->radiusBase - DEMO_RADIUS_BASE_STEP, DEMO_RADIUS_BASE_MIN);
+  fa.ConfigureRadius(cfg->radiusBase, cfg->radiusPerDegree);
+  refreshNodeSizes(fa, *cfg);
+  printf("radius base: %f\n", cfg->radiusBase);
+}
+
+static void actionToggleOverlapPrevention(gviz::layout::EmbeddedGraph &eg, void *userData,
+                                          const gviz::layout::ActionPayload &payload) {
   (void)userData;
   (void)payload;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
-  gvizForceEmbedderConfigureGravity(state, state->gravityK + DEMO_GRAVITY_K_STEP);
-  printf("gravity k: %f\n", state->gravityK);
-}
-
-static void actionGravityDown(gvizEmbeddedGraph *eg, void *userData,
-                              const gvizActionPayload *payload) {
-  (void)userData;
-  (void)payload;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
-  double k = fmax(state->gravityK - DEMO_GRAVITY_K_STEP, 0.0);
-  gvizForceEmbedderConfigureGravity(state, k);
-  printf("gravity k: %f\n", state->gravityK);
-}
-
-static void actionEdgeLengthUp(gvizEmbeddedGraph *eg, void *userData,
-                               const gvizActionPayload *payload) {
-  (void)userData;
-  (void)payload;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
-  gvizForceEmbedderConfigure(state, state->edgeLength + DEMO_EDGE_LENGTH_STEP, 0);
-  printf("edge length: %f\n", state->edgeLength);
-}
-
-static void actionEdgeLengthDown(gvizEmbeddedGraph *eg, void *userData,
-                                 const gvizActionPayload *payload) {
-  (void)userData;
-  (void)payload;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
-  double edgeLength =
-      fmax(state->edgeLength - DEMO_EDGE_LENGTH_STEP, DEMO_EDGE_LENGTH_MIN);
-  gvizForceEmbedderConfigure(state, edgeLength, 0);
-  printf("edge length: %f\n", state->edgeLength);
-}
-
-static void actionThetaUp(gvizEmbeddedGraph *eg, void *userData,
-                          const gvizActionPayload *payload) {
-  (void)userData;
-  (void)payload;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
-  gvizForceEmbedderConfigureBarnesHut(state, state->theta + DEMO_THETA_STEP, 0);
-  printf("theta: %f\n", state->theta);
-}
-
-static void actionThetaDown(gvizEmbeddedGraph *eg, void *userData,
-                            const gvizActionPayload *payload) {
-  (void)userData;
-  (void)payload;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
-  double theta = fmax(state->theta - DEMO_THETA_STEP, DEMO_THETA_MIN);
-  gvizForceEmbedderConfigureBarnesHut(state, theta, 0);
-  printf("theta: %f\n", state->theta);
-}
-
-static void actionRadiusBaseUp(gvizEmbeddedGraph *eg, void *userData,
-                               const gvizActionPayload *payload) {
-  (void)payload;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
-  RadiusControl *ctl = userData;
-  gvizForceEmbedderConfigureRadius(state, state->radiusBase + DEMO_RADIUS_BASE_STEP,
-                                   state->radiusPerDegree);
-  refreshNodeSizes(state, ctl);
-  printf("radius base: %f\n", state->radiusBase);
-}
-
-static void actionRadiusBaseDown(gvizEmbeddedGraph *eg, void *userData,
-                                 const gvizActionPayload *payload) {
-  (void)payload;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
-  RadiusControl *ctl = userData;
-  double base = fmax(state->radiusBase - DEMO_RADIUS_BASE_STEP, DEMO_RADIUS_BASE_MIN);
-  gvizForceEmbedderConfigureRadius(state, base, state->radiusPerDegree);
-  refreshNodeSizes(state, ctl);
-  printf("radius base: %f\n", state->radiusBase);
-}
-
-static void actionToggleOverlapPrevention(gvizEmbeddedGraph *eg, void *userData,
-                                          const gvizActionPayload *payload) {
-  (void)userData;
-  (void)payload;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
-  gvizForceEmbedderSetPreventOverlapEnabled(state, !state->preventOverlap);
-  printf("prevent overlap: %s\n", state->preventOverlap ? "on" : "off");
+  auto &fa = static_cast<ForceAtlas &>(eg);
+  fa.SetPreventOverlapEnabled(!fa.PreventOverlapEnabled());
+  printf("prevent overlap: %s\n", fa.PreventOverlapEnabled() ? "on" : "off");
 }
 
 /* Everything actionGrowVertex needs: the mutable parent graph (mutated
@@ -219,50 +244,52 @@ static void actionToggleOverlapPrevention(gvizEmbeddedGraph *eg, void *userData,
  * renderer's position capacity, which only catches up on the frame
  * following the commit. */
 typedef struct GrowControl {
-  gvizGraph *graph;
+  gviz::Graph *graph;
   unsigned int rng;
   bool sizesDirty;
 } GrowControl;
 
 /* Adds one vertex wired to one or two random existing vertices directly on
- * the gvizGraph, then commits with gvizForceEmbedderSync: the vertex
- * becomes visible and simulated together, already placed near its
- * neighbors. Wiring the edges BEFORE the Sync is what makes that placement
- * possible (see gvizForceEmbedderSync's contract). */
-static void actionGrowVertex(gvizEmbeddedGraph *eg, void *userData,
-                             const gvizActionPayload *payload) {
+ * the gviz::Graph, then commits with ForceAtlas::Sync: the vertex becomes
+ * visible and simulated together, already placed near its neighbors. Wiring
+ * the edges BEFORE the Sync is what makes that placement possible (see
+ * ForceAtlas::Sync's contract). */
+static void actionGrowVertex(gviz::layout::EmbeddedGraph &eg, void *userData,
+                             const gviz::layout::ActionPayload &payload) {
   (void)payload;
-  GrowControl *grow = userData;
-  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
+  GrowControl *grow = (GrowControl *)userData;
+  auto &fa = static_cast<ForceAtlas &>(eg);
 
-  size_t before = gvizGraphSize(grow->graph);
-  if (before == 0 || gvizGraphAddVertex(grow->graph, NULL, NULL, NULL) < 0)
+  size_t before = grow->graph->Size();
+  if (before == 0)
     return;
-  size_t newId = before;
+  size_t newId = grow->graph->AddVertex();
   size_t target = (size_t)rand_r(&grow->rng) % before;
-  gvizGraphAddEdge(grow->graph, newId, target, 1.0);
+  grow->graph->AddEdge(newId, target, 1.0);
   if (before > 1 && rand_r(&grow->rng) % 2 == 0) {
     size_t second = (size_t)rand_r(&grow->rng) % before;
     if (second != target)
-      gvizGraphAddEdge(grow->graph, newId, second, 1.0);
+      grow->graph->AddEdge(newId, second, 1.0);
   }
 
-  if (gvizForceEmbedderSync(state, (unsigned int)rand_r(&grow->rng) | 1u) < 0) {
-    fprintf(stderr, "sync failed; vertex %zu joins on a later sync\n", newId);
+  try {
+    fa.Sync((unsigned int)rand_r(&grow->rng) | 1u);
+  } catch (const std::exception &e) {
+    fprintf(stderr, "sync failed; vertex %zu joins on a later sync: %s\n", newId,
+            e.what());
     return;
   }
   grow->sizesDirty = true;
-  printf("added vertex %zu (%zu vertices)\n", newId,
-         gvizGraphSize(grow->graph));
+  printf("added vertex %zu (%zu vertices)\n", newId, grow->graph->Size());
 }
 
-static int parseModel(const char *arg, gvizForceModelKind *out) {
+static int parseModel(const char *arg, bool *outLinLog) {
   if (!arg || strcasecmp(arg, "linlog") == 0) {
-    *out = GVIZ_FORCE_MODEL_LINLOG;
+    *outLinLog = true;
     return 0;
   }
   if (strcasecmp(arg, "fr") == 0) {
-    *out = GVIZ_FORCE_MODEL_FRUCHTERMAN_REINGOLD;
+    *outLinLog = false;
     return 0;
   }
   return -1;
@@ -276,32 +303,41 @@ static int fileExists(const char *path) {
 /**
  * Loads <GRENDER_GVIZ_DATA_DIR>/<name>/data.gexf if present, else
  * <GRENDER_GVIZ_DATA_DIR>/<name>/data.edges, interpreting edges as directed
- * iff @p directed is non-zero. @p out must be uninitialized on entry,
- * matching gvizGraphLoadFromGexfFile/gvizGraphLoadFromEdgesFile.
+ * iff @p directed is true.
  *
- * @return 0 on success, -1 if neither file exists or loading failed.
+ * @return the loaded graph, or std::nullopt if neither file exists or
+ * loading failed.
  */
-static int loadNamedGraph(const char *name, int directed, gvizGraph *out) {
+static std::optional<gviz::Graph> loadNamedGraph(const char *name, bool directed) {
   char path[1024];
 
   snprintf(path, sizeof(path), "%s/%s/data.gexf", GRENDER_GVIZ_DATA_DIR, name);
   if (fileExists(path)) {
     printf("loading %s...\n", path);
-    return gvizGraphLoadFromGexfFile(path, directed, out);
+    try {
+      return gviz::io::LoadFromGexfFile(path, directed);
+    } catch (const std::exception &e) {
+      fprintf(stderr, "failed to load '%s': %s\n", path, e.what());
+      return std::nullopt;
+    }
   }
 
   snprintf(path, sizeof(path), "%s/%s/data.edges", GRENDER_GVIZ_DATA_DIR, name);
   if (fileExists(path)) {
-    gvizEdgesFileOptions opts;
-    gvizEdgesFileOptionsInit(&opts);
-    opts.directed = directed;
     printf("loading %s...\n", path);
-    return gvizGraphLoadFromEdgesFile(path, &opts, out);
+    gviz::io::EdgesFileOptions opts;
+    opts.directed = directed;
+    try {
+      return gviz::io::LoadFromEdgesFile(path, opts);
+    } catch (const std::exception &e) {
+      fprintf(stderr, "failed to load '%s': %s\n", path, e.what());
+      return std::nullopt;
+    }
   }
 
   fprintf(stderr, "no data.gexf or data.edges found under %s/%s\n",
           GRENDER_GVIZ_DATA_DIR, name);
-  return -1;
+  return std::nullopt;
 }
 
 static void printUsage(const char *prog) {
@@ -322,7 +358,7 @@ static void printUsage(const char *prog) {
       "                              directed (default: undirected; ignored\n"
       "                              without -g/--graph)\n"
       "  -G, --grow                  dynamic mode: 'A' adds a vertex live,\n"
-      "                              committed via gvizForceEmbedderSync\n"
+      "                              committed via ForceAtlas::Sync\n"
       "  -m, --model {linlog|fr}     force model (default linlog)\n"
       "  -o, --screenshot PATH       save a .ppm screenshot after settling and exit\n"
       "      --degree-alpha          fade edges by max endpoint degree (default off)\n"
@@ -382,7 +418,7 @@ int main(int argc, char **argv) {
   const char *graphName = NULL;
   bool directed = false;
   bool grow = false;
-  gvizForceModelKind model = GVIZ_FORCE_MODEL_LINLOG;
+  bool useLinLog = true;
   const char *screenshotPath = NULL;
   bool degreeAlpha = false;
   float edgeWidth = 1.5f;
@@ -411,7 +447,7 @@ int main(int argc, char **argv) {
       grow = true;
       break;
     case 'm':
-      if (parseModel(optarg, &model) < 0) {
+      if (parseModel(optarg, &useLinLog) < 0) {
         fprintf(stderr, "unknown model \"%s\", expected \"linlog\" or \"fr\"\n",
                 optarg);
         return 1;
@@ -456,70 +492,74 @@ int main(int argc, char **argv) {
     fprintf(stderr, "--directed requires -g/--graph\n");
     return 1;
   }
-  gvizGraph graph;
+
+  std::optional<gviz::Graph> graphOpt;
   if (graphName) {
-    if (loadNamedGraph(graphName, directed, &graph) < 0)
+    graphOpt = loadNamedGraph(graphName, directed);
+    if (!graphOpt)
       return 1;
   } else {
-    graph = build_random_connected_graph(N, edgeConnectivity, seed);
+    graphOpt = gviz::graphs::BuildRandomConnectedGraph(N, edgeConnectivity, seed);
   }
+  gviz::Graph &graph = *graphOpt;
 
-  gvizSubgraph sg;
+  std::optional<gviz::Subgraph> sg;
   if (grow) {
     /* Dynamic mode: whole-graph vertex-induced view. No edge-bitset layout
      * is built up front, so each growth commit is amortized O(1) capacity
-     * work plus the embedding's CSR rebuild (see gvizEmbeddedGraph.h's
+     * work plus the embedding's CSR rebuild (see EmbeddedGraph.hpp's
      * GROWTH & SYNC section). Click-picking still works: the renderer
-     * refreshes the layout on demand (gvizGraphEnsureLayout) when a click
+     * refreshes the layout on demand (Graph::EnsureLayout) when a click
      * needs a pick subgraph. */
-    gvizVertexSubset vs = gvizVertexSubsetCreateEmpty(&graph);
-    sg = gvizSubgraphCreateVertexInduced(&graph, vs);
-    for (size_t i = 0; i < gvizGraphSize(&graph); i++)
-      gvizSubgraphShowVertex(&sg, i);
+    sg.emplace(gviz::Subgraph::CreateVertexInduced(graph));
+    for (size_t i = 0; i < graph.Size(); i++)
+      sg->ShowVertex(i);
     if (graphName)
-      printf("loaded %zu vertices\n", gvizGraphSize(&graph));
+      printf("loaded %zu vertices\n", graph.Size());
   } else {
-    gvizGraphBuildLayout(&graph);
+    graph.BuildLayout();
     if (graphName)
-      printf("loaded %zu vertices, %zu edges\n", gvizGraphSize(&graph),
-             gvizGraphEdgeCount(&graph));
-    sg = gvizSubgraphCreateFull(&graph);
+      printf("loaded %zu vertices, %zu edges\n", graph.Size(), graph.EdgeCount());
+    sg.emplace(gviz::Subgraph::CreateFull(graph));
   }
 
-  gvizForceEmbedderState fe = {0};
-  if (gvizForceEmbedderInit(&fe, sg, 2, model) < 0) {
-    fprintf(stderr, "force embedder init failed\n");
-    gvizGraphFreeVertexDataStrings(&graph);
-    gvizGraphRelease(&graph);
+  std::unique_ptr<gviz::layout::ForceModel> model =
+      useLinLog ? std::unique_ptr<gviz::layout::ForceModel>(
+                      std::make_unique<gviz::layout::LinLog>())
+                : std::unique_ptr<gviz::layout::ForceModel>(
+                      std::make_unique<gviz::layout::FruchtermanReingold>());
+
+  std::optional<ForceAtlas> fe;
+  try {
+    fe.emplace(std::move(*sg), 2, std::move(model));
+  } catch (const std::exception &e) {
+    fprintf(stderr, "force embedder init failed: %s\n", e.what());
     return 1;
   }
-  gvizForceEmbedderSetBarnesHutEnabled(&fe, 1);
-  gvizForceEmbedderConfigureGravity(&fe, DEMO_GRAVITY_K_DEFAULT);
-  gvizForceEmbedderConfigureRadius(&fe, DEMO_RADIUS_BASE, DEMO_RADIUS_PER_DEGREE);
-  gvizForceEmbedderBegin(&fe, seed);
+  fe->SetBarnesHutEnabled(true);
 
-  gvizEmbeddedGraph *eg = (gvizEmbeddedGraph *)&fe;
+  DemoConfig cfg;
+  cfg.gravityK = DEMO_GRAVITY_K_DEFAULT;
+  cfg.radiusBase = DEMO_RADIUS_BASE;
+  cfg.radiusPerDegree = DEMO_RADIUS_PER_DEGREE;
+  fe->ConfigureGravity(cfg.gravityK);
+  fe->ConfigureRadius(cfg.radiusBase, cfg.radiusPerDegree);
+  fe->Begin(seed);
+
   bool autoStep = false;
-  RadiusControl radiusControl = {0};
   GrowControl growControl = {&graph, seed ^ 0x9e3779b9u, false};
   if (grow)
-    gvizEmbeddedGraphAddAction(eg, "demo.growVertex", actionGrowVertex,
-                               &growControl);
-  gvizEmbeddedGraphAddAction(eg, "demo.toggleAuto", actionToggleAuto,
-                             &autoStep);
-  gvizEmbeddedGraphAddAction(eg, "demo.gravityUp", actionGravityUp, NULL);
-  gvizEmbeddedGraphAddAction(eg, "demo.gravityDown", actionGravityDown, NULL);
-  gvizEmbeddedGraphAddAction(eg, "demo.edgeLengthUp", actionEdgeLengthUp, NULL);
-  gvizEmbeddedGraphAddAction(eg, "demo.edgeLengthDown", actionEdgeLengthDown,
-                             NULL);
-  gvizEmbeddedGraphAddAction(eg, "demo.thetaUp", actionThetaUp, NULL);
-  gvizEmbeddedGraphAddAction(eg, "demo.thetaDown", actionThetaDown, NULL);
-  gvizEmbeddedGraphAddAction(eg, "demo.toggleOverlapPrevention",
-                             actionToggleOverlapPrevention, NULL);
-  gvizEmbeddedGraphAddAction(eg, "demo.radiusBaseUp", actionRadiusBaseUp,
-                             &radiusControl);
-  gvizEmbeddedGraphAddAction(eg, "demo.radiusBaseDown", actionRadiusBaseDown,
-                             &radiusControl);
+    fe->AddAction("demo.growVertex", actionGrowVertex, &growControl);
+  fe->AddAction("demo.toggleAuto", actionToggleAuto, &autoStep);
+  fe->AddAction("demo.gravityUp", actionGravityUp, &cfg);
+  fe->AddAction("demo.gravityDown", actionGravityDown, &cfg);
+  fe->AddAction("demo.edgeLengthUp", actionEdgeLengthUp, &cfg);
+  fe->AddAction("demo.edgeLengthDown", actionEdgeLengthDown, &cfg);
+  fe->AddAction("demo.thetaUp", actionThetaUp, &cfg);
+  fe->AddAction("demo.thetaDown", actionThetaDown, &cfg);
+  fe->AddAction("demo.toggleOverlapPrevention", actionToggleOverlapPrevention, NULL);
+  fe->AddAction("demo.radiusBaseUp", actionRadiusBaseUp, &cfg);
+  fe->AddAction("demo.radiusBaseDown", actionRadiusBaseDown, &cfg);
 
   grRendererDesc desc;
   grRendererDescInit(&desc);
@@ -549,51 +589,35 @@ int main(int argc, char **argv) {
   grRenderer *r = grRendererCreate(&desc);
   if (!r) {
     fprintf(stderr, "renderer creation failed\n");
-    gvizForceEmbedderRelease(&fe);
-    gvizGraphFreeVertexDataStrings(&graph);
-    gvizGraphRelease(&graph);
     return 1;
   }
 
-  if (grRendererSetGraph(r, eg) < 0) {
+  if (grRendererSetGraph(r, *fe, &graph) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
-    gvizForceEmbedderRelease(&fe);
-    gvizGraphFreeVertexDataStrings(&graph);
-    gvizGraphRelease(&graph);
     return 1;
   }
 
   // Vertex string data (gexf attributes) is only present when -g/--graph
-  // loaded a .gexf file; entries are NULL otherwise, which the overlay
-  // simply skips. Freed alongside graph teardown below, once the renderer
-  // (the only reader of these pointers) is destroyed.
-  size_t vertexLabelCount = gvizEmbeddedGraphPositionCount(eg);
-  const char **vertexLabels =
-      malloc(sizeof(char *) * (vertexLabelCount ? vertexLabelCount : 1));
-  if (vertexLabels) {
-    for (size_t i = 0; i < vertexLabelCount; i++)
-      vertexLabels[i] = gvizGraphGetVertexData(&graph, i);
-    grRendererSetVertexLabels(r, vertexLabels, vertexLabelCount);
+  // loaded a .gexf file, in which case each non-null entry is a
+  // heap-allocated std::string* (see gviz::io::LoadFromGexfFile); entries
+  // are NULL otherwise, which the overlay simply skips. Freed alongside
+  // graph teardown below, once the renderer (the only reader of these
+  // pointers) is destroyed.
+  size_t vertexLabelCount = fe->PositionCount();
+  std::vector<const char *> vertexLabels(vertexLabelCount ? vertexLabelCount : 1);
+  for (size_t i = 0; i < vertexLabelCount; i++) {
+    void *data = graph.GetVertexData(i);
+    vertexLabels[i] = data ? static_cast<const std::string *>(data)->c_str() : NULL;
   }
+  grRendererSetVertexLabels(r, vertexLabels.data(), vertexLabelCount);
 
   /* Degree is fixed for the embedder's lifetime, but radiusBase can change
    * live via '['/']', so this buffer is kept around (not freed) and reused
    * by refreshNodeSizes on every such change instead of being a one-shot
    * upload. */
-  radiusControl.r = r;
-  radiusControl.radii =
-      malloc(sizeof(float) * gvizEmbeddedGraphPositionCount(eg));
-  if (!radiusControl.radii) {
-    fprintf(stderr, "radii allocation failed\n");
-    free(vertexLabels);
-    grRendererDestroy(r);
-    gvizForceEmbedderRelease(&fe);
-    gvizGraphFreeVertexDataStrings(&graph);
-    gvizGraphRelease(&graph);
-    return 1;
-  }
-  refreshNodeSizes(&fe, &radiusControl);
+  cfg.r = r;
+  refreshNodeSizes(*fe, cfg);
 
   /* --degree-alpha / --edge-weight-width need no uploads here: with the
    * desc flags set, the renderer derives degrees and per-edge weights from
@@ -621,7 +645,7 @@ int main(int argc, char **argv) {
   while (grRendererFrame(r)) {
     if (autoStep) {
       for (size_t i = 0; i < 10; i++)
-        gvizForceEmbedderStep(&fe);
+        fe->Step();
     }
 
     /* Deferred by actionGrowVertex: the renderer's per-vertex buffers only
@@ -629,14 +653,8 @@ int main(int argc, char **argv) {
      * the (raw-id-indexed) radius buffer can be resized and re-uploaded at
      * the matching count. */
     if (growControl.sizesDirty) {
-      float *grownRadii = realloc(
-          radiusControl.radii,
-          sizeof(float) * gvizEmbeddedGraphPositionCount(eg));
-      if (grownRadii) {
-        radiusControl.radii = grownRadii;
-        refreshNodeSizes(&fe, &radiusControl);
-        growControl.sizesDirty = false;
-      }
+      refreshNodeSizes(*fe, cfg);
+      growControl.sizesDirty = false;
     }
 
     /* Screenshot mode doubles as the dynamic pipeline's end-to-end check:
@@ -644,9 +662,9 @@ int main(int argc, char **argv) {
      * shows grown vertices that were placed, drawn, and simulated through
      * the mutate-then-commit path. */
     if (grow && screenshotPath) {
-      gvizForceEmbedderStep(&fe);
+      fe->Step();
       if (totalSteps % 30 == 29)
-        gvizEmbeddedGraphInvokeAction(eg, "demo.growVertex", NULL);
+        fe->InvokeAction("demo.growVertex");
     }
 
     if (screenshotPath) {
@@ -663,11 +681,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  free(radiusControl.radii);
   grRendererDestroy(r);
-  free(vertexLabels);
-  gvizForceEmbedderRelease(&fe);
-  gvizGraphFreeVertexDataStrings(&graph);
-  gvizGraphRelease(&graph);
+  gviz::io::FreeVertexDataStrings(graph);
   return 0;
 }
