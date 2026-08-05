@@ -60,11 +60,6 @@ void grCameraUnproject(const grCamera *cam, const grCameraFrame *frame,
 /** Frames an axis-aligned bounding box. */
 void grCameraFitBox(grCamera *cam, const double bmin[3], const double bmax[3],
                     double viewportWPx, double viewportHPx);
-/** Re-centers the camera on @p point (world space) without changing zoom
- *  (distance) or orbit angle -- unlike grCameraFitBox, which also reframes
- *  the zoom level to fit a box. Used by the console's "find" command to
- *  center a vertex on screen while leaving the user's current zoom alone. */
-void grCameraCenterOn(grCamera *cam, const double point[3]);
 
 // ------------------------------------------------------------------------------
 // Topology extraction (the only code that walks gviz structures)
@@ -198,6 +193,77 @@ void grVertexOverlayComputeLayout(struct grRenderer *r, double fbw,
  * the wrapped text is taller than the panel.
  */
 void grVertexOverlayBuild(struct grRenderer *r, double fbw, double fbh);
+
+// ------------------------------------------------------------------------------
+// Vertex list overlay (scrollable list of vertices, filtered by the active
+// highlight and by a fuzzy search over vertex DATA labels; see
+// grListOverlay.c)
+// ------------------------------------------------------------------------------
+
+/** Panel geometry for the vertex-list overlay, computed without emitting any
+ *  draw primitives or re-running the fuzzy filter -- mirrors
+ *  grVertexOverlayLayout's role of letting grRendererFrame's input handling
+ *  hit-test the panel (search bar vs. list body) and clamp scroll input
+ *  without duplicating layout math. maxScrollPx is derived from the *cached*
+ *  r->listFilteredIds count, so calling this every frame (as processInput
+ *  does, for hit-testing) never re-runs the filter itself. */
+typedef struct grListOverlayLayout {
+  bool visible;
+  double x0, y0, x1, y1;       /**< Panel bounds, framebuffer pixels. */
+  double searchY0, searchY1;   /**< Search-bar row, inside the panel. */
+  double contentY0, contentY1; /**< Vertical clip range for the scrollable
+                                     vertex list, below the search bar. */
+  double lineH;
+  double maxScrollPx; /**< 0 if all filtered rows fit without scrolling. */
+} grListOverlayLayout;
+
+/**
+ * Computes the vertex-list panel's bounds, without touching r->statsPrims or
+ * r->listFilteredIds. @p out->visible is false (all other fields zeroed) when
+ * the overlay is hidden, no graph is attached, or the framebuffer is too
+ * small to fit it.
+ */
+void grListOverlayComputeLayout(struct grRenderer *r, double fbw, double fbh,
+                                grListOverlayLayout *out);
+
+/**
+ * Appends the vertex-list panel (search bar + scrollable rows) to
+ * r->statsPrims, if visible. When r->listFilterDirty, first rebuilds
+ * r->listFilteredIds: the vertices of the active highlight (or, with no
+ * highlight active, every visible vertex in the current topology), further
+ * narrowed to those whose grRendererSetVertexLabels DATA string fuzzy-matches
+ * r->listSearchInput (vertices with a NULL label never match a non-empty
+ * query), ranked best-match-first when a query is active. Labels are read
+ * exactly as supplied -- this never touches gviz's graph loader directly, the
+ * same "supplied by the caller, indexed by parent-graph vertex id" contract
+ * as grVertexOverlayBuild.
+ */
+void grListOverlayBuild(struct grRenderer *r, double fbw, double fbh);
+
+/**
+ * Moves the list's selection cursor by @p delta (+1/-1) within
+ * r->listFilteredIds, wiring the newly selected row up exactly like clicking
+ * its vertex would for the vertex-info panel: sets r->pickedVertexId (and
+ * resets r->vertexOverlayScrollPx) so that vertex's grRendererSetVertexLabels
+ * DATA string shows there, without touching the current highlight or
+ * re-running the list's own filter. Scrolls the panel (r->listScrollPx) just
+ * enough to keep the newly selected row within view. No-op when the list is
+ * empty. @p fbw/@p fbh are needed to compute the panel's current layout for
+ * that scroll-into-view adjustment.
+ */
+void grListOverlaySelectDelta(struct grRenderer *r, double fbw, double fbh,
+                              int delta);
+
+/**
+ * Consumes this frame's queued input (r->pendingConsoleEvents) as vertex-list
+ * search-box text editing: printable characters append to
+ * r->listSearchInput, Backspace deletes, Enter defocuses (keeping the
+ * query), Escape clears the query and defocuses. Mutually exclusive with the
+ * console's own use of the same queue -- only called while
+ * r->listSearchFocused, which grRendererFrame's input handling never sets
+ * while the console is open.
+ */
+void grListSearchProcessInput(struct grRenderer *r);
 
 // ------------------------------------------------------------------------------
 // Command console (stateless command line, e.g. "find <id>"; see grConsole.c)
@@ -455,6 +521,16 @@ void grPlatformTextureMapMenuRefresh(struct grRenderer *r);
 // Renderer
 // ------------------------------------------------------------------------------
 
+/**
+ * Centers the camera on vertex @p vertexId and zooms in to comfortably frame
+ * a neighborhood around it, sized relative to the graph's current bounding
+ * box (see GR_FOCUS_EXTENT_FRACTION in grRenderer.c) via grCameraFitBox --
+ * shared by the C key (processInput in grRenderer.c) and grConsole.c's
+ * "find" command so both behave identically. No-op if @p vertexId is out of
+ * range or no vertex position data has been uploaded yet.
+ */
+void grRendererFocusVertex(struct grRenderer *r, size_t vertexId);
+
 typedef struct grKeyBinding {
   int key;
   const char *actionName;
@@ -564,6 +640,14 @@ struct grRenderer {
   size_t edgesBufCapacity; /**< In edges. */
   WGPUBindGroup bindGroup;
   bool bindGroupDirty;
+  /** hasNodeColors/hasEdgeColors track whether nodeColorsBuf/edgeColorsBuf
+   *  (the buffers actually bound for drawing, i.e. the shader flags in
+   *  writeGlobals) currently hold per-element colors -- this is the
+   *  *composited* result (client base layer with any active highlight
+   *  painted over it), not necessarily a verbatim copy of what the client
+   *  last uploaded. See hasClientNodeColors/hasClientEdgeColors below for
+   *  the persistent base layer, and applyColorLayers for how the two
+   *  combine. */
   bool hasNodeColors, hasNodeSizes, hasEdgeColors, hasNodeDegrees;
   bool hasEdgeWeights;
   uint32_t maxNodeDegree; /**< Max value last uploaded via SetNodeDegrees. */
@@ -577,11 +661,38 @@ struct grRenderer {
   float *nodeSizesStaging;
   size_t nodeSizesStagingCount;
 
+  /** CPU copy of the last grRendererSetNodeColors upload, indexed by
+   *  parent-graph vertex id -- the persistent "base layer" of client colors
+   *  that grRendererSetNodeColors's contract promises survive "until
+   *  replaced". Deliberately kept separate from nodeColorsBuf (the GPU
+   *  buffer actually bound for drawing): nodeColorsBuf holds this base layer
+   *  composited with the active highlight, if any, so that clearing or
+   *  changing the highlight can restore the base colors instead of falling
+   *  back to the global style. Preserved across capacity growth the same
+   *  way nodeSizesStaging is. NULL/0 whenever hasClientNodeColors is false.
+   */
+  uint32_t *nodeColorsStaging;
+  size_t nodeColorsStagingCount;
+  bool hasClientNodeColors;
+
+  /** Same idea as nodeColorsStaging, for grRendererSetEdgeColors. Indexed in
+   *  edge-buffer order like edgeColorsBuf; invalidated whenever the topology
+   *  changes (see uploadTopology) since that reorders/renumbers edges out
+   *  from under any previously-uploaded array, exactly like hasEdgeColors
+   *  today. */
+  uint32_t *edgeColorsStaging;
+  size_t edgeColorsStagingCount;
+  bool hasClientEdgeColors;
+
   // highlight styling (subgraph lives on the attached gvizEmbeddedGraph)
   bool highlightActive;
   uint32_t highlightNodeRgba;
   uint32_t highlightEdgeRgba;
-  bool highlightDirty;
+  /** True when nodeColorsBuf/edgeColorsBuf need to be recomputed from the
+   *  client base layer + active highlight by applyColorLayers: set on
+   *  highlight set/clear, client base-layer changes, and capacity/topology
+   *  changes. Checked and cleared once per frame. */
+  bool colorsDirty;
 
   // style
   grColor clearColor;
@@ -624,6 +735,44 @@ struct grRenderer {
                                       input handling, purely to hit-test the
                                       panel -- the text is short enough that
                                       re-wrapping it is not worth caching). */
+
+  // vertex list overlay (searchable "Vertex N" list, filtered by the active
+  // highlight and a fuzzy search over vertex labels; grListOverlay.c)
+  bool listVisible;
+  bool listSearchFocused;     /**< Search bar has keyboard focus: typed keys
+                                    edit listSearchInput instead of driving
+                                    camera nav / bound actions. */
+  char listSearchInput[128];
+  size_t listSearchInputLen;
+  double listScrollPx;        /**< Scroll offset into the filtered row list,
+                                    in pixels; reset to 0 whenever the filter
+                                    is rebuilt with a different result set. */
+  gvizArray listFilteredIds;  /**< of uint32_t; parent-graph vertex ids
+                                    currently shown, after the highlight
+                                    filter and fuzzy search, best match first.
+                                    Only rebuilt when listFilterDirty (see
+                                    grListOverlayBuild) -- unlike the vertex-
+                                    info panel's per-frame rewrap, this can be
+                                    O(vertex count) so it must not run every
+                                    frame just to hit-test the panel. */
+  size_t listSelectedIdx; /**< Index into listFilteredIds of the row selected
+                                via Up/Down (see grListOverlaySelectDelta), or
+                                SIZE_MAX for no selection. Reset to SIZE_MAX
+                                whenever the filter is rebuilt, since a stale
+                                index could point at an unrelated vertex once
+                                the result set changes. */
+  bool listFilterDirty; /**< Set on search text changes, highlight changes,
+                             topology/label changes, and the panel's first
+                             show; cleared once grListOverlayBuild has re-run
+                             the filter. Deliberately separate from
+                             listOverlayDirty below: scrolling must redraw
+                             the panel every tick without re-running an
+                             O(vertex count) filter each time. */
+  bool listOverlayDirty; /**< Forces the shared overlay-prims rebuild pass
+                              (see statsOverlayNeedsRebuild) to run, e.g. on
+                              scroll or visibility toggle -- does not by
+                              itself imply the filter needs re-running; see
+                              listFilterDirty for that. */
 
   // command console (stateless command line, e.g. "find <id>"; input handled
   // by grConsoleProcessInput, commands by grConsoleRun, drawing by

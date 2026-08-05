@@ -214,11 +214,6 @@ void grCameraUnproject(const grCamera *cam, const grCameraFrame *frame,
   *worldY = frame->eye[1] + dir[1] * t;
 }
 
-void grCameraCenterOn(grCamera *cam, const double point[3]) {
-  for (int i = 0; i < 3; i++)
-    cam->target[i] = point[i];
-}
-
 void grCameraFitBox(grCamera *cam, const double bmin[3], const double bmax[3],
                     double viewportWPx, double viewportHPx) {
   double aspect = viewportWPx / (viewportHPx > 0 ? viewportHPx : 1.0);

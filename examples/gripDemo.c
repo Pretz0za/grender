@@ -105,6 +105,14 @@ static void actionToggleAuto(gvizEmbeddedGraph *eg, void *userData,
   printf("auto refine: %s\n", *autoRefine ? "on" : "off");
 }
 
+// Smoke test for GR_ACTION_VERTEX_CLICKED: no grRendererBind* call needed --
+// registering the handler is enough for it to start firing on vertex clicks.
+static void actionVertexClicked(gvizEmbeddedGraph *eg, void *userData,
+                                const gvizActionPayload *payload) {
+  (void)eg, (void)userData;
+  printf("vertex clicked: %lld\n", (long long)payload->iarg);
+}
+
 static int parseGraphType(const char *arg, DemoGraphType *out) {
   if (!arg || strcasecmp(arg, "mobius") == 0) {
     *out = DEMO_GRAPH_MOBIUS;
@@ -470,6 +478,8 @@ int main(int argc, char **argv) {
   bool autoRefine = true;
   gvizEmbeddedGraphAddAction(eg, "demo.toggleAuto", actionToggleAuto,
                              &autoRefine);
+  gvizEmbeddedGraphAddAction(eg, GR_ACTION_VERTEX_CLICKED, actionVertexClicked,
+                             NULL);
 
   grRendererDesc desc;
   grRendererDescInit(&desc);

@@ -87,6 +87,7 @@ add_library(grender STATIC
     src/grTopology.c
     src/grStats.c
     src/grVertexOverlay.c
+    src/grListOverlay.c
     src/grConsole.c
     src/grPCA.c
     src/grObjMesh.c

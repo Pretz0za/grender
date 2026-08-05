@@ -14,9 +14,22 @@
  * live with 'O' once the layout has roughly settled, mirroring Gephi's
  * "Prevent Overlap" checkbox.
  *
+ * With -G/--grow the graph is dynamic: the embedder is built over a
+ * whole-graph vertex-induced view (no up-front edge-bitset layout), and 'A'
+ * adds a vertex wired to one or two random existing vertices directly on
+ * the gvizGraph, committed with gvizForceEmbedderSync -- the new vertex
+ * appears already placed near its neighbors, visible and simulated in the
+ * same frame (gviz's commit model: nothing downstream of the graph sees a
+ * mutation until Sync). Everything else works as in static mode:
+ * click-highlighting (the renderer refreshes the pick layout on demand),
+ * per-vertex sizes (preserved by the renderer across growth), and
+ * --degree-alpha/--edge-weight-width (derived by the renderer from the
+ * structure on every commit).
+ *
  * Controls:
  *   R      - run one relaxation step
  *   space  - toggle continuous stepping
+ *   A      - add a vertex and commit it (with -G/--grow)
  *   h/l    - decrease/increase ideal edge length
  *   j/k    - decrease/increase gravity k
  *   N/M    - decrease/increase Barnes-Hut theta
@@ -38,6 +51,9 @@
  *   -d, --directed                interpret the -g/--graph file's edges as
  *                                 directed (default: undirected; ignored
  *                                 without -g/--graph)
+ *   -G, --grow                    dynamic mode: vertex-induced embedding, 'A'
+ *                                 grows the graph live (screenshot mode grows
+ *                                 automatically while stepping)
  *   -m, --model {linlog|fr}       force model (default linlog)
  *   -o, --screenshot PATH         save a .ppm screenshot after settling and exit
  *       --degree-alpha            fade edges by max endpoint degree (default off)
@@ -196,6 +212,50 @@ static void actionToggleOverlapPrevention(gvizEmbeddedGraph *eg, void *userData,
   printf("prevent overlap: %s\n", state->preventOverlap ? "on" : "off");
 }
 
+/* Everything actionGrowVertex needs: the mutable parent graph (mutated
+ * directly, per gviz's commit model), an RNG stream of its own, and a flag
+ * for the main loop to refresh node sizes AFTER the renderer has grown its
+ * per-vertex buffers -- grRendererSetNodeSizes requires count to match the
+ * renderer's position capacity, which only catches up on the frame
+ * following the commit. */
+typedef struct GrowControl {
+  gvizGraph *graph;
+  unsigned int rng;
+  bool sizesDirty;
+} GrowControl;
+
+/* Adds one vertex wired to one or two random existing vertices directly on
+ * the gvizGraph, then commits with gvizForceEmbedderSync: the vertex
+ * becomes visible and simulated together, already placed near its
+ * neighbors. Wiring the edges BEFORE the Sync is what makes that placement
+ * possible (see gvizForceEmbedderSync's contract). */
+static void actionGrowVertex(gvizEmbeddedGraph *eg, void *userData,
+                             const gvizActionPayload *payload) {
+  (void)payload;
+  GrowControl *grow = userData;
+  gvizForceEmbedderState *state = (gvizForceEmbedderState *)eg;
+
+  size_t before = gvizGraphSize(grow->graph);
+  if (before == 0 || gvizGraphAddVertex(grow->graph, NULL, NULL, NULL) < 0)
+    return;
+  size_t newId = before;
+  size_t target = (size_t)rand_r(&grow->rng) % before;
+  gvizGraphAddEdge(grow->graph, newId, target, 1.0);
+  if (before > 1 && rand_r(&grow->rng) % 2 == 0) {
+    size_t second = (size_t)rand_r(&grow->rng) % before;
+    if (second != target)
+      gvizGraphAddEdge(grow->graph, newId, second, 1.0);
+  }
+
+  if (gvizForceEmbedderSync(state, (unsigned int)rand_r(&grow->rng) | 1u) < 0) {
+    fprintf(stderr, "sync failed; vertex %zu joins on a later sync\n", newId);
+    return;
+  }
+  grow->sizesDirty = true;
+  printf("added vertex %zu (%zu vertices)\n", newId,
+         gvizGraphSize(grow->graph));
+}
+
 static int parseModel(const char *arg, gvizForceModelKind *out) {
   if (!arg || strcasecmp(arg, "linlog") == 0) {
     *out = GVIZ_FORCE_MODEL_LINLOG;
@@ -261,6 +321,8 @@ static void printUsage(const char *prog) {
       "  -d, --directed              interpret the -g/--graph file's edges as\n"
       "                              directed (default: undirected; ignored\n"
       "                              without -g/--graph)\n"
+      "  -G, --grow                  dynamic mode: 'A' adds a vertex live,\n"
+      "                              committed via gvizForceEmbedderSync\n"
       "  -m, --model {linlog|fr}     force model (default linlog)\n"
       "  -o, --screenshot PATH       save a .ppm screenshot after settling and exit\n"
       "      --degree-alpha          fade edges by max endpoint degree (default off)\n"
@@ -275,6 +337,7 @@ static void printUsage(const char *prog) {
       "Controls:\n"
       "  R      - run one relaxation step\n"
       "  space  - toggle continuous stepping\n"
+      "  A      - add a vertex and commit it (with -G/--grow)\n"
       "  h/l    - decrease/increase ideal edge length\n"
       "  j/k    - decrease/increase gravity k\n"
       "  N/M    - decrease/increase Barnes-Hut theta\n"
@@ -300,6 +363,7 @@ static const struct option kLongOptions[] = {
     {"edge-connectivity", required_argument, NULL, 'e'},
     {"graph", required_argument, NULL, 'g'},
     {"directed", no_argument, NULL, 'd'},
+    {"grow", no_argument, NULL, 'G'},
     {"model", required_argument, NULL, 'm'},
     {"screenshot", required_argument, NULL, 'o'},
     {"degree-alpha", no_argument, NULL, OPT_DEGREE_ALPHA},
@@ -317,6 +381,7 @@ int main(int argc, char **argv) {
   double edgeConnectivity = 0.0;
   const char *graphName = NULL;
   bool directed = false;
+  bool grow = false;
   gvizForceModelKind model = GVIZ_FORCE_MODEL_LINLOG;
   const char *screenshotPath = NULL;
   bool degreeAlpha = false;
@@ -324,7 +389,7 @@ int main(int argc, char **argv) {
   bool edgeWeightWidth = false;
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "n:s:e:g:dm:o:w:h", kLongOptions,
+  while ((opt = getopt_long(argc, argv, "n:s:e:g:dGm:o:w:h", kLongOptions,
                             NULL)) != -1) {
     switch (opt) {
     case 'n':
@@ -341,6 +406,9 @@ int main(int argc, char **argv) {
       break;
     case 'd':
       directed = true;
+      break;
+    case 'G':
+      grow = true;
       break;
     case 'm':
       if (parseModel(optarg, &model) < 0) {
@@ -388,7 +456,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "--directed requires -g/--graph\n");
     return 1;
   }
-
   gvizGraph graph;
   if (graphName) {
     if (loadNamedGraph(graphName, directed, &graph) < 0)
@@ -396,11 +463,28 @@ int main(int argc, char **argv) {
   } else {
     graph = build_random_connected_graph(N, edgeConnectivity, seed);
   }
-  gvizGraphBuildLayout(&graph);
-  if (graphName)
-    printf("loaded %zu vertices, %zu edges\n", gvizGraphSize(&graph),
-           gvizGraphEdgeCount(&graph));
-  gvizSubgraph sg = gvizSubgraphCreateFull(&graph);
+
+  gvizSubgraph sg;
+  if (grow) {
+    /* Dynamic mode: whole-graph vertex-induced view. No edge-bitset layout
+     * is built up front, so each growth commit is amortized O(1) capacity
+     * work plus the embedding's CSR rebuild (see gvizEmbeddedGraph.h's
+     * GROWTH & SYNC section). Click-picking still works: the renderer
+     * refreshes the layout on demand (gvizGraphEnsureLayout) when a click
+     * needs a pick subgraph. */
+    gvizVertexSubset vs = gvizVertexSubsetCreateEmpty(&graph);
+    sg = gvizSubgraphCreateVertexInduced(&graph, vs);
+    for (size_t i = 0; i < gvizGraphSize(&graph); i++)
+      gvizSubgraphShowVertex(&sg, i);
+    if (graphName)
+      printf("loaded %zu vertices\n", gvizGraphSize(&graph));
+  } else {
+    gvizGraphBuildLayout(&graph);
+    if (graphName)
+      printf("loaded %zu vertices, %zu edges\n", gvizGraphSize(&graph),
+             gvizGraphEdgeCount(&graph));
+    sg = gvizSubgraphCreateFull(&graph);
+  }
 
   gvizForceEmbedderState fe = {0};
   if (gvizForceEmbedderInit(&fe, sg, 2, model) < 0) {
@@ -417,6 +501,10 @@ int main(int argc, char **argv) {
   gvizEmbeddedGraph *eg = (gvizEmbeddedGraph *)&fe;
   bool autoStep = false;
   RadiusControl radiusControl = {0};
+  GrowControl growControl = {&graph, seed ^ 0x9e3779b9u, false};
+  if (grow)
+    gvizEmbeddedGraphAddAction(eg, "demo.growVertex", actionGrowVertex,
+                               &growControl);
   gvizEmbeddedGraphAddAction(eg, "demo.toggleAuto", actionToggleAuto,
                              &autoStep);
   gvizEmbeddedGraphAddAction(eg, "demo.gravityUp", actionGravityUp, NULL);
@@ -494,7 +582,8 @@ int main(int argc, char **argv) {
    * by refreshNodeSizes on every such change instead of being a one-shot
    * upload. */
   radiusControl.r = r;
-  radiusControl.radii = malloc(sizeof(float) * fe.vertexCount);
+  radiusControl.radii =
+      malloc(sizeof(float) * gvizEmbeddedGraphPositionCount(eg));
   if (!radiusControl.radii) {
     fprintf(stderr, "radii allocation failed\n");
     free(vertexLabels);
@@ -506,74 +595,10 @@ int main(int argc, char **argv) {
   }
   refreshNodeSizes(&fe, &radiusControl);
 
-  if (degreeAlpha) {
-    /* Compact fe.degree[i] -> parent-id indexed buffer for the edge shader. */
-    uint32_t *degrees = calloc(fe.vertexCount, sizeof(uint32_t));
-    if (!degrees) {
-      fprintf(stderr, "degrees allocation failed\n");
-      free(radiusControl.radii);
-      free(vertexLabels);
-      grRendererDestroy(r);
-      gvizForceEmbedderRelease(&fe);
-      gvizGraphFreeVertexDataStrings(&graph);
-      gvizGraphRelease(&graph);
-      return 1;
-    }
-    for (size_t i = 0; i < fe.vertexCount; i++)
-      degrees[fe.vertices[i]] = (uint32_t)fe.degree[i];
-    if (grRendererSetNodeDegrees(r, degrees, fe.vertexCount) < 0) {
-      fprintf(stderr, "node degrees upload failed\n");
-      free(degrees);
-      free(radiusControl.radii);
-      free(vertexLabels);
-      grRendererDestroy(r);
-      gvizForceEmbedderRelease(&fe);
-      gvizGraphFreeVertexDataStrings(&graph);
-      gvizGraphRelease(&graph);
-      return 1;
-    }
-    free(degrees);
-  }
-
-  if (edgeWeightWidth) {
-    /* Edge-buffer order: (u, v) pairs as produced by grRendererGetEdges,
-     * with weights looked up on the underlying gvizGraph. */
-    size_t edgeCount = grRendererEdgeCount(r);
-    uint32_t *edges = calloc(edgeCount ? edgeCount : 1, 2 * sizeof(uint32_t));
-    float *weights = calloc(edgeCount ? edgeCount : 1, sizeof(float));
-    if (!edges || !weights) {
-      fprintf(stderr, "edge weights allocation failed\n");
-      free(edges);
-      free(weights);
-      free(radiusControl.radii);
-      free(vertexLabels);
-      grRendererDestroy(r);
-      gvizForceEmbedderRelease(&fe);
-      gvizGraphFreeVertexDataStrings(&graph);
-      gvizGraphRelease(&graph);
-      return 1;
-    }
-    grRendererGetEdges(r, edges);
-    for (size_t i = 0; i < edgeCount; i++) {
-      double w = 1.0;
-      gvizGraphGetEdgeWeight(&graph, edges[2 * i], edges[2 * i + 1], &w);
-      weights[i] = (float)w;
-    }
-    if (grRendererSetEdgeWeights(r, weights, edgeCount) < 0) {
-      fprintf(stderr, "edge weights upload failed\n");
-      free(edges);
-      free(weights);
-      free(radiusControl.radii);
-      free(vertexLabels);
-      grRendererDestroy(r);
-      gvizForceEmbedderRelease(&fe);
-      gvizGraphFreeVertexDataStrings(&graph);
-      gvizGraphRelease(&graph);
-      return 1;
-    }
-    free(edges);
-    free(weights);
-  }
+  /* --degree-alpha / --edge-weight-width need no uploads here: with the
+   * desc flags set, the renderer derives degrees and per-edge weights from
+   * the graph itself on every structural change, so they stay correct as
+   * the graph grows. */
 
   grRendererBindKey(r, 'R', "forceEmbedder.step");
   grRendererBindKey(r, GR_KEY_SPACE, "demo.toggleAuto");
@@ -586,6 +611,8 @@ int main(int argc, char **argv) {
   grRendererBindKey(r, 'O', "demo.toggleOverlapPrevention");
   grRendererBindKey(r, ']', "demo.radiusBaseUp");
   grRendererBindKey(r, '[', "demo.radiusBaseDown");
+  if (grow)
+    grRendererBindKey(r, 'A', "demo.growVertex");
   grRendererFitView(r);
 
   const size_t stepsBeforeShot = screenshotPath ? 300 : SIZE_MAX;
@@ -595,6 +622,31 @@ int main(int argc, char **argv) {
     if (autoStep) {
       for (size_t i = 0; i < 10; i++)
         gvizForceEmbedderStep(&fe);
+    }
+
+    /* Deferred by actionGrowVertex: the renderer's per-vertex buffers only
+     * grew during the grRendererFrame call above, so this is the earliest
+     * the (raw-id-indexed) radius buffer can be resized and re-uploaded at
+     * the matching count. */
+    if (growControl.sizesDirty) {
+      float *grownRadii = realloc(
+          radiusControl.radii,
+          sizeof(float) * gvizEmbeddedGraphPositionCount(eg));
+      if (grownRadii) {
+        radiusControl.radii = grownRadii;
+        refreshNodeSizes(&fe, &radiusControl);
+        growControl.sizesDirty = false;
+      }
+    }
+
+    /* Screenshot mode doubles as the dynamic pipeline's end-to-end check:
+     * keep stepping and grow a vertex every 30 frames, so the saved frame
+     * shows grown vertices that were placed, drawn, and simulated through
+     * the mutate-then-commit path. */
+    if (grow && screenshotPath) {
+      gvizForceEmbedderStep(&fe);
+      if (totalSteps % 30 == 29)
+        gvizEmbeddedGraphInvokeAction(eg, "demo.growVertex", NULL);
     }
 
     if (screenshotPath) {

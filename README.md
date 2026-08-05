@@ -207,6 +207,9 @@ src/grRenderer.c            device setup, frame loop, input, GPU buffers
 src/grCamera.c              2D ortho + 3D orbit camera, picking math
 src/grTopology.c            the only code that reads gviz structure
 src/grStats.c               stats overlay: chart layout, text, primitive list
+src/grVertexOverlay.c       vertex-info overlay: label word-wrap, scroll panel
+src/grListOverlay.c         vertex list overlay: fuzzy search over vertex data
+src/grConsole.c             command console: input line, built-in commands
 src/grPCA.c                 4D -> 3D PCA projection (OpenBLAS)
 src/grObjMesh.c             .obj mesh parsing for the object overlay
 src/grObjOverlay.c          object overlay: own pipelines, camera, render pass

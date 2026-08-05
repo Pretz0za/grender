@@ -16,6 +16,7 @@
 
 #include "grInternal.h"
 
+#include "ds/gvizGraph.h"
 #include "ds/gvizSubgraph.h"
 
 #include <stdarg.h>
@@ -60,8 +61,8 @@ static void consoleFail(grConsoleResult *out, const char *fmt, ...) {
 /**
  * "find <id>": clears any active highlight, highlights vertex <id> alone
  * (no neighbors/edges -- unlike click-to-pick, this is a plain locate, not an
- * inspect-neighborhood action), and centers the camera on it without
- * changing zoom.
+ * inspect-neighborhood action), and focuses the camera on it (see
+ * grRendererFocusVertex) -- the same center-and-zoom behavior as the C key.
  */
 static void cmdFind(grRenderer *r, int argc, char **argv,
                     grConsoleResult *out) {
@@ -90,8 +91,8 @@ static void cmdFind(grRenderer *r, int argc, char **argv,
   }
   // r->posStaging holds exactly what's currently drawn for this vertex --
   // float, and already PCA-projected to 3D for a 4D embedding (see
-  // uploadPositions) -- so reading it here to center the camera stays
-  // correct for 2D/3D/4D alike without redoing that projection.
+  // uploadPositions) -- so grRendererFocusVertex reading it to frame the
+  // camera stays correct for 2D/3D/4D alike without redoing that projection.
   if (!r->posStaging || (size_t)id >= r->posCapacity) {
     consoleFail(out, "vertex %ld not renderable yet", id);
     return;
@@ -100,6 +101,12 @@ static void cmdFind(grRenderer *r, int argc, char **argv,
   grRendererClearHighlight(r);
 
   const gvizSubgraph *structure = gvizEmbeddedGraphStructure(r->graph);
+  /* See grHighlightCopySubgraph: refresh the shared layout on demand so the
+   * full-subgraph pick works on graphs that grew since the last use. */
+  if (gvizGraphEnsureLayout((gvizGraph *)structure->g) < 0) {
+    consoleFail(out, "internal error selecting vertex %ld", id);
+    return;
+  }
   gvizSubgraph pick = gvizSubgraphCreateEmpty(structure->g);
   if (!pick.g) {
     consoleFail(out, "internal error selecting vertex %ld", id);
@@ -110,10 +117,7 @@ static void cmdFind(grRenderer *r, int argc, char **argv,
   grRendererSetHighlight(r, &pick, GR_RGBA8(255, 210, 80, 255), 0);
   gvizSubgraphRelease(&pick);
 
-  double point[3] = {0.0, 0.0, 0.0};
-  for (size_t d = 0; d < r->posDim && d < 3; d++)
-    point[d] = (double)r->posStaging[(size_t)id * r->posDim + d];
-  grCameraCenterOn(&r->camera, point);
+  grRendererFocusVertex(r, (size_t)id);
 
   out->ok = true;
   snprintf(out->message, sizeof(out->message), "found vertex %ld", id);

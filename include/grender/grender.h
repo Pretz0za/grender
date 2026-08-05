@@ -87,20 +87,27 @@ typedef struct grRendererDesc {
   grEdgeStyle edgeStyle;
   bool vsync;          /**< true: FIFO present (default), false: immediate. */
   /**
-   * When true (and node degrees have been uploaded via
-   * grRendererSetNodeDegrees), the edge shader scales each edge's alpha by
-   * the higher degree of its endpoints so hub edges fade. Per-edge colors
-   * (including highlights) are unaffected and keep their uploaded alpha.
-   * Off by default; can also be toggled with grRendererSetEdgeDegreeAlpha.
+   * When true, the edge shader scales each edge's alpha by the higher
+   * degree of its endpoints so hub edges fade. The renderer derives and
+   * re-uploads the per-vertex degrees itself on every structural change
+   * (from the embedding's synced adjacency), so this stays correct as a
+   * dynamic graph grows -- no grRendererSetNodeDegrees calls needed (that
+   * API remains for custom values, but the automatic refresh overwrites
+   * them on the next structural change). Per-edge colors (including
+   * highlights) are unaffected and keep their uploaded alpha. Off by
+   * default; can also be toggled with grRendererSetEdgeDegreeAlpha.
    */
   bool edgeDegreeAlpha;
   /**
-   * When true (and weights have been uploaded via grRendererSetEdgeWeights),
-   * the edge shader scales each edge's drawn width by its weight relative to
-   * the mean of all uploaded weights, so e.g. an edge weighing twice the mean
-   * is drawn twice as thick -- edgeStyle.width is the base thickness an
-   * average-weight edge is drawn at. Off by default; can also be toggled
-   * with grRendererSetEdgeWeightWidth.
+   * When true, the edge shader scales each edge's drawn width by its
+   * gvizGraph edge weight relative to the mean weight, so e.g. an edge
+   * weighing twice the mean is drawn twice as thick -- edgeStyle.width is
+   * the base thickness an average-weight edge is drawn at. The renderer
+   * derives and re-uploads the weights itself on every structural change,
+   * in the edge buffer's exact order, so this stays correct as a dynamic
+   * graph grows -- no grRendererSetEdgeWeights calls needed (same
+   * custom-value caveat as edgeDegreeAlpha). Off by default; can also be
+   * toggled with grRendererSetEdgeWeightWidth.
    */
   bool edgeWeightWidth;
 } grRendererDesc;
@@ -174,8 +181,17 @@ bool grRendererEdgeWeightWidth(const grRenderer *r);
 /**
  * Uploads per-node fill colors (GR_RGBA8 packed), indexed by parent-graph
  * vertex id; @p count must equal gvizEmbeddedGraphPositionCount(). Pass NULL
- * to revert to the global style. The data is copied to the GPU; the caller
- * keeps ownership.
+ * to revert to the global style. The data is copied; the caller keeps
+ * ownership.
+ *
+ * This is a persistent base layer: it survives until replaced by another
+ * call (or cleared by passing NULL) and is NOT affected by
+ * grRendererSetHighlight / grRendererClearHighlight. A highlight, while
+ * active, is painted over these colors -- vertices in the highlight show the
+ * highlight color, vertices outside it keep showing whatever was set here
+ * (or the global style, for vertices this was never called with non-NULL
+ * data for). Clearing the highlight simply removes that overlay and these
+ * colors reappear unchanged.
  *
  * @return 0 on success, -1 on failure.
  */
@@ -215,6 +231,14 @@ int grRendererSetVertexLabels(grRenderer *r, const char *const *labels,
  * by iterating subgraph vertices in increasing id and their neighbor
  * iterators (undirected edges appear once, with u < v). Use
  * grRendererEdgeCount / grRendererGetEdges to inspect that order.
+ *
+ * Like grRendererSetNodeColors, this is a persistent base layer that a
+ * highlight paints over rather than replaces (see grRendererSetHighlight);
+ * clearing the highlight restores it. Because the indexing is
+ * edge-buffer-order rather than a stable id, any structural change to the
+ * graph invalidates it -- the renderer drops it automatically (as if NULL
+ * had been passed) whenever the edge order changes, and it must be
+ * re-uploaded afterward.
  */
 int grRendererSetEdgeColors(grRenderer *r, const uint32_t *rgba8, size_t count);
 
@@ -332,6 +356,29 @@ int grRendererBindMouse(grRenderer *r, int button, const char *actionName);
 /** Removes the binding for @p button, if any. */
 void grRendererUnbindMouse(grRenderer *r, int button);
 
+/**
+ * Action name invoked whenever a click (press and release without a drag,
+ * on any mouse button) lands on a vertex's drawn circle -- the same hit test
+ * GR_ACTION_PICK_VERTEX uses, so a click only counts as landing "on" a
+ * vertex when it falls within the circle the user actually sees. Unlike
+ * GR_ACTION_PICK_VERTEX (the renderer's own default for an *unbound* left
+ * button), this fires unconditionally whenever a handler is registered for
+ * it, independent of and in addition to whatever action is separately bound
+ * to that button with grRendererBindMouse.
+ *
+ * There is nothing to bind: register a handler the same way as any other
+ * action (gvizEmbeddedGraphAddAction) and it starts firing on the next hit.
+ * The payload is filled like grRendererBindKey, except @p iarg carries the
+ * clicked vertex's parent-graph id (not modifier bits -- gvizActionPayload's
+ * fields are contextual per trigger, see its doc comment):
+ *   worldX/worldY - cursor position unprojected into embedding coordinates,
+ *   deltaTime     - seconds since the previous frame,
+ *   iarg          - the clicked vertex's parent-graph id,
+ *   darg          - 0.
+ * A click that misses every vertex does not invoke it.
+ */
+#define GR_ACTION_VERTEX_CLICKED "grender.vertexClicked"
+
 // HIGHLIGHTS: ---------------------------------------------------------------
 
 /**
@@ -340,6 +387,13 @@ void grRendererUnbindMouse(grRenderer *r, int button);
  * global node/edge styles every frame. Pass 0 for @p nodeRgba or @p edgeRgba
  * to keep the global style for that element class. The subgraph is copied;
  * @p highlight may be released by the caller afterward.
+ *
+ * This paints over, rather than replaces, any base colors set via
+ * grRendererSetNodeColors / grRendererSetEdgeColors: elements in @p
+ * highlight show the highlight color, and everything else keeps showing its
+ * base color (or the global style, if none was set). Those base colors are
+ * unaffected by this call and reappear as-is once the highlight is cleared
+ * or replaced.
  *
  * @return 0 on success, -1 on failure.
  */
@@ -355,7 +409,12 @@ int grRendererSetHighlightCycle(grRenderer *r, const size_t *vertices,
                                 size_t count, uint32_t nodeRgba,
                                 uint32_t edgeRgba);
 
-/** Clears the stored highlight and reverts to global node/edge styles. */
+/**
+ * Clears the stored highlight. Elements revert to whatever base colors were
+ * set via grRendererSetNodeColors / grRendererSetEdgeColors (unaffected by
+ * this call), or the global node/edge styles for elements with no base
+ * color set.
+ */
 void grRendererClearHighlight(grRenderer *r);
 
 // FRAME LOOP: -------------------------------------------------------------
@@ -426,7 +485,10 @@ void grRendererShowStatSeries(grRenderer *r, size_t idx, bool show);
 // without running anything. Built-in commands:
 //
 //   find <id>   Clears the current highlight, highlights vertex <id> alone,
-//               and centers the camera on it (zoom/orbit angle unchanged).
+//               and focuses the camera on it -- centers it and zooms in to
+//               comfortably frame it, the same as the C key does for the
+//               vertex-list overlay's current selection (see VERTEX LIST
+//               OVERLAY below).
 //
 // New commands are added in grConsole.c's command table, independent of the
 // rest of the renderer.
@@ -445,6 +507,44 @@ void grRendererShowConsole(grRenderer *r, bool show);
 
 /** Returns whether the console is currently open. */
 bool grRendererConsoleShown(const grRenderer *r);
+
+// VERTEX LIST OVERLAY: -------------------------------------------------------
+//
+// A scrollable panel listing vertices as "Vertex N" (N is the parent-graph
+// vertex id), with a search bar across the top. With no highlight active
+// (see HIGHLIGHTS above), the list holds every currently-visible vertex;
+// while a highlight is active, it holds only the highlighted vertices --
+// e.g. clicking a vertex via GR_ACTION_PICK_VERTEX narrows the list to that
+// vertex and its neighbors. Typing in the search bar further narrows
+// whatever is currently listed to vertices whose grRendererSetVertexLabels
+// DATA string fuzzy-matches the query (a vertex with no label, or no labels
+// set at all, never matches a non-empty query); matches are ranked
+// best-match-first. Visible by default; toggled by the L key unless the app
+// bound L itself, same as the S (stats) and I (texture image) toggles.
+//
+// Click the search bar to give it keyboard focus (typed keys edit the query
+// instead of driving camera navigation or bound actions); Enter or clicking
+// elsewhere blurs it keeping the query, Escape while focused clears the
+// query and blurs. Clicks anywhere else in the panel are consumed by it and
+// never reach the graph, so interacting with the list never also picks a
+// vertex or clears the current highlight.
+//
+// The Up/Down arrow keys move a selection cursor through the list (works
+// even while the search box has focus, unless the app has bound those keys
+// itself); the selected row is highlighted and its vertex becomes the
+// picked vertex -- the same grRendererSetVertexLabels DATA string shown by
+// clicking a vertex (see GR_ACTION_PICK_VERTEX) appears in the vertex-info
+// panel, without changing the current highlight or the list's own contents.
+// The C key centers the camera on the selected row's vertex and zooms in to
+// comfortably frame it, unless the app has bound C itself -- the same
+// center-and-zoom behavior as the console's "find <id>" command (see
+// COMMAND CONSOLE above); a no-op if nothing is currently selected.
+
+/** Shows or hides the vertex-list overlay. Visible by default. */
+void grRendererShowVertexList(grRenderer *r, bool show);
+
+/** Returns whether the vertex-list overlay is currently shown. */
+bool grRendererVertexListShown(const grRenderer *r);
 
 // OBJECT OVERLAY: -----------------------------------------------------------
 //

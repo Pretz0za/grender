@@ -350,8 +350,11 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   r->edgeWeightWidth = descIn->edgeWeightWidth;
   r->statsVisible = true;
   r->pickedVertexId = -1;
+  r->listVisible = true;
+  r->listSelectedIdx = SIZE_MAX;
   gvizArrayInit(&r->statsPrims, sizeof(grStatsPrim));
   gvizArrayInit(&r->vertexOverlayLines, sizeof(grVertexOverlayLine));
+  gvizArrayInit(&r->listFilteredIds, sizeof(uint32_t));
   gvizArrayInit(&r->statsSeriesRevisions, sizeof(uint64_t));
   gvizArrayInit(&r->bindings, sizeof(grKeyBinding));
   gvizArrayInit(&r->mouseBindings, sizeof(grMouseBinding));
@@ -533,8 +536,11 @@ void grRendererDestroy(grRenderer *r) {
   grTopologyRelease(&r->topo);
   free(r->posStaging);
   free(r->nodeSizesStaging);
+  free(r->nodeColorsStaging);
+  free(r->edgeColorsStaging);
   gvizArrayRelease(&r->statsPrims);
   gvizArrayRelease(&r->vertexOverlayLines);
+  gvizArrayRelease(&r->listFilteredIds);
   gvizArrayRelease(&r->statsSeriesRevisions);
   free(r->statsSeriesVisible);
   gvizArrayRelease(&r->bindings);
@@ -635,9 +641,26 @@ bool grRendererConsoleShown(const grRenderer *r) {
   return r && r->consoleOpen;
 }
 
+void grRendererShowVertexList(grRenderer *r, bool show) {
+  if (!r || r->listVisible == show)
+    return;
+  r->listVisible = show;
+  r->listOverlayDirty = true;
+  if (!show)
+    r->listSearchFocused = false;
+}
+
+bool grRendererVertexListShown(const grRenderer *r) {
+  return r && r->listVisible;
+}
+
 // ------------------------------------------------------------------------------
 // Graph attachment and GPU buffer management
 // ------------------------------------------------------------------------------
+
+static int uploadAttribute(grRenderer *r, WGPUBuffer *buf, const void *data,
+                           size_t bytes, bool *flag, const char *label);
+static uint32_t colorToRgba8(const grColor *c);
 
 /** (Re)creates position-indexed buffers when the vertex capacity changes. */
 static int ensurePositionBuffers(grRenderer *r) {
@@ -668,11 +691,54 @@ static int ensurePositionBuffers(grRenderer *r) {
   r->posDim = renderDim;
   r->bindGroupDirty = true;
 
-  // Per-vertex attributes are indexed the same way; stale ones are dropped.
-  if (r->hasNodeColors || r->hasNodeSizes) {
-    r->hasNodeColors = false;
+  // Per-vertex attributes are indexed the same way. Node sizes are
+  // preserved across capacity growth from their CPU staging copy -- new
+  // slots default to the global style radius until the client re-uploads
+  // real values -- so a growth commit never blanks every vertex's size for
+  // a frame. Client base node colors get the same treatment below.
+  if (r->hasNodeSizes && r->nodeSizesStaging) {
+    float *grown = realloc(r->nodeSizesStaging, sizeof(float) * count);
+    if (grown) {
+      for (size_t i = r->nodeSizesStagingCount; i < count; i++)
+        grown[i] = r->nodeStyle.radius;
+      r->nodeSizesStaging = grown;
+      r->nodeSizesStagingCount = count;
+      if (uploadAttribute(r, &r->nodeSizesBuf, grown, sizeof(float) * count,
+                          &r->hasNodeSizes, "grender node sizes") < 0)
+        r->hasNodeSizes = false;
+    } else {
+      free(r->nodeSizesStaging);
+      r->nodeSizesStaging = NULL;
+      r->nodeSizesStagingCount = 0;
+      r->hasNodeSizes = false;
+    }
+  } else {
     r->hasNodeSizes = false;
   }
+  // Client base node colors are preserved across capacity growth from their
+  // CPU staging copy, exactly like nodeSizesStaging above -- new slots
+  // default to the global fill style until the client re-uploads real
+  // values. The composited GPU buffer bound for drawing is rebuilt by
+  // applyColorLayers (colorsDirty) regardless, since it must reflect the
+  // new capacity either way.
+  if (r->hasClientNodeColors && r->nodeColorsStaging) {
+    uint32_t *grown = realloc(r->nodeColorsStaging, sizeof(uint32_t) * count);
+    if (grown) {
+      uint32_t baseNode = colorToRgba8(&r->nodeStyle.fillColor);
+      for (size_t i = r->nodeColorsStagingCount; i < count; i++)
+        grown[i] = baseNode;
+      r->nodeColorsStaging = grown;
+      r->nodeColorsStagingCount = count;
+    } else {
+      free(r->nodeColorsStaging);
+      r->nodeColorsStaging = NULL;
+      r->nodeColorsStagingCount = 0;
+      r->hasClientNodeColors = false;
+    }
+  } else {
+    r->hasClientNodeColors = false;
+  }
+  r->colorsDirty = true;
   r->vertexLabels = NULL;
   r->vertexLabelsCount = 0;
   if (r->pickedVertexId != -1) {
@@ -680,6 +746,57 @@ static int ensurePositionBuffers(grRenderer *r) {
     r->vertexOverlayDirty = true;
   }
   return 0;
+}
+
+/* Degree of raw vertex @p v as the drawn structure defines it: the
+ * embedding's synced out+in rows when a snapshot exists (matching exactly
+ * what grTopologyExtract drew), the live subgraph otherwise. */
+static uint32_t topoVertexDegree(gvizEmbeddedGraph *graph, size_t v) {
+  size_t count;
+  if (gvizEmbeddedGraphOutNeighbors(graph, v, &count))
+    return (uint32_t)(count + gvizEmbeddedGraphInDegree(graph, v));
+  return (uint32_t)gvizSubgraphDegree(gvizEmbeddedGraphStructure(graph), v);
+}
+
+/* Recomputes and re-uploads the per-vertex degrees the edge shader's
+ * degree-alpha mode reads. Called on every structural change, so degrees
+ * stay current as the graph grows -- a new edge changes its endpoints'
+ * degrees even when both vertices are old. */
+static int refreshNodeDegrees(grRenderer *r) {
+  if (r->posCapacity == 0)
+    return 0;
+  uint32_t *degrees = calloc(r->posCapacity, sizeof(uint32_t));
+  if (!degrees)
+    return -1;
+  for (size_t i = 0; i < r->topo.nodeCount; i++) {
+    uint32_t v = r->topo.nodeIds[i];
+    degrees[v] = topoVertexDegree(r->graph, v);
+  }
+  int res = grRendererSetNodeDegrees(r, degrees, r->posCapacity);
+  free(degrees);
+  return res;
+}
+
+/* Recomputes and re-uploads per-edge weights in the exact order of the edge
+ * buffer just extracted -- the only ordering the weight-width shader can
+ * index by, and one that changes wholesale on every structural change. */
+static int refreshEdgeWeights(grRenderer *r) {
+  size_t edgeCount = r->topo.edgeCount;
+  if (edgeCount == 0)
+    return grRendererSetEdgeWeights(r, NULL, 0);
+  float *weights = malloc(sizeof(float) * edgeCount);
+  if (!weights)
+    return -1;
+  const gvizGraph *g = gvizEmbeddedGraphStructure(r->graph)->g;
+  for (size_t i = 0; i < edgeCount; i++) {
+    double w = 1.0;
+    gvizGraphGetEdgeWeight(g, r->topo.edges[2 * i], r->topo.edges[2 * i + 1],
+                           &w);
+    weights[i] = (float)w;
+  }
+  int res = grRendererSetEdgeWeights(r, weights, edgeCount);
+  free(weights);
+  return res;
 }
 
 /** Uploads topology-derived buffers (node id remap + edge endpoint pairs). */
@@ -715,11 +832,31 @@ static int uploadTopology(grRenderer *r) {
     wgpuQueueWriteBuffer(r->queue, r->edgesBuf, 0, r->topo.edges,
                          sizeof(uint32_t) * 2 * r->topo.edgeCount);
 
-  // Stale per-edge colors/weights no longer match the edge ordering.
+  // Stale per-edge colors/weights no longer match the edge ordering -- this
+  // includes the client base layer (edgeColorsStaging), which is indexed
+  // the same edge-buffer-order way and is just as stale; the client must
+  // re-upload after a structural change, matching grRendererSetEdgeColors's
+  // documented indexing contract.
   r->hasEdgeColors = false;
   r->hasEdgeWeights = false;
-  r->highlightDirty = true;
+  free(r->edgeColorsStaging);
+  r->edgeColorsStaging = NULL;
+  r->edgeColorsStagingCount = 0;
+  r->hasClientEdgeColors = false;
+  r->colorsDirty = true;
   r->bindGroupDirty = true;
+  r->listFilterDirty = true; // visible vertex set changed
+  r->listOverlayDirty = true;
+
+  // Auto-maintained attributes: with degree-alpha or weight-width enabled,
+  // the data those shader modes index is a pure function of the structure
+  // just uploaded, so the renderer refreshes it here instead of every
+  // client having to chase structural changes (which made both modes
+  // unusable on growing graphs).
+  if (r->edgeDegreeAlpha && refreshNodeDegrees(r) < 0)
+    return -1;
+  if (r->edgeWeightWidth && refreshEdgeWeights(r) < 0)
+    return -1;
   return 0;
 }
 
@@ -806,9 +943,16 @@ int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
   gvizEmbeddedGraphAddAction(graph, GR_ACTION_PICK_VERTEX,
                              grenderActionPickVertex, r);
   r->highlightActive = false;
-  r->highlightDirty = false;
+  r->colorsDirty = false;
   r->pickedVertexId = -1;
   r->vertexOverlayDirty = true;
+  r->listSearchFocused = false;
+  r->listSearchInput[0] = '\0';
+  r->listSearchInputLen = 0;
+  r->listScrollPx = 0.0;
+  r->listSelectedIdx = SIZE_MAX;
+  r->listFilterDirty = true;
+  r->listOverlayDirty = true;
   if (dim == 3 || dim == 4)
     grCameraInit3D(&r->camera);
   else
@@ -847,6 +991,10 @@ void grRendererSetEdgeDegreeAlpha(grRenderer *r, bool enabled) {
   if (!r)
     return;
   r->edgeDegreeAlpha = enabled;
+  /* Auto-derived data (see uploadTopology): refresh right away so enabling
+   * mid-run takes effect this frame, not at the next structural change. */
+  if (enabled && r->graph)
+    refreshNodeDegrees(r);
 }
 
 bool grRendererEdgeDegreeAlpha(const grRenderer *r) {
@@ -857,6 +1005,8 @@ void grRendererSetEdgeWeightWidth(grRenderer *r, bool enabled) {
   if (!r)
     return;
   r->edgeWeightWidth = enabled;
+  if (enabled && r->graph)
+    refreshEdgeWeights(r);
 }
 
 bool grRendererEdgeWeightWidth(const grRenderer *r) {
@@ -892,8 +1042,31 @@ int grRendererSetNodeColors(grRenderer *r, const uint32_t *rgba8,
                             size_t count) {
   if (rgba8 && (!r->graph || count != r->posCapacity))
     return -1;
-  return uploadAttribute(r, &r->nodeColorsBuf, rgba8, count * sizeof(uint32_t),
-                         &r->hasNodeColors, "grender node colors");
+
+  // This is the persistent client base layer, not the GPU buffer bound for
+  // drawing: keep our own copy and let applyColorLayers (colorsDirty)
+  // recompute nodeColorsBuf from it (composited with any active highlight)
+  // before the next frame, so a highlight set/clear afterward can't stomp
+  // it the way overwriting nodeColorsBuf directly here used to.
+  if (!rgba8) {
+    free(r->nodeColorsStaging);
+    r->nodeColorsStaging = NULL;
+    r->nodeColorsStagingCount = 0;
+    r->hasClientNodeColors = false;
+    r->colorsDirty = true;
+    return 0;
+  }
+
+  uint32_t *staging = malloc(count * sizeof(uint32_t));
+  if (!staging)
+    return -1;
+  memcpy(staging, rgba8, count * sizeof(uint32_t));
+  free(r->nodeColorsStaging);
+  r->nodeColorsStaging = staging;
+  r->nodeColorsStagingCount = count;
+  r->hasClientNodeColors = true;
+  r->colorsDirty = true;
+  return 0;
 }
 
 int grRendererSetNodeSizes(grRenderer *r, const float *radii, size_t count) {
@@ -957,6 +1130,8 @@ int grRendererSetVertexLabels(grRenderer *r, const char *const *labels,
   r->vertexLabels = labels;
   r->vertexLabelsCount = labels ? count : 0;
   r->vertexOverlayDirty = true;
+  r->listFilterDirty = true; // search text now matches against new labels
+  r->listOverlayDirty = true;
   return 0;
 }
 
@@ -964,8 +1139,28 @@ int grRendererSetEdgeColors(grRenderer *r, const uint32_t *rgba8,
                             size_t count) {
   if (rgba8 && (!r->graph || count != r->topo.edgeCount))
     return -1;
-  return uploadAttribute(r, &r->edgeColorsBuf, rgba8, count * sizeof(uint32_t),
-                         &r->hasEdgeColors, "grender edge colors");
+
+  // Same client-base-layer-vs-composited-buffer split as
+  // grRendererSetNodeColors above.
+  if (!rgba8) {
+    free(r->edgeColorsStaging);
+    r->edgeColorsStaging = NULL;
+    r->edgeColorsStagingCount = 0;
+    r->hasClientEdgeColors = false;
+    r->colorsDirty = true;
+    return 0;
+  }
+
+  uint32_t *staging = malloc(count * sizeof(uint32_t));
+  if (!staging)
+    return -1;
+  memcpy(staging, rgba8, count * sizeof(uint32_t));
+  free(r->edgeColorsStaging);
+  r->edgeColorsStaging = staging;
+  r->edgeColorsStagingCount = count;
+  r->hasClientEdgeColors = true;
+  r->colorsDirty = true;
+  return 0;
 }
 
 int grRendererSetEdgeWeights(grRenderer *r, const float *weights,
@@ -1055,12 +1250,21 @@ static uint32_t colorToRgba8(const grColor *c) {
 
 static void grHighlightReset(grRenderer *r) {
   r->highlightActive = false;
-  r->highlightDirty = false;
+  r->colorsDirty = true; // recompute nodeColorsBuf/edgeColorsBuf without it
 }
 
 static gvizSubgraph grHighlightCopySubgraph(const gvizSubgraph *src) {
   gvizSubgraph dst = {0};
   if (!src || !src->g)
+    return dst;
+
+  /* Pick/highlight subgraphs are full subgraphs whose edge bitsets are
+   * addressed by the graph's shared layout; refresh it on demand (an O(1)
+   * no-op unless the graph mutated) so highlighting keeps working on
+   * graphs that grow between clicks. The persisted highlight this copy
+   * replaces was written under the previous layout, but it's swapped out
+   * before anything reads it under the rebuilt one. */
+  if (gvizGraphEnsureLayout((gvizGraph *)src->g) < 0)
     return dst;
 
   dst = gvizSubgraphCreateEmpty(src->g);
@@ -1105,49 +1309,89 @@ static int highlightHasEdge(const gvizSubgraph *sg, size_t u, size_t v,
   return gvizSubgraphHasEdge(sg, v, u);
 }
 
-static void applyHighlightColors(grRenderer *r) {
-  if (!r->graph)
+/**
+ * Recomputes nodeColorsBuf/edgeColorsBuf -- the GPU buffers actually bound
+ * for drawing -- from two layers: the persistent client base layer
+ * (nodeColorsStaging/edgeColorsStaging, set via grRendererSetNodeColors/
+ * grRendererSetEdgeColors) and the transient active highlight, if any. The
+ * highlight is painted *over* the base layer rather than replacing it, so
+ * clearing or changing the highlight restores the client's colors instead
+ * of falling back to the global style -- that fallback only happens for
+ * elements the client never set a color for (or never called
+ * grRendererSetNodeColors/SetEdgeColors at all), which is what keeps
+ * existing callers' behavior unchanged.
+ *
+ * Runs once per frame, gated by colorsDirty (set on highlight set/clear,
+ * client base-layer changes, and capacity/topology changes) so an unrelated
+ * frame does no work.
+ */
+static void applyColorLayers(grRenderer *r) {
+  if (!r->graph || !r->colorsDirty)
     return;
 
-  if (!r->highlightActive || !gvizEmbeddedGraphHasHighlight(r->graph)) {
-    if (r->hasNodeColors || r->hasEdgeColors) {
-      grRendererSetNodeColors(r, NULL, 0);
-      grRendererSetEdgeColors(r, NULL, 0);
-    }
-    r->highlightDirty = false;
-    return;
-  }
+  bool highlightOn =
+      r->highlightActive && gvizEmbeddedGraphHasHighlight(r->graph);
+  const gvizSubgraph *highlight =
+      highlightOn ? gvizEmbeddedGraphGetHighlight(r->graph) : NULL;
 
-  if (!r->highlightDirty)
-    return;
-
-  const gvizSubgraph *highlight = gvizEmbeddedGraphGetHighlight(r->graph);
+  // ---- nodes ----
   size_t nodeCount = r->posCapacity;
-  uint32_t *nodeColors = calloc(nodeCount, sizeof(uint32_t));
-  if (!nodeColors)
-    return;
+  bool haveNodeBase = r->hasClientNodeColors && r->nodeColorsStaging &&
+                      r->nodeColorsStagingCount == nodeCount;
 
-  uint32_t baseNode = colorToRgba8(&r->nodeStyle.fillColor);
-  for (size_t i = 0; i < nodeCount; i++)
-    nodeColors[i] = baseNode;
+  if (!highlightOn) {
+    // No highlight: the bound buffer is exactly the client's base layer, or
+    // cleared to the global style if the client never set one (or cleared
+    // it) -- this is what restores base colors after a highlight ends.
+    if (haveNodeBase)
+      uploadAttribute(r, &r->nodeColorsBuf, r->nodeColorsStaging,
+                      nodeCount * sizeof(uint32_t), &r->hasNodeColors,
+                      "grender node colors");
+    else
+      uploadAttribute(r, &r->nodeColorsBuf, NULL, 0, &r->hasNodeColors,
+                      "grender node colors");
+  } else {
+    uint32_t *nodeColors = calloc(nodeCount, sizeof(uint32_t));
+    if (!nodeColors)
+      return;
 
-  size_t u;
-  gvizSubgraphVertexIterator vit =
-      gvizSubgraphVertexIteratorCreate(highlight);
-  while (gvizSubgraphVertexIterate(&vit, &u)) {
-    if (r->highlightNodeRgba)
-      nodeColors[u] = r->highlightNodeRgba;
-  }
+    uint32_t baseNode = colorToRgba8(&r->nodeStyle.fillColor);
+    for (size_t i = 0; i < nodeCount; i++)
+      nodeColors[i] = haveNodeBase ? r->nodeColorsStaging[i] : baseNode;
 
-  if (grRendererSetNodeColors(r, nodeColors, nodeCount) < 0) {
+    size_t u;
+    gvizSubgraphVertexIterator vit =
+        gvizSubgraphVertexIteratorCreate(highlight);
+    while (gvizSubgraphVertexIterate(&vit, &u)) {
+      if (r->highlightNodeRgba)
+        nodeColors[u] = r->highlightNodeRgba;
+    }
+
+    uploadAttribute(r, &r->nodeColorsBuf, nodeColors,
+                    nodeCount * sizeof(uint32_t), &r->hasNodeColors,
+                    "grender node colors");
     free(nodeColors);
+  }
+
+  // ---- edges ----
+  size_t edgeCount = r->topo.edgeCount;
+  bool haveEdgeBase = r->hasClientEdgeColors && r->edgeColorsStaging &&
+                      r->edgeColorsStagingCount == edgeCount;
+
+  if (!highlightOn) {
+    if (haveEdgeBase)
+      uploadAttribute(r, &r->edgeColorsBuf, r->edgeColorsStaging,
+                      edgeCount * sizeof(uint32_t), &r->hasEdgeColors,
+                      "grender edge colors");
+    else
+      uploadAttribute(r, &r->edgeColorsBuf, NULL, 0, &r->hasEdgeColors,
+                      "grender edge colors");
+    r->colorsDirty = false;
     return;
   }
-  free(nodeColors);
 
-  size_t edgeCount = r->topo.edgeCount;
   if (edgeCount == 0) {
-    r->highlightDirty = false;
+    r->colorsDirty = false;
     return;
   }
 
@@ -1157,7 +1401,7 @@ static void applyHighlightColors(grRenderer *r) {
 
   uint32_t baseEdge = colorToRgba8(&r->edgeStyle.color);
   for (size_t i = 0; i < edgeCount; i++)
-    edgeColors[i] = baseEdge;
+    edgeColors[i] = haveEdgeBase ? r->edgeColorsStaging[i] : baseEdge;
 
   if (r->highlightEdgeRgba) {
     for (size_t i = 0; i < edgeCount; i++) {
@@ -1168,9 +1412,11 @@ static void applyHighlightColors(grRenderer *r) {
     }
   }
 
-  grRendererSetEdgeColors(r, edgeColors, edgeCount);
+  uploadAttribute(r, &r->edgeColorsBuf, edgeColors,
+                  edgeCount * sizeof(uint32_t), &r->hasEdgeColors,
+                  "grender edge colors");
   free(edgeColors);
-  r->highlightDirty = false;
+  r->colorsDirty = false;
 }
 
 /**
@@ -1201,7 +1447,9 @@ int grRendererSetHighlight(grRenderer *r, const gvizSubgraph *highlight,
   r->highlightActive = true;
   r->highlightNodeRgba = nodeRgba;
   r->highlightEdgeRgba = edgeRgba;
-  r->highlightDirty = true;
+  r->colorsDirty = true;
+  r->listFilterDirty = true; // the list's vertex set follows the highlight
+  r->listOverlayDirty = true;
   return 0;
 }
 
@@ -1212,6 +1460,8 @@ int grRendererSetHighlightCycle(grRenderer *r, const size_t *vertices,
     return -1;
 
   const gvizGraph *g = gvizEmbeddedGraphStructure(r->graph)->g;
+  if (gvizGraphEnsureLayout((gvizGraph *)g) < 0)
+    return -1;
   gvizSubgraph cycle = gvizSubgraphCreateEmpty(g);
   if (!cycle.g)
     return -1;
@@ -1231,9 +1481,14 @@ void grRendererClearHighlight(grRenderer *r) {
     return;
   if (r->graph)
     gvizEmbeddedGraphClearHighlight(r->graph);
+  // grHighlightReset marks colorsDirty so applyColorLayers repaints
+  // nodeColorsBuf/edgeColorsBuf from the client base layer alone (or the
+  // global style, if none was set) -- it must NOT touch the client's base
+  // layer itself (nodeColorsStaging/edgeColorsStaging), which persists
+  // across highlight clears per grRendererSetNodeColors's contract.
   grHighlightReset(r);
-  grRendererSetNodeColors(r, NULL, 0);
-  grRendererSetEdgeColors(r, NULL, 0);
+  r->listFilterDirty = true; // the list's vertex set follows the highlight
+  r->listOverlayDirty = true;
 }
 
 static void grenderActionPickFace(gvizEmbeddedGraph *eg, void *userData,
@@ -1291,28 +1546,31 @@ static double grHitTestVertexEpsilon(grRenderer *r, uint32_t v, double x,
   return radiusPx / pxPerWorld;
 }
 
-static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
-                                    const gvizActionPayload *payload) {
-  grRenderer *r = userData;
-  if (!r || !payload || r->topo.nodeCount == 0)
-    return;
-
+/**
+ * Finds the vertex whose drawn circle contains a click at (@p worldX, @p
+ * worldY) on embedded graph @p eg, preferring the most centrally-contained
+ * one when circles overlap (smaller vertices sitting on/near a larger one
+ * must still be selectable, so this can't just take the nearest center and
+ * test that one vertex's radius alone -- per-vertex sizes vary, so the
+ * nearest center isn't necessarily the vertex whose circle actually reaches
+ * the click). Shared by grenderActionPickVertex and the vertex-click action
+ * dispatch (grRendererBindVertexClick) so both agree on what counts as
+ * "clicked". Returns false (leaving *outVertex untouched) when no vertex's
+ * circle contains the click.
+ */
+static bool grHitTestVertex(grRenderer *r, gvizEmbeddedGraph *eg,
+                            double worldX, double worldY,
+                            size_t *outVertex) {
   size_t dim = gvizEmbeddedGraphDim(eg);
   const double *pos = gvizEmbeddedGraphPositions(eg);
 
-  // Picks the vertex whose drawn circle contains the click, preferring the
-  // most centrally-contained one when circles overlap (smaller vertices
-  // sitting on/near a larger one must still be selectable, so this can't
-  // just take the nearest center and test that one vertex's radius alone --
-  // per-vertex sizes vary, so the nearest center isn't necessarily the
-  // vertex whose circle actually reaches the click).
   size_t best = SIZE_MAX;
   double bestRatio2 = 0.0;
   for (size_t i = 0; i < r->topo.nodeCount; i++) {
     uint32_t v = r->topo.nodeIds[i];
     const double *p = pos + (size_t)v * dim;
-    double dx = p[0] - payload->worldX;
-    double dy = p[1] - payload->worldY;
+    double dx = p[0] - worldX;
+    double dy = p[1] - worldY;
     double d2 = dx * dx + dy * dy;
 
     double epsilon = grHitTestVertexEpsilon(r, v, p[0], p[1],
@@ -1327,7 +1585,20 @@ static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
       bestRatio2 = ratio2;
     }
   }
-  if (best == SIZE_MAX) {
+  if (best == SIZE_MAX)
+    return false;
+  *outVertex = best;
+  return true;
+}
+
+static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
+                                    const gvizActionPayload *payload) {
+  grRenderer *r = userData;
+  if (!r || !payload || r->topo.nodeCount == 0)
+    return;
+
+  size_t nearest;
+  if (!grHitTestVertex(r, eg, payload->worldX, payload->worldY, &nearest)) {
     grRendererClearHighlight(r);
     if (r->pickedVertexId != -1) {
       r->pickedVertexId = -1;
@@ -1335,7 +1606,6 @@ static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
     }
     return;
   }
-  size_t nearest = best;
 
   if (r->pickedVertexId != (int64_t)nearest) {
     r->pickedVertexId = (int64_t)nearest;
@@ -1344,6 +1614,10 @@ static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
   }
 
   const gvizSubgraph *structure = gvizEmbeddedGraphStructure(eg);
+  /* See grHighlightCopySubgraph: refresh the shared layout on demand so the
+   * full-subgraph pick works on graphs that grew since the last click. */
+  if (gvizGraphEnsureLayout((gvizGraph *)structure->g) < 0)
+    return;
   gvizSubgraph pick = gvizSubgraphCreateEmpty(structure->g);
   if (!pick.g)
     return;
@@ -1353,10 +1627,15 @@ static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
   // Shift-click flips the highlight to in-edges (nearest's predecessors)
   // instead of the default out-edges, for directed graphs only -- shift is
   // a no-op on undirected graphs, where every edge already appears both
-  // ways via gvizSubgraphNeighborIterate. gvizEmbeddedGraphInNeighbors is a
-  // property of the embedding itself (see gvizEmbeddedGraph.h), so this
-  // works for any embedder, not just forceEmbedder.
-  if (gvizEmbeddedGraphIsDirected(eg) && (payload->iarg & GR_MOD_SHIFT) != 0) {
+  // ways in the out rows. Both branches read the embedding's SYNCED
+  // adjacency snapshot (gvizEmbeddedGraphOutNeighbors/InNeighbors), the
+  // same structure grTopologyExtract draws edges from, so the highlight can
+  // never include an edge that isn't on screen. Embeddings that never
+  // synced have no snapshot (the accessors return NULL); there the live
+  // subgraph is the committed structure and out-edges fall back to neighbor
+  // iteration, while in-edges have no source at all and shift-click
+  // degrades to highlighting just the vertex.
+  if (gvizGraphIsDirected(structure->g) && (payload->iarg & GR_MOD_SHIFT) != 0) {
     size_t inCount;
     const size_t *inNbrs = gvizEmbeddedGraphInNeighbors(eg, nearest, &inCount);
     for (size_t idx = 0; idx < inCount; idx++) {
@@ -1365,12 +1644,21 @@ static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
       highlightShowBoundaryEdge(&pick, u, nearest); // edge is u -> nearest
     }
   } else {
-    gvizSubgraphNeighborIterator nit =
-        gvizSubgraphNeighborIteratorCreate(structure, nearest);
-    size_t v;
-    while (gvizSubgraphNeighborIterate(&nit, &v)) {
-      gvizSubgraphShowVertex(&pick, v);
-      highlightShowBoundaryEdge(&pick, nearest, v);
+    size_t outCount;
+    const size_t *outNbrs = gvizEmbeddedGraphOutNeighbors(eg, nearest, &outCount);
+    if (outNbrs) {
+      for (size_t idx = 0; idx < outCount; idx++) {
+        gvizSubgraphShowVertex(&pick, outNbrs[idx]);
+        highlightShowBoundaryEdge(&pick, nearest, outNbrs[idx]);
+      }
+    } else {
+      gvizSubgraphNeighborIterator nit =
+          gvizSubgraphNeighborIteratorCreate(structure, nearest);
+      size_t v;
+      while (gvizSubgraphNeighborIterate(&nit, &v)) {
+        gvizSubgraphShowVertex(&pick, v);
+        highlightShowBoundaryEdge(&pick, nearest, v);
+      }
     }
   }
   gvizSubgraphRebuild(&pick);
@@ -1386,25 +1674,35 @@ void grRendererRequestClose(grRenderer *r) { r->closeRequested = true; }
 
 double grRendererDeltaTime(const grRenderer *r) { return r->deltaTime; }
 
-static void fitViewNow(grRenderer *r, double fbw, double fbh) {
+/**
+ * Computes the axis-aligned bounding box (in the coordinates actually
+ * rendered -- PCA-projected to 3D for a 4D embedding) of the topology's
+ * currently visible vertices. Returns false (bmin/bmax left untouched) when
+ * there's nothing to bound (no graph, no visible vertices, or a 4D-PCA
+ * allocation failure). Shared by fitViewNow (F key / grRendererFitView) and
+ * grRendererFocusVertex, so both agree on what "the graph's extent" means
+ * for an embedding of any supported dimension.
+ */
+static bool computeVisibleBoundingBox(grRenderer *r, double bmin[3],
+                                      double bmax[3]) {
   if (!r->graph || r->topo.nodeCount == 0)
-    return;
+    return false;
 
   const double *pos = gvizEmbeddedGraphPositions(r->graph);
   size_t srcDim = r->srcDim;
-  double bmin[3] = {INFINITY, INFINITY, 0.0};
-  double bmax[3] = {-INFINITY, -INFINITY, 0.0};
+  bmin[0] = INFINITY, bmin[1] = INFINITY, bmin[2] = 0.0;
+  bmax[0] = -INFINITY, bmax[1] = -INFINITY, bmax[2] = 0.0;
   if (r->posDim == 3)
     bmin[2] = INFINITY, bmax[2] = -INFINITY;
 
   if (srcDim == 4) {
     float *proj = malloc(sizeof(float) * r->posCapacity * 3);
     if (!proj)
-      return;
+      return false;
     if (grPCAProjectTo3(pos, r->posCapacity, srcDim, proj, r->pcaBasis,
                         r->pcaBasisValid ? r->pcaBasis : NULL) < 0) {
       free(proj);
-      return;
+      return false;
     }
     r->pcaBasisValid = true;
     for (size_t i = 0; i < r->topo.nodeCount; i++) {
@@ -1428,7 +1726,60 @@ static void fitViewNow(grRenderer *r, double fbw, double fbh) {
       }
     }
   }
+  return true;
+}
+
+static void fitViewNow(grRenderer *r, double fbw, double fbh) {
+  double bmin[3], bmax[3];
+  if (!computeVisibleBoundingBox(r, bmin, bmax))
+    return;
   grCameraFitBox(&r->camera, bmin, bmax, fbw, fbh);
+}
+
+// Fraction of the graph's own max extent used to size the "focus" box in
+// grRendererFocusVertex: small enough to feel like a deliberate zoom-in on
+// one vertex (rather than grCameraFitBox's zero-size box for a lone point,
+// which would zoom to the camera's minimum distance and show nothing useful
+// around it), while still scaling with the graph's own coordinate units
+// instead of an arbitrary absolute distance that would be wrong for a graph
+// laid out in [-1, 1] versus one laid out in the thousands.
+#define GR_FOCUS_EXTENT_FRACTION 0.08
+#define GR_FOCUS_FALLBACK_RADIUS 1.0
+
+/**
+ * Centers the camera on vertex @p vertexId and zooms in to comfortably frame
+ * a neighborhood around it, sized relative to the graph's current bounding
+ * box (see GR_FOCUS_EXTENT_FRACTION) via grCameraFitBox -- shared by the C
+ * key (see processInput below) and grConsole.c's "find" command so both
+ * behave identically. No-op if @p vertexId is out of range or no vertex
+ * position data has been uploaded yet.
+ */
+void grRendererFocusVertex(grRenderer *r, size_t vertexId) {
+  if (!r || !r->posStaging || vertexId >= r->posCapacity)
+    return;
+
+  double point[3] = {0.0, 0.0, 0.0};
+  for (size_t d = 0; d < r->posDim && d < 3; d++)
+    point[d] = (double)r->posStaging[vertexId * r->posDim + d];
+
+  double bmin[3], bmax[3], maxExtent = 0.0;
+  if (computeVisibleBoundingBox(r, bmin, bmax)) {
+    for (int d = 0; d < 3; d++) {
+      double extent = bmax[d] - bmin[d];
+      if (extent > maxExtent)
+        maxExtent = extent;
+    }
+  }
+  double radius = maxExtent > 0.0 ? maxExtent * GR_FOCUS_EXTENT_FRACTION
+                                  : GR_FOCUS_FALLBACK_RADIUS;
+
+  double focusMin[3], focusMax[3];
+  for (int d = 0; d < 3; d++) {
+    focusMin[d] = point[d] - radius;
+    focusMax[d] = point[d] + radius;
+  }
+  grCameraFitBox(&r->camera, focusMin, focusMax, r->surfaceConfig.width,
+                r->surfaceConfig.height);
 }
 
 /** Applies built-in navigation and queues action dispatches. */
@@ -1451,7 +1802,14 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
     return;
   }
-  r->pendingConsoleEvents.count = 0; // no console focused; discard queued input
+  // The vertex-list search box is the console's only other user of this
+  // queue; the two are mutually exclusive (the branch above already
+  // returned if the console owns input), so it's safe to route the whole
+  // queue to whichever one currently has focus, or discard it if neither does.
+  if (r->listSearchFocused)
+    grListSearchProcessInput(r);
+  else
+    r->pendingConsoleEvents.count = 0;
 
   double cx, cy;
   glfwGetCursorPos(r->window, &cx, &cy);
@@ -1516,6 +1874,27 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     r->scrollAccum = 0.0;
   }
 
+  grListOverlayLayout listOverlayLayout;
+  grListOverlayComputeLayout(r, fbw, fbh, &listOverlayLayout);
+  bool overListOverlay =
+      listOverlayLayout.visible && cxPx >= listOverlayLayout.x0 &&
+      cxPx <= listOverlayLayout.x1 && cyPx >= listOverlayLayout.y0 &&
+      cyPx <= listOverlayLayout.y1;
+
+  if (overListOverlay && r->scrollAccum != 0.0) {
+    double newScroll =
+        r->listScrollPx + r->scrollAccum * listOverlayLayout.lineH * 3.0;
+    if (newScroll < 0.0)
+      newScroll = 0.0;
+    if (newScroll > listOverlayLayout.maxScrollPx)
+      newScroll = listOverlayLayout.maxScrollPx;
+    if (newScroll != r->listScrollPx) {
+      r->listScrollPx = newScroll;
+      r->listOverlayDirty = true;
+    }
+    r->scrollAccum = 0.0;
+  }
+
   if (r->scrollAccum != 0.0) {
     double factor = pow(0.90, r->scrollAccum);
     if (!r->camera.perspective) {
@@ -1536,41 +1915,66 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
 
   grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
 
-  // Key dispatch: built-in fit on F unless the app bound F itself.
-  const grPendingKey *pendingKeys = r->pendingKeys.arr;
-  const grKeyBinding *bindings = r->bindings.arr;
-  for (size_t k = 0; k < r->pendingKeys.count; k++) {
-    int key = pendingKeys[k].key;
-    int mods = pendingKeys[k].mods;
+  // Key dispatch: built-in fit on F unless the app bound F itself. Most of
+  // this is suppressed while the list's search box has focus, so typing e.g.
+  // "field" into it doesn't also fit the view (F), toggle stats (S), or fire
+  // any app-bound action -- exactly like the console's own exclusive input
+  // capture, just scoped to key dispatch rather than all input. Up/Down list
+  // navigation is the one exception: arrow keys never appear in typed text,
+  // so they stay live even while the search box is focused.
+  {
+    const grPendingKey *pendingKeys = r->pendingKeys.arr;
+    const grKeyBinding *bindings = r->bindings.arr;
+    for (size_t k = 0; k < r->pendingKeys.count; k++) {
+      int key = pendingKeys[k].key;
+      int mods = pendingKeys[k].mods;
 
-    const char *actionName = NULL;
-    for (size_t i = 0; i < r->bindings.count; i++) {
-      if (bindings[i].key == key) {
-        actionName = bindings[i].actionName;
-        break;
+      const char *actionName = NULL;
+      for (size_t i = 0; i < r->bindings.count; i++) {
+        if (bindings[i].key == key) {
+          actionName = bindings[i].actionName;
+          break;
+        }
       }
-    }
 
-    if (!actionName) {
-      if (key == 'F')
-        r->fitRequested = true;
-      else if (key == 'S')
-        grRendererShowStats(r, !r->statsVisible);
-      else if (key == 'I')
-        grRendererShowTextureMapImage(r, !grRendererTextureMapImageShown(r));
-      else if (key == GR_CONSOLE_TOGGLE_KEY)
-        grConsoleOpen(r);
-      continue;
-    }
-    if (!r->graph)
-      continue;
+      if (!actionName) {
+        if (r->listVisible && key == GR_KEY_UP) {
+          grListOverlaySelectDelta(r, fbw, fbh, -1);
+          continue;
+        }
+        if (r->listVisible && key == GR_KEY_DOWN) {
+          grListOverlaySelectDelta(r, fbw, fbh, 1);
+          continue;
+        }
+        if (r->listSearchFocused)
+          continue; // F/S/I/L/C/console-toggle stay suppressed while typing
+        if (key == 'F')
+          r->fitRequested = true;
+        else if (key == 'S')
+          grRendererShowStats(r, !r->statsVisible);
+        else if (key == 'I')
+          grRendererShowTextureMapImage(r, !grRendererTextureMapImageShown(r));
+        else if (key == 'L')
+          grRendererShowVertexList(r, !r->listVisible);
+        else if (key == 'C' && r->listSelectedIdx < r->listFilteredIds.count) {
+          const uint32_t *ids = r->listFilteredIds.arr;
+          grRendererFocusVertex(r, ids[r->listSelectedIdx]);
+        } else if (key == GR_CONSOLE_TOGGLE_KEY)
+          grConsoleOpen(r);
+        continue;
+      }
+      if (r->listSearchFocused)
+        continue; // app-bound actions stay suppressed while typing too
+      if (!r->graph)
+        continue;
 
-    gvizActionPayload payload = {0};
-    grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh,
-                      &payload.worldX, &payload.worldY);
-    payload.deltaTime = r->deltaTime;
-    payload.iarg = mods; // GLFW mod bits match GR_MOD_*
-    gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
+      gvizActionPayload payload = {0};
+      grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh,
+                        &payload.worldX, &payload.worldY);
+      payload.deltaTime = r->deltaTime;
+      payload.iarg = mods; // GLFW mod bits match GR_MOD_*
+      gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
+    }
   }
   r->pendingKeys.count = 0;
 
@@ -1579,6 +1983,24 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   for (size_t m = 0; m < r->pendingMouse.count; m++) {
     int button = pendingMouse[m].button;
     int mods = pendingMouse[m].mods;
+
+    // Clicks landing on the list panel never reach the graph: inside the
+    // search bar they focus it (so subsequent keys type into the query
+    // instead of dispatching), anywhere else in the panel they just blur it.
+    // A click outside the panel blurs a focused search box too, but then
+    // falls through to dispatch normally (e.g. still picks a vertex).
+    if (listOverlayLayout.visible &&
+        pendingMouse[m].xPx >= listOverlayLayout.x0 &&
+        pendingMouse[m].xPx <= listOverlayLayout.x1 &&
+        pendingMouse[m].yPx >= listOverlayLayout.y0 &&
+        pendingMouse[m].yPx <= listOverlayLayout.y1) {
+      r->listSearchFocused =
+          pendingMouse[m].yPx >= listOverlayLayout.searchY0 &&
+          pendingMouse[m].yPx <= listOverlayLayout.searchY1;
+      continue;
+    }
+    if (r->listSearchFocused)
+      r->listSearchFocused = false;
 
     const char *actionName = NULL;
     for (size_t i = 0; i < r->mouseBindings.count; i++) {
@@ -1589,7 +2011,15 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     }
     if (!actionName && button == GR_MOUSE_BUTTON_LEFT)
       actionName = GR_ACTION_PICK_VERTEX;
-    if (!actionName || !r->graph)
+    if (!r->graph)
+      continue;
+    // GR_ACTION_VERTEX_CLICKED has no binding to check -- it fires purely
+    // off whether the creator registered a handler for it, so look that up
+    // instead of unconditionally paying for the O(vertex count) hit test
+    // below on every click of every app that doesn't use it.
+    bool wantsVertexClicked =
+        gvizEmbeddedGraphFindAction(r->graph, GR_ACTION_VERTEX_CLICKED) != NULL;
+    if (!actionName && !wantsVertexClicked)
       continue;
 
     gvizActionPayload payload = {0};
@@ -1598,7 +2028,24 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
                       &payload.worldY);
     payload.deltaTime = r->deltaTime;
     payload.iarg = mods;
-    gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
+    if (actionName)
+      gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
+
+    // GR_ACTION_VERTEX_CLICKED dispatch is independent of, and in addition
+    // to, the per-button action above: it fires on any button whose click
+    // actually lands on a vertex's drawn circle (grHitTestVertex, the same
+    // test GR_ACTION_PICK_VERTEX uses), carrying the hit vertex's id in iarg
+    // rather than the modifier bits regular key/mouse actions get there.
+    if (wantsVertexClicked) {
+      size_t hitVertex;
+      if (grHitTestVertex(r, r->graph, payload.worldX, payload.worldY,
+                          &hitVertex)) {
+        gvizActionPayload vertexPayload = payload;
+        vertexPayload.iarg = (int64_t)hitVertex;
+        gvizEmbeddedGraphInvokeAction(r->graph, GR_ACTION_VERTEX_CLICKED,
+                                      &vertexPayload);
+      }
+    }
   }
   r->pendingMouse.count = 0;
 }
@@ -1678,7 +2125,7 @@ static void statsRevisionCacheSync(grRenderer *r, double fbw, double fbh) {
 }
 
 static bool statsOverlayNeedsRebuild(grRenderer *r, double fbw, double fbh) {
-  if (r->statsOverlayDirty || r->vertexOverlayDirty)
+  if (r->statsOverlayDirty || r->vertexOverlayDirty || r->listOverlayDirty)
     return true;
   // The console has no revision counter like the stats/vertex panels do --
   // its text changes on every keystroke -- so just rebuild every frame it's
@@ -1707,8 +2154,9 @@ static bool statsOverlayNeedsRebuild(grRenderer *r, double fbw, double fbh) {
 }
 
 /** Rebuilds overlay primitives (stat charts if shown, the vertex-info panel,
- *  and the command console if open) when stat data, the picked vertex,
- *  console state, or layout changed; uploads (grow-only buffer). */
+ *  the vertex-list panel if shown, and the command console if open) when
+ *  stat data, the picked vertex, the list's filter, console state, or layout
+ *  changed; uploads (grow-only buffer). */
 static void uploadStats(grRenderer *r, double fbw, double fbh) {
   if (!statsOverlayNeedsRebuild(r, fbw, fbh))
     return;
@@ -1717,6 +2165,7 @@ static void uploadStats(grRenderer *r, double fbw, double fbh) {
   if (r->statsVisible)
     grStatsOverlayBuild(r, fbw, fbh);
   grVertexOverlayBuild(r, fbw, fbh);
+  grListOverlayBuild(r, fbw, fbh);
   grConsoleBuild(r, fbw, fbh);
   statsRevisionCacheSync(r, fbw, fbh);
   r->vertexOverlayDirty = false;
@@ -1955,7 +2404,7 @@ bool grRendererFrame(grRenderer *r) {
         return false;
       r->topoDirty = false;
     }
-    applyHighlightColors(r);
+    applyColorLayers(r);
     if (r->fitRequested) {
       fitViewNow(r, fbw, fbh);
       r->fitRequested = false;
