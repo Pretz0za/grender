@@ -4,14 +4,32 @@
 #include "grender/grender.h"
 #include "grProfiling.h"
 
-#include "ds/gvizArray.h"
+#include "gviz.hpp"
 
 #include <webgpu/webgpu.h>
 
-// grender never hand-rolls a growable array: gviz already provides gvizArray
-// (see ds/gvizArray.h) and every dynamically-sized list in this codebase
-// (pending input events, key/mouse bindings, stats primitives, ...) is one.
-// Reach for gvizArray before writing another malloc/realloc-doubling loop.
+#include <cstdint>
+#include <vector>
+
+// grender never hand-rolls a growable array: every dynamically-sized list in
+// this codebase (pending input events, key/mouse bindings, stats primitives,
+// ...) is a std::vector. Reach for std::vector before writing another
+// malloc/realloc-doubling loop.
+
+/**
+ * Binds a compound-literal temporary (e.g. `grPtr(WGPUBufferDescriptor{...})`)
+ * to a const reference parameter -- which, per C++'s ordinary temporary
+ * lifetime rules, keeps it alive through the end of the full expression that
+ * calls grPtr() -- and returns its address. wgpu-native's C API takes
+ * `const T*` descriptor arguments almost everywhere; the old C code built
+ * those inline with `&(const T){...}`, which relied on C's rule that a
+ * compound literal is an lvalue. C++ compound literals (a Clang extension,
+ * used throughout this codebase instead of hand-declaring a named temporary
+ * for every single descriptor struct) are prvalues, so `&` directly on one is
+ * ill-formed; routing through this template is the minimal-diff fix that
+ * keeps the inline-descriptor style intact.
+ */
+template <typename T> const T *grPtr(const T &v) noexcept { return &v; }
 
 typedef struct GLFWwindow GLFWwindow;
 
@@ -74,7 +92,7 @@ typedef struct grTopology {
   size_t nodeCount;
   uint32_t *edges;   /**< Flat (u, v) pairs of parent-graph vertex ids. */
   size_t edgeCount;
-  /** Whether the attached graph's parent gvizGraph is directed. When true,
+  /** Whether the attached graph's parent gviz::Graph is directed. When true,
    *  each (u, v) pair in edges is stored as (from, to) rather than the
    *  u < v-deduplicated pairs used for undirected graphs, and the edge
    *  pipeline draws an arrowhead at v. */
@@ -87,11 +105,11 @@ typedef struct grTopology {
  *
  * @return 0 on success, -1 on allocation failure.
  */
-int grTopologyExtract(grTopology *topo, gvizEmbeddedGraph *graph);
+int grTopologyExtract(grTopology *topo, gviz::layout::EmbeddedGraph &graph);
 void grTopologyRelease(grTopology *topo);
 
 // ------------------------------------------------------------------------------
-// Stats overlay (charts for gvizStatSeries recorded by the embedder)
+// Stats overlay (charts for gviz::layout::StatSeries recorded by the embedder)
 // ------------------------------------------------------------------------------
 
 /** One screen-space overlay primitive. Must match struct StatsPrim in
@@ -109,14 +127,14 @@ typedef struct grStatsPrim {
 struct grRenderer;
 
 /** Advance of one character cell, in font pixels; and glyph height, in font
- *  rows. Shared layout constants for the tiny bitmap font in grStats.c. */
+ *  rows. Shared layout constants for the tiny bitmap font in grStats.cpp. */
 #define GR_FONT_ADVANCE 6.0
 #define GR_FONT_ROWS 7
 
 /**
  * Rebuilds the overlay primitive list (r->statsPrims) from the stat series of
  * the attached graph: one mini line chart per non-empty series, stacked in the
- * top-right corner. Only reads the graph through gvizEmbeddedGraphStatSeries*.
+ * top-right corner. Only reads the graph through EmbeddedGraph::StatSeries*.
  */
 void grStatsOverlayBuild(struct grRenderer *r, double fbw, double fbh);
 
@@ -154,9 +172,23 @@ void grOverlayPushTextClipped(struct grRenderer *r, double x, double y,
  *  actually draws anything. */
 bool grOverlayCharHasGlyph(char c);
 
-/** Fixed-width line buffer for grVertexOverlayLayout.lines: one word-wrapped,
- *  whitespace-collapsed display line. */
-typedef char grVertexOverlayLine[96];
+/**
+ * Fixed-width line buffer for grVertexOverlayLayout.lines: one word-wrapped,
+ * whitespace-collapsed display line. A struct wrapping the char array, not a
+ * bare `typedef char grVertexOverlayLine[96]` array type as in the old C
+ * code: std::vector<T> requires T to be copy-constructible/-assignable,
+ * which a raw array type is not (arrays can't be assigned in C++). The
+ * conversion operators and operator[] below let every existing array-style
+ * use (`buf[0] = ...`, `sizeof(buf)`, passing a `const grVertexOverlayLine&`
+ * where a `const char*` is expected) keep working unchanged at call sites.
+ */
+struct grVertexOverlayLine {
+  char data[96];
+  char &operator[](size_t i) noexcept { return data[i]; }
+  const char &operator[](size_t i) const noexcept { return data[i]; }
+  operator char *() noexcept { return data; }
+  operator const char *() const noexcept { return data; }
+};
 
 /** Panel geometry and scroll extent for the vertex-info overlay, computed
  *  without emitting any draw primitives. Shared by grRendererFrame's input
@@ -197,7 +229,7 @@ void grVertexOverlayBuild(struct grRenderer *r, double fbw, double fbh);
 // ------------------------------------------------------------------------------
 // Vertex list overlay (scrollable list of vertices, filtered by the active
 // highlight and by a fuzzy search over vertex DATA labels; see
-// grListOverlay.c)
+// grListOverlay.cpp)
 // ------------------------------------------------------------------------------
 
 /** Panel geometry for the vertex-list overlay, computed without emitting any
@@ -266,7 +298,7 @@ void grListOverlaySelectDelta(struct grRenderer *r, double fbw, double fbh,
 void grListSearchProcessInput(struct grRenderer *r);
 
 // ------------------------------------------------------------------------------
-// Command console (stateless command line, e.g. "find <id>"; see grConsole.c)
+// Command console (stateless command line, e.g. "find <id>"; see grConsole.cpp)
 // ------------------------------------------------------------------------------
 
 /** Opens the console: shows the input bar and clears any leftover input/
@@ -367,15 +399,16 @@ typedef struct grTexMapImageUBO {
 } grTexMapImageUBO;
 
 /**
- * Live UV mapping tying a 2D gvizEmbeddedGraph's vertex positions to a
- * movable/resizable image rectangle in embedding space, reprojected as
+ * Live UV mapping tying a 2D gviz::layout::EmbeddedGraph's vertex positions to
+ * a movable/resizable image rectangle in embedding space, reprojected as
  * texture coordinates for the object overlay's mesh. Owned by grObjOverlay;
  * `graph` itself is a borrowed pointer.
  */
 typedef struct grTextureMap {
   bool active;
   bool visible; /**< Whether the image rect also draws in the main scene. */
-  gvizEmbeddedGraph *graph; /**< Not owned; must be a 2D embedding. */
+  gviz::layout::EmbeddedGraph *graph = nullptr; /**< Not owned; must be a 2D
+                                                      embedding. */
   double imgCenter[2], imgHalfExtent[2];
   double initCenter[2], initHalfExtent[2]; /**< For grTextureMapResetImage. */
   float *uvStaging;          /**< vertexCount * 2, rebuilt every frame. */
@@ -524,8 +557,8 @@ void grPlatformTextureMapMenuRefresh(struct grRenderer *r);
 /**
  * Centers the camera on vertex @p vertexId and zooms in to comfortably frame
  * a neighborhood around it, sized relative to the graph's current bounding
- * box (see GR_FOCUS_EXTENT_FRACTION in grRenderer.c) via grCameraFitBox --
- * shared by the C key (processInput in grRenderer.c) and grConsole.c's
+ * box (see GR_FOCUS_EXTENT_FRACTION in grRenderer.cpp) via grCameraFitBox --
+ * shared by the C key (processInput in grRenderer.cpp) and grConsole.cpp's
  * "find" command so both behave identically. No-op if @p vertexId is out of
  * range or no vertex position data has been uploaded yet.
  */
@@ -618,7 +651,14 @@ struct grRenderer {
   WGPUTextureView depthView;
 
   // graph data
-  gvizEmbeddedGraph *graph;
+  gviz::layout::EmbeddedGraph *graph = nullptr; /**< Not owned. */
+  /** Not owned. Backs @ref graph's Structure() for the operations that need
+   *  raw parent-graph access (EnsureLayout/GetEdgeWeight/planar face
+   *  queries) that gviz::Subgraph deliberately never exposes -- see
+   *  grRendererSetGraph's doc comment. NULL is tolerated everywhere it's
+   *  read: the features that need it just no-op (return/find nothing)
+   *  instead of crashing. */
+  gviz::Graph *backingGraph = nullptr;
   grTopology topo;
   bool topoDirty;
   uint64_t drawMaskRevision;
@@ -684,7 +724,7 @@ struct grRenderer {
   size_t edgeColorsStagingCount;
   bool hasClientEdgeColors;
 
-  // highlight styling (subgraph lives on the attached gvizEmbeddedGraph)
+  // highlight styling (subgraph lives on the attached gviz::layout::EmbeddedGraph)
   bool highlightActive;
   uint32_t highlightNodeRgba;
   uint32_t highlightEdgeRgba;
@@ -703,14 +743,14 @@ struct grRenderer {
 
   // stats overlay
   bool statsVisible;
-  gvizArray statsPrims; /**< of grStatsPrim; CPU staging list, rebuilt when
+  std::vector<grStatsPrim> statsPrims; /**< CPU staging list, rebuilt when
                              series revision, the picked vertex, or layout
                              changes. Holds both the stats charts and the
                              vertex-info panel (see grVertexOverlayBuild). */
   WGPUBuffer statsBuf;
   size_t statsBufCapacity; /**< In primitives. */
-  gvizArray statsSeriesRevisions; /**< of uint64_t; cached
-                                       gvizStatSeries.revision per index. */
+  std::vector<uint64_t> statsSeriesRevisions; /**< Cached
+                                       StatSeries::revision per index. */
   bool *statsSeriesVisible; /**< Per-series chart visibility (render only). */
   size_t statsSeriesVisibleCount;
   size_t statsMenuSeriesCount; /**< Last series count synced to the macOS menu. */
@@ -729,7 +769,7 @@ struct grRenderer {
   double vertexOverlayScrollPx; /**< Scroll offset into the wrapped label
                                       text, in pixels; reset to 0 whenever a
                                       different vertex is picked. */
-  gvizArray vertexOverlayLines; /**< of grVertexOverlayLine; rebuilt by
+  std::vector<grVertexOverlayLine> vertexOverlayLines; /**< Rebuilt by
                                       grVertexOverlayComputeLayout every time
                                       it runs (including every frame, from
                                       input handling, purely to hit-test the
@@ -737,7 +777,7 @@ struct grRenderer {
                                       re-wrapping it is not worth caching). */
 
   // vertex list overlay (searchable "Vertex N" list, filtered by the active
-  // highlight and a fuzzy search over vertex labels; grListOverlay.c)
+  // highlight and a fuzzy search over vertex labels; grListOverlay.cpp)
   bool listVisible;
   bool listSearchFocused;     /**< Search bar has keyboard focus: typed keys
                                     edit listSearchInput instead of driving
@@ -747,7 +787,7 @@ struct grRenderer {
   double listScrollPx;        /**< Scroll offset into the filtered row list,
                                     in pixels; reset to 0 whenever the filter
                                     is rebuilt with a different result set. */
-  gvizArray listFilteredIds;  /**< of uint32_t; parent-graph vertex ids
+  std::vector<uint32_t> listFilteredIds;  /**< Parent-graph vertex ids
                                     currently shown, after the highlight
                                     filter and fuzzy search, best match first.
                                     Only rebuilt when listFilterDirty (see
@@ -776,14 +816,14 @@ struct grRenderer {
 
   // command console (stateless command line, e.g. "find <id>"; input handled
   // by grConsoleProcessInput, commands by grConsoleRun, drawing by
-  // grConsoleBuild -- see grConsole.c)
+  // grConsoleBuild -- see grConsole.cpp)
   bool consoleOpen;
   char consoleInput[256];      /**< Current, unsubmitted input line. */
   size_t consoleInputLen;
   char consoleMessage[128];    /**< Result/error from the last run command,
                                      empty if none yet. */
   bool consoleMessageIsError;
-  gvizArray pendingConsoleEvents; /**< of grPendingConsoleEvent; queued by
+  std::vector<grPendingConsoleEvent> pendingConsoleEvents; /**< Queued by
                                         onKey/onChar, drained by
                                         grConsoleProcessInput while the
                                         console is open, and discarded each
@@ -807,10 +847,10 @@ struct grRenderer {
   bool fitRequested;
 
   // actions
-  gvizArray bindings;      /**< of grKeyBinding. */
-  gvizArray mouseBindings; /**< of grMouseBinding. */
-  gvizArray pendingKeys;   /**< of grPendingKey. */
-  gvizArray pendingMouse;  /**< of grPendingMouse. */
+  std::vector<grKeyBinding> bindings;
+  std::vector<grMouseBinding> mouseBindings;
+  std::vector<grPendingKey> pendingKeys;
+  std::vector<grPendingMouse> pendingMouse;
   bool mouseDown[3];
   bool mouseDragged[3];
   double mousePressX, mousePressY;

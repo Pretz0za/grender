@@ -16,9 +16,6 @@
 
 #include "grInternal.h"
 
-#include "ds/gvizGraph.h"
-#include "ds/gvizSubgraph.h"
-
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,6 +73,13 @@ static void cmdFind(grRenderer *r, int argc, char **argv,
     consoleFail(out, "no graph attached");
     return;
   }
+  if (!r->backingGraph) {
+    // Vertex selection needs raw parent-graph access (EnsureLayout) that
+    // gviz::Subgraph deliberately never exposes -- see grRendererSetGraph's
+    // doc comment on backingGraph.
+    consoleFail(out, "no backing graph attached");
+    return;
+  }
 
   char *end = NULL;
   long id = strtol(argv[1], &end, 10);
@@ -84,7 +88,7 @@ static void cmdFind(grRenderer *r, int argc, char **argv,
     return;
   }
 
-  size_t vertexCount = gvizEmbeddedGraphPositionCount(r->graph);
+  size_t vertexCount = r->graph->PositionCount();
   if ((size_t)id >= vertexCount) {
     consoleFail(out, "no vertex %ld (graph has %zu)", id, vertexCount);
     return;
@@ -100,22 +104,18 @@ static void cmdFind(grRenderer *r, int argc, char **argv,
 
   grRendererClearHighlight(r);
 
-  const gvizSubgraph *structure = gvizEmbeddedGraphStructure(r->graph);
-  /* See grHighlightCopySubgraph: refresh the shared layout on demand so the
-   * full-subgraph pick works on graphs that grew since the last use. */
-  if (gvizGraphEnsureLayout((gvizGraph *)structure->g) < 0) {
+  try {
+    /* See grHighlightCopySubgraph: refresh the shared layout on demand so
+     * the full-subgraph pick works on graphs that grew since the last use. */
+    r->backingGraph->EnsureLayout();
+    gviz::Subgraph pick = gviz::Subgraph::CreateEmpty(*r->backingGraph);
+    pick.ShowVertex((size_t)id);
+    pick.Rebuild();
+    grRendererSetHighlight(r, pick, GR_RGBA8(255, 210, 80, 255), 0);
+  } catch (const std::exception &) {
     consoleFail(out, "internal error selecting vertex %ld", id);
     return;
   }
-  gvizSubgraph pick = gvizSubgraphCreateEmpty(structure->g);
-  if (!pick.g) {
-    consoleFail(out, "internal error selecting vertex %ld", id);
-    return;
-  }
-  gvizSubgraphShowVertex(&pick, (size_t)id);
-  gvizSubgraphRebuild(&pick);
-  grRendererSetHighlight(r, &pick, GR_RGBA8(255, 210, 80, 255), 0);
-  gvizSubgraphRelease(&pick);
 
   grRendererFocusVertex(r, (size_t)id);
 
@@ -221,8 +221,8 @@ void grConsoleProcessInput(grRenderer *r) {
   // Drained as one queue, in delivery order, rather than as separate key and
   // char queues -- see grPendingConsoleEvent for why: it's what makes "type
   // '3', then press Enter" within the same frame apply in that order.
-  const grPendingConsoleEvent *events = r->pendingConsoleEvents.arr;
-  for (size_t i = 0; i < r->pendingConsoleEvents.count; i++) {
+  const grPendingConsoleEvent *events = r->pendingConsoleEvents.data();
+  for (size_t i = 0; i < r->pendingConsoleEvents.size(); i++) {
     const grPendingConsoleEvent *ev = &events[i];
     if (ev->isChar) {
       consoleAppendChar(r, (uint32_t)ev->code);
@@ -245,7 +245,7 @@ void grConsoleProcessInput(grRenderer *r) {
       break;
     }
   }
-  r->pendingConsoleEvents.count = 0;
+  r->pendingConsoleEvents.clear();
 }
 
 // ------------------------------------------------------------------------------

@@ -1,17 +1,32 @@
 cmake_minimum_required(VERSION 3.20)
-project(grender LANGUAGES C)
-set(CMAKE_C_STANDARD 11)
+project(grender LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_OBJCXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The grender library itself is pure C++20, but examples/*.c (ported in a
+# follow-up pass) are still C, so C must stay enabled at configure time or
+# CMake refuses to generate targets referencing those sources at all.
+enable_language(C)
+
 if(APPLE)
+    # Both OBJC and OBJCXX: GLFW's own Cocoa backend (third-party/glfw) is
+    # plain Objective-C (.m) and needs OBJC enabled or CMake silently
+    # compiles those sources with the C++ front end instead, which rejects
+    # GLFW's C-style implicit void*-to-T* conversions. grender's own
+    # grSurfaceCocoa.mm/grMenuCocoa.mm are Objective-C++ (.mm) because they
+    # include grInternal.h, which pulls in gviz's C++ headers transitively --
+    # plain Objective-C has no access to the C++ standard library.
     enable_language(OBJC)
+    enable_language(OBJCXX)
 endif()
 
 option(GRENDER_BUILD_EXAMPLES "Build grender example apps" ON)
 option(GRENDER_ENABLE_PROFILING
     "Time every rendered frame and print avg/p50/p95/p99/max on exit" OFF)
 set(GRENDER_GVIZ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../gviz" CACHE PATH
-    "Path to the gviz repository (provides gviz public headers and the graphvis library)")
+    "Path to the gviz repository (provides gviz public headers and the gviz library)")
 
 # ------------------------------------------------------------------------------
 # wgpu-native: prebuilt WebGPU implementation (webgpu.h C API).
@@ -82,18 +97,18 @@ endif()
 # grender library
 # ------------------------------------------------------------------------------
 add_library(grender STATIC
-    src/grRenderer.c
-    src/grCamera.c
-    src/grTopology.c
-    src/grStats.c
-    src/grVertexOverlay.c
-    src/grListOverlay.c
-    src/grConsole.c
-    src/grPCA.c
-    src/grObjMesh.c
-    src/grObjOverlay.c
-    src/grTextureMap.c
-    src/grProfiling.c
+    src/grRenderer.cpp
+    src/grCamera.cpp
+    src/grTopology.cpp
+    src/grStats.cpp
+    src/grVertexOverlay.cpp
+    src/grListOverlay.cpp
+    src/grConsole.cpp
+    src/grPCA.cpp
+    src/grObjMesh.cpp
+    src/grObjOverlay.cpp
+    src/grTextureMap.cpp
+    src/grProfiling.cpp
 )
 
 if(GRENDER_ENABLE_PROFILING)
@@ -101,10 +116,10 @@ if(GRENDER_ENABLE_PROFILING)
 endif()
 
 if(APPLE)
-    target_sources(grender PRIVATE src/grSurfaceCocoa.m src/grMenuCocoa.m)
+    target_sources(grender PRIVATE src/grSurfaceCocoa.mm src/grMenuCocoa.mm)
     target_link_libraries(grender PRIVATE "-framework AppKit")
 else()
-    target_sources(grender PRIVATE src/grPlatformMenu.c)
+    target_sources(grender PRIVATE src/grPlatformMenu.cpp)
 endif()
 
 target_include_directories(grender
@@ -132,35 +147,35 @@ endif()
 # ------------------------------------------------------------------------------
 # Examples
 # ------------------------------------------------------------------------------
-if(GRENDER_BUILD_EXAMPLES AND TARGET graphvis)
+if(GRENDER_BUILD_EXAMPLES AND TARGET gviz)
     add_executable(gripDemo examples/gripDemo.c)
     target_compile_definitions(gripDemo PRIVATE
         GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
-    target_link_libraries(gripDemo PRIVATE grender graphvis)
+    target_link_libraries(gripDemo PRIVATE grender gviz)
 
     add_executable(millionDemo examples/millionDemo.c)
-    target_link_libraries(millionDemo PRIVATE grender graphvis)
+    target_link_libraries(millionDemo PRIVATE grender gviz)
 
     add_executable(datasetDemo examples/datasetDemo.c)
     target_compile_definitions(datasetDemo PRIVATE
         GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
-    target_link_libraries(datasetDemo PRIVATE grender graphvis)
+    target_link_libraries(datasetDemo PRIVATE grender gviz)
 
     add_executable(treeDemo examples/treeDemo.c)
-    target_link_libraries(treeDemo PRIVATE grender graphvis)
+    target_link_libraries(treeDemo PRIVATE grender gviz)
 
     add_executable(tutteDemo examples/tutteDemo.c)
-    target_link_libraries(tutteDemo PRIVATE grender graphvis)
+    target_link_libraries(tutteDemo PRIVATE grender gviz)
 
     add_executable(forceEmbedderDemo examples/forceEmbedderDemo.c)
     target_compile_definitions(forceEmbedderDemo PRIVATE
         GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
-    target_link_libraries(forceEmbedderDemo PRIVATE grender graphvis)
+    target_link_libraries(forceEmbedderDemo PRIVATE grender gviz)
 
     add_executable(textureMapDemo examples/textureMapDemo.c)
-    target_link_libraries(textureMapDemo PRIVATE grender graphvis)
+    target_link_libraries(textureMapDemo PRIVATE grender gviz)
 
     add_executable(textureMapUnitTest examples/textureMapUnitTest.c)
     target_include_directories(textureMapUnitTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(textureMapUnitTest PRIVATE grender graphvis)
+    target_link_libraries(textureMapUnitTest PRIVATE grender gviz)
 endif()

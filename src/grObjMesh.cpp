@@ -3,17 +3,17 @@
  * (vertex position) and 'f' (face) lines are read; texture/normal indices
  * on face tokens are ignored and per-vertex normals are instead computed as
  * the area-weighted average of adjacent face normals. This is deliberately
- * independent of gviz's gvizGraphLoadFromObjFile, which discards vertex
+ * independent of gviz's io::LoadFromObjFile, which discards vertex
  * positions and only reconstructs face-boundary edges for graph embedding.
  */
 #include "grInternal.h"
-
-#include "ds/gvizArray.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <vector>
 
 #define GR_LOG(...) fprintf(stderr, "[grender] " __VA_ARGS__)
 #define GR_OBJ_MAX_FACE_VERTS 256
@@ -38,8 +38,8 @@ static int parseFaceVertexIndex(const char *tok, size_t vertexCount,
 }
 
 static int parseFaceLine(const char *p, size_t vertexCount,
-                         gvizArray *indices, gvizArray *faceIds,
-                         size_t faceId) {
+                         std::vector<uint32_t> *indices,
+                         std::vector<uint32_t> *faceIds, size_t faceId) {
   size_t faceVerts[GR_OBJ_MAX_FACE_VERTS];
   size_t faceLen = 0;
 
@@ -67,9 +67,10 @@ static int parseFaceLine(const char *p, size_t vertexCount,
     uint32_t b = (uint32_t)faceVerts[i];
     uint32_t c = (uint32_t)faceVerts[i + 1];
     uint32_t fid = (uint32_t)faceId;
-    if (gvizArrayPush(indices, &a) < 0 || gvizArrayPush(indices, &b) < 0 ||
-        gvizArrayPush(indices, &c) < 0 || gvizArrayPush(faceIds, &fid) < 0)
-      return -1;
+    indices->push_back(a);
+    indices->push_back(b);
+    indices->push_back(c);
+    faceIds->push_back(fid);
   }
   return 0;
 }
@@ -124,15 +125,9 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
     return -1;
   }
 
-  gvizArray positions, indices, faceIds;
-  if (gvizArrayInit(&positions, sizeof(grVec3d)) < 0 ||
-      gvizArrayInit(&indices, sizeof(uint32_t)) < 0 ||
-      gvizArrayInit(&faceIds, sizeof(uint32_t)) < 0) {
-    gvizArrayRelease(&positions);
-    gvizArrayRelease(&indices);
-    fclose(file);
-    return -1;
-  }
+  std::vector<grVec3d> positions;
+  std::vector<uint32_t> indices;
+  std::vector<uint32_t> faceIds;
 
   char *line = NULL;
   size_t lineCap = 0;
@@ -150,15 +145,12 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
         err = -1;
         break;
       }
-      if (gvizArrayPush(&positions, &v) < 0) {
-        err = -1;
-        break;
-      }
+      positions.push_back(v);
       continue;
     }
 
     if (p[0] == 'f' && (p[1] == ' ' || p[1] == '\t')) {
-      if (parseFaceLine(p + 1, positions.count, &indices, &faceIds,
+      if (parseFaceLine(p + 1, positions.size(), &indices, &faceIds,
                         faceCount) < 0) {
         err = -1;
         break;
@@ -170,42 +162,37 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
   free(line);
   fclose(file);
 
-  if (err < 0 || positions.count == 0 || indices.count == 0) {
+  if (err < 0 || positions.empty() || indices.empty()) {
     GR_LOG("failed to parse obj file '%s'\n", path);
-    gvizArrayRelease(&positions);
-    gvizArrayRelease(&indices);
-    gvizArrayRelease(&faceIds);
     return -1;
   }
 
-  size_t vertexCount = positions.count;
-  size_t indexCount = indices.count;
-  const uint32_t *idx = indices.arr;
-  const uint32_t *faceIdsArr = faceIds.arr;
+  size_t vertexCount = positions.size();
+  size_t indexCount = indices.size();
+  const uint32_t *idx = indices.data();
+  const uint32_t *faceIdsArr = faceIds.data();
 
   // .obj files are Y-up by convention; grender's world is Z-up, so rotate
   // the mesh +90 degrees about X (y,z) -> (-z,y) to stand it upright facing
   // the overlay camera instead of lying on its back.
-  grVec3d *posMut = positions.arr;
+  grVec3d *posMut = positions.data();
   for (size_t i = 0; i < vertexCount; i++) {
     double y = posMut[i].y, z = posMut[i].z;
     posMut[i].y = -z;
     posMut[i].z = y;
   }
-  const grVec3d *pos = positions.arr;
+  const grVec3d *pos = positions.data();
 
-  float *outPositions = malloc(sizeof(float) * vertexCount * 3);
-  float *outNormals = malloc(sizeof(float) * vertexCount * 3);
-  uint32_t *outIndices = malloc(sizeof(uint32_t) * indexCount);
-  uint32_t *outFaceIds = malloc(sizeof(uint32_t) * (indexCount / 3));
+  float *outPositions = (float *)malloc(sizeof(float) * vertexCount * 3);
+  float *outNormals = (float *)malloc(sizeof(float) * vertexCount * 3);
+  uint32_t *outIndices = (uint32_t *)malloc(sizeof(uint32_t) * indexCount);
+  uint32_t *outFaceIds =
+      (uint32_t *)malloc(sizeof(uint32_t) * (indexCount / 3));
   if (!outPositions || !outNormals || !outIndices || !outFaceIds) {
     free(outPositions);
     free(outNormals);
     free(outIndices);
     free(outFaceIds);
-    gvizArrayRelease(&positions);
-    gvizArrayRelease(&indices);
-    gvizArrayRelease(&faceIds);
     return -1;
   }
 
@@ -224,10 +211,6 @@ int grObjMeshLoad(const char *path, grObjMesh *out) {
   memcpy(outIndices, idx, sizeof(uint32_t) * indexCount);
   memcpy(outFaceIds, faceIdsArr, sizeof(uint32_t) * (indexCount / 3));
   computeNormals(pos, vertexCount, idx, indexCount, outNormals);
-
-  gvizArrayRelease(&positions);
-  gvizArrayRelease(&indices);
-  gvizArrayRelease(&faceIds);
 
   out->positions = outPositions;
   out->normals = outNormals;

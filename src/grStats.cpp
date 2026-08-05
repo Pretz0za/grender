@@ -1,10 +1,11 @@
 /**
- * Stats overlay: renders the gvizStatSeries recorded on the attached embedded
- * graph as mini line charts stacked in the top-right corner of the window.
+ * Stats overlay: renders the gviz::layout::StatSeries recorded on the
+ * attached embedded graph as mini line charts stacked in the top-right
+ * corner of the window.
  *
  * This file only decides *where pixels go* (layout, autoscaling, text); the
  * data and chart kinds come from the embedder through the public
- * gvizEmbeddedGraphStatSeries* API, and drawing is a single instanced pass
+ * EmbeddedGraph::StatSeries* API, and drawing is a single instanced pass
  * over the grStatsPrim list built here. grRenderer only calls this when a
  * series revision, series count, or viewport layout changes.
  */
@@ -338,7 +339,8 @@ static const char *glyphRows(char c) {
 // ------------------------------------------------------------------------------
 
 static int pushPrim(grRenderer *r, grStatsPrim prim) {
-  return gvizArrayPush(&r->statsPrims, &prim);
+  r->statsPrims.push_back(prim);
+  return 0;
 }
 
 void grOverlayPushRect(grRenderer *r, double x0, double y0, double x1,
@@ -439,11 +441,11 @@ static double mapSampleY(double v, double lo, double hi, bool logScale,
 
 /** Computes the plotted range of @p series. Log charts only consider positive
  *  samples; returns false when nothing is plottable. */
-static bool seriesRange(const gvizStatSeries *series, bool logScale, double *lo,
-                        double *hi) {
+static bool seriesRange(const gviz::layout::StatSeries *series, bool logScale,
+                        double *lo, double *hi) {
   bool any = false;
   double mn = 0.0, mx = 0.0;
-  for (size_t i = 0; i < series->count; i++) {
+  for (size_t i = 0; i < series->samples.size(); i++) {
     double v = series->samples[i];
     if (!isfinite(v) || (logScale && v <= 0.0))
       continue;
@@ -469,7 +471,7 @@ static bool seriesRange(const gvizStatSeries *series, bool logScale, double *lo,
   return true;
 }
 
-static void buildChart(grRenderer *r, const gvizStatSeries *series,
+static void buildChart(grRenderer *r, const gviz::layout::StatSeries *series,
                        size_t paletteIdx, double x0, double y0, double x1,
                        double y1, double s) {
   const uint32_t bgColor = GR_RGBA8(15, 17, 22, 215);
@@ -483,14 +485,14 @@ static void buildChart(grRenderer *r, const gvizStatSeries *series,
   const double fontPx = 1.4 * s;
   const double fontSmallPx = 1.1 * s;
   const double titleH = GR_FONT_ROWS * fontPx + 5.0 * s;
-  const bool logScale = series->kind == GVIZ_STAT_CHART_LINE_LOG;
+  const bool logScale = series->kind == gviz::layout::StatChartKind::LineLog;
 
   grOverlayPushRect(r, x0, y0, x1, y1, bgColor);
 
   char buf[64];
   grOverlayPushText(r, x0 + pad, y0 + pad, fontPx, textColor, series->name);
-  if (series->count > 0) {
-    snprintf(buf, sizeof(buf), "%.4g", series->samples[series->count - 1]);
+  if (!series->samples.empty()) {
+    snprintf(buf, sizeof(buf), "%.4g", series->samples.back());
     grOverlayPushText(r, x1 - pad - grOverlayTextWidth(buf, fontPx), y0 + pad,
                       fontPx, lineColor, buf);
   }
@@ -499,7 +501,7 @@ static void buildChart(grRenderer *r, const gvizStatSeries *series,
   double py0 = y0 + pad + titleH, py1 = y1 - pad;
   grOverlayPushFrame(r, px0, py0, px1, py1, 1.0 * s, frameColor);
 
-  if (series->count == 0)
+  if (series->samples.empty())
     return;
 
   double lo, hi;
@@ -510,7 +512,7 @@ static void buildChart(grRenderer *r, const gvizStatSeries *series,
   double xLeft = px0 + 2.0 * s, xRight = px1 - 2.0 * s;
 
   // One segment per horizontal pixel is enough; stride over dense series.
-  size_t count = series->count;
+  size_t count = series->samples.size();
   size_t maxPoints = (size_t)(xRight - xLeft) + 2;
   size_t stride = count > maxPoints ? (count + maxPoints - 1) / maxPoints : 1;
 
@@ -546,11 +548,11 @@ static void buildChart(grRenderer *r, const gvizStatSeries *series,
 }
 
 void grStatsOverlayBuild(grRenderer *r, double fbw, double fbh) {
-  r->statsPrims.count = 0;
+  r->statsPrims.clear();
   if (!r->graph)
     return;
 
-  size_t total = gvizEmbeddedGraphStatSeriesCount(r->graph);
+  size_t total = r->graph->StatSeriesCount();
   double s = r->contentScale > 0.0 ? r->contentScale : 1.0;
 
   const double margin = 12.0 * s;
@@ -564,7 +566,7 @@ void grStatsOverlayBuild(grRenderer *r, double fbw, double fbh) {
 
   size_t chartIdx = 0;
   for (size_t i = 0; i < total; i++) {
-    const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, i);
+    const gviz::layout::StatSeries *series = r->graph->StatSeriesAt(i);
     if (!series)
       continue;
     if (i < r->statsSeriesVisibleCount && !r->statsSeriesVisible[i])

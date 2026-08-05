@@ -74,9 +74,9 @@ static double glyphWidth(char c, double px) {
 
 /** Appends one buffered display line to @p lines, resetting @p buf/@p bufLen/
  *  @p curW for the next line. */
-static void flushLine(gvizArray *lines, grVertexOverlayLine *buf,
-                      size_t *bufLen, double *curW) {
-  gvizArrayPush(lines, buf);
+static void flushLine(std::vector<grVertexOverlayLine> *lines,
+                      grVertexOverlayLine *buf, size_t *bufLen, double *curW) {
+  lines->push_back(*buf);
   (*buf)[0] = '\0';
   *bufLen = 0;
   *curW = 0.0;
@@ -86,7 +86,7 @@ static void flushLine(gvizArray *lines, grVertexOverlayLine *buf,
  *  pixels at @p fontPx, appending one grVertexOverlayLine per wrapped row to
  *  @p lines. Only breaks mid-word when a single word alone exceeds innerW. */
 static void wordWrapLine(const char *line, double innerW, double fontPx,
-                         gvizArray *lines) {
+                         std::vector<grVertexOverlayLine> *lines) {
   grVertexOverlayLine buf;
   size_t bufLen = 0;
   double curW = 0.0;
@@ -130,14 +130,14 @@ static void wordWrapLine(const char *line, double innerW, double fontPx,
     }
   }
   if (bufLen > 0)
-    gvizArrayPush(lines, &buf);
+    lines->push_back(buf);
 }
 
 void grVertexOverlayComputeLayout(grRenderer *r, double fbw, double fbh,
                                   grVertexOverlayLayout *out) {
   (void)fbw;
   memset(out, 0, sizeof(*out));
-  r->vertexOverlayLines.count = 0;
+  r->vertexOverlayLines.clear();
 
   if (!r->graph || r->pickedVertexId < 0 || !r->vertexLabels ||
       (size_t)r->pickedVertexId >= r->vertexLabelsCount)
@@ -181,7 +181,7 @@ void grVertexOverlayComputeLayout(grRenderer *r, double fbw, double fbh,
   }
 
   double titleH = lineH + 4.0 * s;
-  double contentH = (double)r->vertexOverlayLines.count * lineH;
+  double contentH = (double)r->vertexOverlayLines.size() * lineH;
   double availH = fbh - 2.0 * margin;
   double wantH = pad * 2.0 + titleH + contentH;
   double panelH = wantH < availH ? wantH : availH;
@@ -236,9 +236,9 @@ void grVertexOverlayBuild(grRenderer *r, double fbw, double fbh) {
   if (r->vertexOverlayScrollPx < 0.0)
     r->vertexOverlayScrollPx = 0.0;
 
-  const grVertexOverlayLine *lines = r->vertexOverlayLines.arr;
+  const grVertexOverlayLine *lines = r->vertexOverlayLines.data();
   double ty = L.contentY0 - r->vertexOverlayScrollPx;
-  for (size_t i = 0; i < r->vertexOverlayLines.count; i++, ty += L.lineH)
+  for (size_t i = 0; i < r->vertexOverlayLines.size(); i++, ty += L.lineH)
     grOverlayPushTextClipped(r, L.x0 + pad, ty, fontPx, textColor, lines[i],
                              L.contentY0, L.contentY1);
 

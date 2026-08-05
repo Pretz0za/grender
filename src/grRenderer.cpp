@@ -1,11 +1,6 @@
 #include "grInternal.h"
 #include "grShaders.h"
 
-#include "ds/gvizArray.h"
-#include "ds/gvizGraph.h"
-#include "ds/gvizSubgraph.h"
-#include "embedders/gvizPlanarEmbedder.h"
-
 #include <webgpu/wgpu.h> // wgpu-native extensions (wgpuDevicePoll)
 
 #include <GLFW/glfw3.h>
@@ -16,12 +11,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <new>
+#include <optional>
+#include <utility>
+
 #define GR_LOG(...) fprintf(stderr, "[grender] " __VA_ARGS__)
 
-static void grenderActionPickFace(gvizEmbeddedGraph *eg, void *userData,
-                                  const gvizActionPayload *payload);
-static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
-                                    const gvizActionPayload *payload);
+static void grenderActionPickFace(gviz::layout::EmbeddedGraph &eg,
+                                  void *userData,
+                                  const gviz::layout::ActionPayload &payload);
+static void grenderActionPickVertex(gviz::layout::EmbeddedGraph &eg,
+                                    void *userData,
+                                    const gviz::layout::ActionPayload &payload);
 
 // ------------------------------------------------------------------------------
 // Defaults
@@ -90,11 +91,11 @@ static WGPUBuffer createBuffer(grRenderer *r, size_t size, WGPUBufferUsage usage
     size = 4;
   size = (size + 3) & ~(size_t)3;
   return wgpuDeviceCreateBuffer(r->device,
-                                &(const WGPUBufferDescriptor){
+                                grPtr(WGPUBufferDescriptor{
                                     .label = {label, WGPU_STRLEN},
                                     .size = size,
                                     .usage = usage,
-                                });
+                                }));
 }
 
 static int checkStorageBinding(grRenderer *r, const char *what, size_t bytes) {
@@ -132,14 +133,14 @@ static uint64_t storageBindBytes(grRenderer *r, WGPUBuffer buf) {
 static int createPipelines(grRenderer *r) {
   r->shaderModule = wgpuDeviceCreateShaderModule(
       r->device,
-      &(const WGPUShaderModuleDescriptor){
+      grPtr(WGPUShaderModuleDescriptor{
           .label = {"grender shaders", WGPU_STRLEN},
           .nextInChain =
-              (WGPUChainedStruct *)&(WGPUShaderSourceWGSL){
+              (WGPUChainedStruct *)grPtr(WGPUShaderSourceWGSL{
                   .chain = {.sType = WGPUSType_ShaderSourceWGSL},
                   .code = {GR_WGSL_SOURCE, WGPU_STRLEN},
-              },
-      });
+              }),
+      }));
   if (!r->shaderModule)
     return -1;
 
@@ -158,18 +159,18 @@ static int createPipelines(grRenderer *r) {
   }
 
   r->bindGroupLayout = wgpuDeviceCreateBindGroupLayout(
-      r->device, &(const WGPUBindGroupLayoutDescriptor){
+      r->device, grPtr(WGPUBindGroupLayoutDescriptor{
                      .label = {"grender bgl", WGPU_STRLEN},
                      .entryCount = 10,
                      .entries = entries,
-                 });
+                 }));
   r->pipelineLayout = wgpuDeviceCreatePipelineLayout(
-      r->device, &(const WGPUPipelineLayoutDescriptor){
+      r->device, grPtr(WGPUPipelineLayoutDescriptor{
                      .label = {"grender layout", WGPU_STRLEN},
                      .bindGroupLayoutCount = 1,
                      .bindGroupLayouts =
                          (const WGPUBindGroupLayout[]){r->bindGroupLayout},
-                 });
+                 }));
   if (!r->bindGroupLayout || !r->pipelineLayout)
     return -1;
 
@@ -209,23 +210,23 @@ static int createPipelines(grRenderer *r) {
 
     pipelines[i] = wgpuDeviceCreateRenderPipeline(
         r->device,
-        &(const WGPURenderPipelineDescriptor){
+        grPtr(WGPURenderPipelineDescriptor{
             .label = {labels[i], WGPU_STRLEN},
             .layout = r->pipelineLayout,
             .vertex = {.module = r->shaderModule,
                        .entryPoint = {vsEntries[i], WGPU_STRLEN}},
             .fragment =
-                &(const WGPUFragmentState){
+                grPtr(WGPUFragmentState{
                     .module = r->shaderModule,
                     .entryPoint = {fsEntries[i], WGPU_STRLEN},
                     .targetCount = 1,
                     .targets = &colorTarget,
-                },
+                }),
             .primitive = {.topology = WGPUPrimitiveTopology_TriangleList,
                           .cullMode = WGPUCullMode_None},
             .depthStencil = &depthState,
             .multisample = {.count = 1, .mask = 0xFFFFFFFF},
-        });
+        }));
     if (!pipelines[i])
       return -1;
   }
@@ -244,7 +245,7 @@ static void recreateDepthTexture(grRenderer *r) {
     wgpuTextureRelease(r->depthTexture);
   }
   r->depthTexture = wgpuDeviceCreateTexture(
-      r->device, &(const WGPUTextureDescriptor){
+      r->device, grPtr(WGPUTextureDescriptor{
                      .label = {"grender depth", WGPU_STRLEN},
                      .usage = WGPUTextureUsage_RenderAttachment,
                      .dimension = WGPUTextureDimension_2D,
@@ -252,7 +253,7 @@ static void recreateDepthTexture(grRenderer *r) {
                      .format = WGPUTextureFormat_Depth24Plus,
                      .mipLevelCount = 1,
                      .sampleCount = 1,
-                 });
+                 }));
   r->depthView = wgpuTextureCreateView(r->depthTexture, NULL);
 }
 
@@ -262,14 +263,14 @@ static void recreateDepthTexture(grRenderer *r) {
 
 static void onFramebufferSize(GLFWwindow *window, int width, int height) {
   (void)width, (void)height;
-  grRenderer *r = glfwGetWindowUserPointer(window);
+  grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
   if (r)
     r->surfaceDirty = true;
 }
 
 static void onScroll(GLFWwindow *window, double dx, double dy) {
   (void)dx;
-  grRenderer *r = glfwGetWindowUserPointer(window);
+  grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
   if (r)
     r->scrollAccum += dy;
 }
@@ -277,32 +278,32 @@ static void onScroll(GLFWwindow *window, double dx, double dy) {
 static void onKey(GLFWwindow *window, int key, int scancode, int action,
                   int mods) {
   (void)scancode;
-  grRenderer *r = glfwGetWindowUserPointer(window);
+  grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
   if (!r || (action != GLFW_PRESS && action != GLFW_REPEAT))
     return;
 
   grPendingKey pk = {key, mods};
-  gvizArrayPush(&r->pendingKeys, &pk);
+  r->pendingKeys.push_back(pk);
 
   // Also recorded in the console's own chronologically-ordered queue (see
   // grPendingConsoleEvent) so Enter/Escape/Backspace interleave correctly
   // with typed characters from onChar below; harmless/unused when the
   // console is closed (processInput discards it every such frame).
   grPendingConsoleEvent ce = {.isChar = false, .code = key};
-  gvizArrayPush(&r->pendingConsoleEvents, &ce);
+  r->pendingConsoleEvents.push_back(ce);
 }
 
 static void onChar(GLFWwindow *window, unsigned int codepoint) {
-  grRenderer *r = glfwGetWindowUserPointer(window);
+  grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
   if (!r)
     return;
 
   grPendingConsoleEvent ce = {.isChar = true, .code = (int32_t)codepoint};
-  gvizArrayPush(&r->pendingConsoleEvents, &ce);
+  r->pendingConsoleEvents.push_back(ce);
 }
 
 static void onMouseButton(GLFWwindow *window, int button, int action, int mods) {
-  grRenderer *r = glfwGetWindowUserPointer(window);
+  grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
   if (!r || button < 0 || button > 2)
     return;
 
@@ -326,7 +327,7 @@ static void onMouseButton(GLFWwindow *window, int button, int action, int mods) 
   glfwGetCursorPos(window, &cx, &cy);
 
   grPendingMouse pm = {button, mods, cx * r->contentScale, cy * r->contentScale};
-  gvizArrayPush(&r->pendingMouse, &pm);
+  r->pendingMouse.push_back(pm);
 }
 
 // ------------------------------------------------------------------------------
@@ -340,7 +341,14 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
     descIn = &defaults;
   }
 
-  grRenderer *r = calloc(1, sizeof(grRenderer));
+  // Not calloc: grRenderer now owns real C++ members (std::vector fields,
+  // gviz pointer fields with default member initializers) that need their
+  // constructors to actually run, not a zero-fill over raw bytes. Value
+  // -initializing via `new grRenderer()` gives every field its declared
+  // default (0/false/nullptr for the plain-old-data fields, a properly
+  // constructed empty vector for the std::vector ones) in one step, so the
+  // explicit gvizArrayInit-equivalent calls below are gone entirely (RAII).
+  grRenderer *r = new (std::nothrow) grRenderer();
   if (!r)
     return NULL;
   r->clearColor = descIn->clearColor;
@@ -352,15 +360,6 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   r->pickedVertexId = -1;
   r->listVisible = true;
   r->listSelectedIdx = SIZE_MAX;
-  gvizArrayInit(&r->statsPrims, sizeof(grStatsPrim));
-  gvizArrayInit(&r->vertexOverlayLines, sizeof(grVertexOverlayLine));
-  gvizArrayInit(&r->listFilteredIds, sizeof(uint32_t));
-  gvizArrayInit(&r->statsSeriesRevisions, sizeof(uint64_t));
-  gvizArrayInit(&r->bindings, sizeof(grKeyBinding));
-  gvizArrayInit(&r->mouseBindings, sizeof(grMouseBinding));
-  gvizArrayInit(&r->pendingKeys, sizeof(grPendingKey));
-  gvizArrayInit(&r->pendingMouse, sizeof(grPendingMouse));
-  gvizArrayInit(&r->pendingConsoleEvents, sizeof(grPendingConsoleEvent));
   grCameraInit2D(&r->camera);
 
 #ifdef __APPLE__
@@ -368,7 +367,7 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
 #endif
   if (!glfwInit()) {
     GR_LOG("glfwInit failed\n");
-    free(r);
+    delete r;
     return NULL;
   }
 
@@ -379,7 +378,7 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
                                descIn->title ? descIn->title : "grender", NULL,
                                NULL);
   if (!r->window)
-    goto fail;
+    { grRendererDestroy(r); return NULL; }
 
   glfwSetWindowUserPointer(r->window, r);
   glfwSetFramebufferSizeCallback(r->window, onFramebufferSize);
@@ -390,25 +389,25 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
 
   r->instance = wgpuCreateInstance(NULL);
   if (!r->instance)
-    goto fail;
+    { grRendererDestroy(r); return NULL; }
 
   r->surface = grPlatformCreateSurface(r->instance, r->window);
   if (!r->surface)
-    goto fail;
+    { grRendererDestroy(r); return NULL; }
 
   // wgpu-native services these callbacks synchronously.
   wgpuInstanceRequestAdapter(
       r->instance,
-      &(const WGPURequestAdapterOptions){.compatibleSurface = r->surface},
+      grPtr(WGPURequestAdapterOptions{.compatibleSurface = r->surface}),
       (const WGPURequestAdapterCallbackInfo){.callback = onAdapterRequest,
                                              .userdata1 = &r->adapter});
   if (!r->adapter)
-    goto fail;
+    { grRendererDestroy(r); return NULL; }
 
   WGPULimits adapterLimits = WGPU_LIMITS_INIT;
   if (wgpuAdapterGetLimits(r->adapter, &adapterLimits) != WGPUStatus_Success) {
     GR_LOG("failed to query adapter limits\n");
-    goto fail;
+    { grRendererDestroy(r); return NULL; }
   }
 
   WGPULimits requiredLimits = WGPU_LIMITS_INIT;
@@ -423,15 +422,15 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
 
   wgpuAdapterRequestDevice(
       r->adapter,
-      &(const WGPUDeviceDescriptor){
+      grPtr(WGPUDeviceDescriptor{
           .label = {"grender device", WGPU_STRLEN},
           .requiredLimits = &requiredLimits,
           .uncapturedErrorCallbackInfo = {.callback = onUncapturedError},
-      },
+      }),
       (const WGPURequestDeviceCallbackInfo){.callback = onDeviceRequest,
                                             .userdata1 = &r->device});
   if (!r->device)
-    goto fail;
+    { grRendererDestroy(r); return NULL; }
 
   {
     WGPULimits deviceLimits = WGPU_LIMITS_INIT;
@@ -477,7 +476,7 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
 
   if (createPipelines(r) < 0) {
     GR_LOG("pipeline creation failed\n");
-    goto fail;
+    { grRendererDestroy(r); return NULL; }
   }
 
   r->globalsBuf = createBuffer(r, sizeof(grGlobalsUBO),
@@ -488,9 +487,6 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   r->lastFrameTime = glfwGetTime();
   return r;
 
-fail:
-  grRendererDestroy(r);
-  return NULL;
 }
 
 #define GR_RELEASE(fn, x)                                                      \
@@ -538,17 +534,8 @@ void grRendererDestroy(grRenderer *r) {
   free(r->nodeSizesStaging);
   free(r->nodeColorsStaging);
   free(r->edgeColorsStaging);
-  gvizArrayRelease(&r->statsPrims);
-  gvizArrayRelease(&r->vertexOverlayLines);
-  gvizArrayRelease(&r->listFilteredIds);
-  gvizArrayRelease(&r->statsSeriesRevisions);
   free(r->statsSeriesVisible);
-  gvizArrayRelease(&r->bindings);
-  gvizArrayRelease(&r->mouseBindings);
-  gvizArrayRelease(&r->pendingKeys);
-  gvizArrayRelease(&r->pendingMouse);
-  gvizArrayRelease(&r->pendingConsoleEvents);
-  free(r);
+  delete r; // matches grRendererCreate's `new`; runs every member's destructor
 }
 
 // ------------------------------------------------------------------------------
@@ -563,11 +550,11 @@ static void statsVisibilitySync(grRenderer *r) {
   if (!r->graph)
     return;
 
-  size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
+  size_t n = r->graph->StatSeriesCount();
   if (n == 0)
     return;
 
-  r->statsSeriesVisible = calloc(n, sizeof(bool));
+  r->statsSeriesVisible = (bool *)calloc(n, sizeof(bool));
   if (!r->statsSeriesVisible)
     return;
   for (size_t i = 0; i < n; i++)
@@ -578,7 +565,7 @@ static void statsVisibilitySync(grRenderer *r) {
 static void statsMenuSyncIfNeeded(grRenderer *r) {
   if (!r->graph)
     return;
-  size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
+  size_t n = r->graph->StatSeriesCount();
   if (n == r->statsMenuSeriesCount)
     return;
   if (n != r->statsSeriesVisibleCount)
@@ -590,13 +577,13 @@ static void statsMenuSyncIfNeeded(grRenderer *r) {
 size_t grRendererStatSeriesCount(const grRenderer *r) {
   if (!r || !r->graph)
     return 0;
-  return gvizEmbeddedGraphStatSeriesCount(r->graph);
+  return r->graph->StatSeriesCount();
 }
 
 const char *grRendererStatSeriesName(const grRenderer *r, size_t idx) {
   if (!r || !r->graph)
     return NULL;
-  const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, idx);
+  const gviz::layout::StatSeries *series = r->graph->StatSeriesAt(idx);
   return series ? series->name : NULL;
 }
 
@@ -622,7 +609,7 @@ void grRendererShowStats(grRenderer *r, bool show) {
   if (show)
     r->statsOverlayDirty = true;
   else
-    r->statsPrims.count = 0;
+    r->statsPrims.clear();
   grPlatformStatsMenuRefresh(r);
 }
 
@@ -664,15 +651,15 @@ static uint32_t colorToRgba8(const grColor *c);
 
 /** (Re)creates position-indexed buffers when the vertex capacity changes. */
 static int ensurePositionBuffers(grRenderer *r) {
-  size_t count = gvizEmbeddedGraphPositionCount(r->graph);
-  size_t srcDim = gvizEmbeddedGraphDim(r->graph);
+  size_t count = r->graph->PositionCount();
+  size_t srcDim = r->graph->Dim();
   size_t renderDim = srcDim == 4 ? 3 : srcDim;
   if (count == r->posCapacity && srcDim == r->srcDim && renderDim == r->posDim &&
       r->positionsBuf)
     return 0;
 
   free(r->posStaging);
-  r->posStaging = malloc(sizeof(float) * count * renderDim);
+  r->posStaging = (float *)malloc(sizeof(float) * count * renderDim);
   if (!r->posStaging)
     return -1;
 
@@ -697,7 +684,7 @@ static int ensurePositionBuffers(grRenderer *r) {
   // real values -- so a growth commit never blanks every vertex's size for
   // a frame. Client base node colors get the same treatment below.
   if (r->hasNodeSizes && r->nodeSizesStaging) {
-    float *grown = realloc(r->nodeSizesStaging, sizeof(float) * count);
+    float *grown = (float *)realloc(r->nodeSizesStaging, sizeof(float) * count);
     if (grown) {
       for (size_t i = r->nodeSizesStagingCount; i < count; i++)
         grown[i] = r->nodeStyle.radius;
@@ -722,7 +709,8 @@ static int ensurePositionBuffers(grRenderer *r) {
   // applyColorLayers (colorsDirty) regardless, since it must reflect the
   // new capacity either way.
   if (r->hasClientNodeColors && r->nodeColorsStaging) {
-    uint32_t *grown = realloc(r->nodeColorsStaging, sizeof(uint32_t) * count);
+    uint32_t *grown =
+        (uint32_t *)realloc(r->nodeColorsStaging, sizeof(uint32_t) * count);
     if (grown) {
       uint32_t baseNode = colorToRgba8(&r->nodeStyle.fillColor);
       for (size_t i = r->nodeColorsStagingCount; i < count; i++)
@@ -751,11 +739,11 @@ static int ensurePositionBuffers(grRenderer *r) {
 /* Degree of raw vertex @p v as the drawn structure defines it: the
  * embedding's synced out+in rows when a snapshot exists (matching exactly
  * what grTopologyExtract drew), the live subgraph otherwise. */
-static uint32_t topoVertexDegree(gvizEmbeddedGraph *graph, size_t v) {
-  size_t count;
-  if (gvizEmbeddedGraphOutNeighbors(graph, v, &count))
-    return (uint32_t)(count + gvizEmbeddedGraphInDegree(graph, v));
-  return (uint32_t)gvizSubgraphDegree(gvizEmbeddedGraphStructure(graph), v);
+static uint32_t topoVertexDegree(gviz::layout::EmbeddedGraph &graph, size_t v) {
+  std::span<const size_t> outNbrs = graph.OutNeighbors(v);
+  if (!outNbrs.empty())
+    return (uint32_t)(outNbrs.size() + graph.InDegree(v));
+  return (uint32_t)graph.Structure().Degree(v);
 }
 
 /* Recomputes and re-uploads the per-vertex degrees the edge shader's
@@ -765,12 +753,12 @@ static uint32_t topoVertexDegree(gvizEmbeddedGraph *graph, size_t v) {
 static int refreshNodeDegrees(grRenderer *r) {
   if (r->posCapacity == 0)
     return 0;
-  uint32_t *degrees = calloc(r->posCapacity, sizeof(uint32_t));
+  uint32_t *degrees = (uint32_t *)calloc(r->posCapacity, sizeof(uint32_t));
   if (!degrees)
     return -1;
   for (size_t i = 0; i < r->topo.nodeCount; i++) {
     uint32_t v = r->topo.nodeIds[i];
-    degrees[v] = topoVertexDegree(r->graph, v);
+    degrees[v] = topoVertexDegree(*r->graph, v);
   }
   int res = grRendererSetNodeDegrees(r, degrees, r->posCapacity);
   free(degrees);
@@ -784,14 +772,18 @@ static int refreshEdgeWeights(grRenderer *r) {
   size_t edgeCount = r->topo.edgeCount;
   if (edgeCount == 0)
     return grRendererSetEdgeWeights(r, NULL, 0);
-  float *weights = malloc(sizeof(float) * edgeCount);
+  float *weights = (float *)malloc(sizeof(float) * edgeCount);
   if (!weights)
     return -1;
-  const gvizGraph *g = gvizEmbeddedGraphStructure(r->graph)->g;
+  // gviz::Subgraph deliberately never exposes its parent graph, so real
+  // weights need r->backingGraph (see grRendererSetGraph); with none
+  // attached every edge just reports the default weight of 1.0, same as an
+  // edge whose weight was never explicitly set.
+  gviz::Graph *g = r->backingGraph;
   for (size_t i = 0; i < edgeCount; i++) {
     double w = 1.0;
-    gvizGraphGetEdgeWeight(g, r->topo.edges[2 * i], r->topo.edges[2 * i + 1],
-                           &w);
+    if (g)
+      g->GetEdgeWeight(r->topo.edges[2 * i], r->topo.edges[2 * i + 1], w);
     weights[i] = (float)w;
   }
   int res = grRendererSetEdgeWeights(r, weights, edgeCount);
@@ -801,7 +793,7 @@ static int refreshEdgeWeights(grRenderer *r) {
 
 /** Uploads topology-derived buffers (node id remap + edge endpoint pairs). */
 static int uploadTopology(grRenderer *r) {
-  if (grTopologyExtract(&r->topo, r->graph) < 0)
+  if (grTopologyExtract(&r->topo, *r->graph) < 0)
     return -1;
 
   size_t nodeBytes = sizeof(uint32_t) * (r->topo.nodeCount ? r->topo.nodeCount : 1);
@@ -920,28 +912,28 @@ static int rebuildBindGroup(grRenderer *r) {
     }
   }
   r->bindGroup = wgpuDeviceCreateBindGroup(
-      r->device, &(const WGPUBindGroupDescriptor){
+      r->device, grPtr(WGPUBindGroupDescriptor{
                      .label = {"grender bind group", WGPU_STRLEN},
                      .layout = r->bindGroupLayout,
                      .entryCount = 10,
                      .entries = entries,
-                 });
+                 }));
   r->bindGroupDirty = false;
   return r->bindGroup ? 0 : -1;
 }
 
-int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
-  size_t dim = gvizEmbeddedGraphDim(graph);
+int grRendererSetGraph(grRenderer *r, gviz::layout::EmbeddedGraph &graph,
+                       gviz::Graph *backingGraph) {
+  size_t dim = graph.Dim();
   if (dim != 2 && dim != 3 && dim != 4) {
     GR_LOG("unsupported embedding dimension %zu (only 2, 3, and 4)\n", dim);
     return -1;
   }
 
-  r->graph = graph;
-  gvizEmbeddedGraphAddAction(graph, GR_ACTION_PICK_FACE, grenderActionPickFace,
-                             r);
-  gvizEmbeddedGraphAddAction(graph, GR_ACTION_PICK_VERTEX,
-                             grenderActionPickVertex, r);
+  r->graph = &graph;
+  r->backingGraph = backingGraph;
+  graph.AddAction(GR_ACTION_PICK_FACE, grenderActionPickFace, r);
+  graph.AddAction(GR_ACTION_PICK_VERTEX, grenderActionPickVertex, r);
   r->highlightActive = false;
   r->colorsDirty = false;
   r->pickedVertexId = -1;
@@ -961,13 +953,13 @@ int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph) {
   if (ensurePositionBuffers(r) < 0 || uploadTopology(r) < 0)
     return -1;
   r->topoDirty = false;
-  r->drawMaskRevision = gvizEmbeddedGraphDrawMaskRevision(graph);
-  r->statsSeriesRevisions.count = 0;
+  r->drawMaskRevision = graph.DrawMaskRevision();
+  r->statsSeriesRevisions.clear();
   r->statsOverlayDirty = true;
-  r->statsPrims.count = 0;
+  r->statsPrims.clear();
   r->pcaBasisValid = false;
   statsVisibilitySync(r);
-  r->statsMenuSeriesCount = gvizEmbeddedGraphStatSeriesCount(graph);
+  r->statsMenuSeriesCount = graph.StatSeriesCount();
   grPlatformStatsMenuRefresh(r);
   r->fitRequested = true;
   return 0;
@@ -1057,7 +1049,7 @@ int grRendererSetNodeColors(grRenderer *r, const uint32_t *rgba8,
     return 0;
   }
 
-  uint32_t *staging = malloc(count * sizeof(uint32_t));
+  uint32_t *staging = (uint32_t *)malloc(count * sizeof(uint32_t));
   if (!staging)
     return -1;
   memcpy(staging, rgba8, count * sizeof(uint32_t));
@@ -1085,7 +1077,7 @@ int grRendererSetNodeSizes(grRenderer *r, const float *radii, size_t count) {
     return 0;
   }
 
-  float *staging = realloc(r->nodeSizesStaging, count * sizeof(float));
+  float *staging = (float *)realloc(r->nodeSizesStaging, count * sizeof(float));
   if (!staging) {
     // GPU upload already succeeded; hit-testing just falls back to the
     // global node style radius until the next successful call.
@@ -1151,7 +1143,7 @@ int grRendererSetEdgeColors(grRenderer *r, const uint32_t *rgba8,
     return 0;
   }
 
-  uint32_t *staging = malloc(count * sizeof(uint32_t));
+  uint32_t *staging = (uint32_t *)malloc(count * sizeof(uint32_t));
   if (!staging)
     return -1;
   memcpy(staging, rgba8, count * sizeof(uint32_t));
@@ -1198,44 +1190,50 @@ size_t grRendererGetEdges(const grRenderer *r, uint32_t *out) {
 // ------------------------------------------------------------------------------
 
 int grRendererBindKey(grRenderer *r, int key, const char *actionName) {
-  grKeyBinding *bindings = r->bindings.arr;
-  for (size_t i = 0; i < r->bindings.count; i++) {
-    if (bindings[i].key == key) {
-      bindings[i].actionName = actionName;
+  for (grKeyBinding &b : r->bindings) {
+    if (b.key == key) {
+      b.actionName = actionName;
       return 0;
     }
   }
-  grKeyBinding kb = {key, actionName};
-  return gvizArrayPush(&r->bindings, &kb);
+  try {
+    r->bindings.push_back({key, actionName});
+  } catch (const std::bad_alloc &) {
+    return -1;
+  }
+  return 0;
 }
 
 void grRendererUnbindKey(grRenderer *r, int key) {
-  grKeyBinding *bindings = r->bindings.arr;
-  for (size_t i = 0; i < r->bindings.count; i++) {
-    if (bindings[i].key == key) {
-      gvizArraySwapDelete(&r->bindings, i);
+  for (size_t i = 0; i < r->bindings.size(); i++) {
+    if (r->bindings[i].key == key) {
+      r->bindings[i] = std::move(r->bindings.back());
+      r->bindings.pop_back();
       return;
     }
   }
 }
 
 int grRendererBindMouse(grRenderer *r, int button, const char *actionName) {
-  grMouseBinding *mouseBindings = r->mouseBindings.arr;
-  for (size_t i = 0; i < r->mouseBindings.count; i++) {
-    if (mouseBindings[i].button == button) {
-      mouseBindings[i].actionName = actionName;
+  for (grMouseBinding &b : r->mouseBindings) {
+    if (b.button == button) {
+      b.actionName = actionName;
       return 0;
     }
   }
-  grMouseBinding mb = {button, actionName};
-  return gvizArrayPush(&r->mouseBindings, &mb);
+  try {
+    r->mouseBindings.push_back({button, actionName});
+  } catch (const std::bad_alloc &) {
+    return -1;
+  }
+  return 0;
 }
 
 void grRendererUnbindMouse(grRenderer *r, int button) {
-  grMouseBinding *mouseBindings = r->mouseBindings.arr;
-  for (size_t i = 0; i < r->mouseBindings.count; i++) {
-    if (mouseBindings[i].button == button) {
-      gvizArraySwapDelete(&r->mouseBindings, i);
+  for (size_t i = 0; i < r->mouseBindings.size(); i++) {
+    if (r->mouseBindings[i].button == button) {
+      r->mouseBindings[i] = std::move(r->mouseBindings.back());
+      r->mouseBindings.pop_back();
       return;
     }
   }
@@ -1253,41 +1251,43 @@ static void grHighlightReset(grRenderer *r) {
   r->colorsDirty = true; // recompute nodeColorsBuf/edgeColorsBuf without it
 }
 
-static gvizSubgraph grHighlightCopySubgraph(const gvizSubgraph *src) {
-  gvizSubgraph dst = {0};
-  if (!src || !src->g)
-    return dst;
+/**
+ * Deep-copies @p src into a fresh full subgraph over @p backingGraph.
+ * gviz::Subgraph has no default/null state (it always references a real
+ * parent Graph), so a copy that might not happen -- @p backingGraph is NULL,
+ * or an internal gviz call throws -- is expressed as std::nullopt rather
+ * than the old C code's zeroed `gvizSubgraph{0}` sentinel.
+ */
+static std::optional<gviz::Subgraph>
+grHighlightCopySubgraph(const gviz::Subgraph &src, gviz::Graph *backingGraph) {
+  if (!backingGraph)
+    return std::nullopt;
 
-  /* Pick/highlight subgraphs are full subgraphs whose edge bitsets are
-   * addressed by the graph's shared layout; refresh it on demand (an O(1)
-   * no-op unless the graph mutated) so highlighting keeps working on
-   * graphs that grow between clicks. The persisted highlight this copy
-   * replaces was written under the previous layout, but it's swapped out
-   * before anything reads it under the rebuilt one. */
-  if (gvizGraphEnsureLayout((gvizGraph *)src->g) < 0)
-    return dst;
+  try {
+    /* Pick/highlight subgraphs are full subgraphs whose edge bitsets are
+     * addressed by the graph's shared layout; refresh it on demand (an O(1)
+     * no-op unless the graph mutated) so highlighting keeps working on
+     * graphs that grew between clicks. The persisted highlight this copy
+     * replaces was written under the previous layout, but it's swapped out
+     * before anything reads it under the rebuilt one. */
+    backingGraph->EnsureLayout();
 
-  dst = gvizSubgraphCreateEmpty(src->g);
-  if (!dst.g)
-    return dst;
+    gviz::Subgraph dst = gviz::Subgraph::CreateEmpty(*backingGraph);
 
-  gvizSubgraphVertexIterator vit = gvizSubgraphVertexIteratorCreate(src);
-  size_t u;
-  while (gvizSubgraphVertexIterate(&vit, &u))
-    gvizSubgraphShowVertex(&dst, u);
+    for (size_t u : src)
+      dst.ShowVertex(u);
 
-  vit = gvizSubgraphVertexIteratorCreate(src);
-  while (gvizSubgraphVertexIterate(&vit, &u)) {
-    gvizSubgraphNeighborIterator nit =
-        gvizSubgraphNeighborIteratorCreate(src, u);
-    size_t v;
-    while (gvizSubgraphNeighborIterate(&nit, &v)) {
-      if (gvizSubgraphHasEdge(src, u, v))
-        gvizSubgraphShowEdge(&dst, u, v);
+    for (size_t u : src) {
+      for (size_t v : src.Neighbors(u)) {
+        if (src.HasEdge(u, v))
+          dst.ShowEdge(u, v);
+      }
     }
+    dst.Rebuild();
+    return dst;
+  } catch (const std::exception &) {
+    return std::nullopt;
   }
-  gvizSubgraphRebuild(&dst);
-  return dst;
 }
 
 /**
@@ -1300,13 +1300,13 @@ static gvizSubgraph grHighlightCopySubgraph(const gvizSubgraph *src) {
  * while the highlight may have stored the same edge from either endpoint, so
  * both directions must be checked there.
  */
-static int highlightHasEdge(const gvizSubgraph *sg, size_t u, size_t v,
+static int highlightHasEdge(const gviz::Subgraph *sg, size_t u, size_t v,
                             bool directed) {
-  if (gvizSubgraphHasEdge(sg, u, v))
+  if (sg->HasEdge(u, v))
     return 1;
   if (directed || u == v)
     return 0;
-  return gvizSubgraphHasEdge(sg, v, u);
+  return sg->HasEdge(v, u);
 }
 
 /**
@@ -1329,10 +1329,9 @@ static void applyColorLayers(grRenderer *r) {
   if (!r->graph || !r->colorsDirty)
     return;
 
-  bool highlightOn =
-      r->highlightActive && gvizEmbeddedGraphHasHighlight(r->graph);
-  const gvizSubgraph *highlight =
-      highlightOn ? gvizEmbeddedGraphGetHighlight(r->graph) : NULL;
+  bool highlightOn = r->highlightActive && r->graph->HasHighlight();
+  const gviz::Subgraph *highlight =
+      highlightOn ? r->graph->GetHighlight() : NULL;
 
   // ---- nodes ----
   size_t nodeCount = r->posCapacity;
@@ -1351,7 +1350,7 @@ static void applyColorLayers(grRenderer *r) {
       uploadAttribute(r, &r->nodeColorsBuf, NULL, 0, &r->hasNodeColors,
                       "grender node colors");
   } else {
-    uint32_t *nodeColors = calloc(nodeCount, sizeof(uint32_t));
+    uint32_t *nodeColors = (uint32_t *)calloc(nodeCount, sizeof(uint32_t));
     if (!nodeColors)
       return;
 
@@ -1359,10 +1358,7 @@ static void applyColorLayers(grRenderer *r) {
     for (size_t i = 0; i < nodeCount; i++)
       nodeColors[i] = haveNodeBase ? r->nodeColorsStaging[i] : baseNode;
 
-    size_t u;
-    gvizSubgraphVertexIterator vit =
-        gvizSubgraphVertexIteratorCreate(highlight);
-    while (gvizSubgraphVertexIterate(&vit, &u)) {
+    for (size_t u : *highlight) {
       if (r->highlightNodeRgba)
         nodeColors[u] = r->highlightNodeRgba;
     }
@@ -1395,7 +1391,7 @@ static void applyColorLayers(grRenderer *r) {
     return;
   }
 
-  uint32_t *edgeColors = calloc(edgeCount, sizeof(uint32_t));
+  uint32_t *edgeColors = (uint32_t *)calloc(edgeCount, sizeof(uint32_t));
   if (!edgeColors)
     return;
 
@@ -1430,20 +1426,21 @@ static void applyColorLayers(grRenderer *r) {
  * whose u is always the true source since it walks only u's own
  * out-neighbors).
  */
-static void highlightShowBoundaryEdge(gvizSubgraph *sg, size_t u, size_t v) {
-  gvizSubgraphShowEdge(sg, u, v);
+static void highlightShowBoundaryEdge(gviz::Subgraph &sg, size_t u, size_t v) {
+  sg.ShowEdge(u, v);
 }
 
-int grRendererSetHighlight(grRenderer *r, const gvizSubgraph *highlight,
+int grRendererSetHighlight(grRenderer *r, const gviz::Subgraph &highlight,
                            uint32_t nodeRgba, uint32_t edgeRgba) {
-  if (!r || !r->graph || !highlight)
+  if (!r || !r->graph)
     return -1;
 
-  gvizSubgraph copy = grHighlightCopySubgraph(highlight);
-  if (!copy.g)
+  std::optional<gviz::Subgraph> copy =
+      grHighlightCopySubgraph(highlight, r->backingGraph);
+  if (!copy)
     return -1;
 
-  gvizEmbeddedGraphSetHighlight(r->graph, copy);
+  r->graph->SetHighlight(std::move(*copy));
   r->highlightActive = true;
   r->highlightNodeRgba = nodeRgba;
   r->highlightEdgeRgba = edgeRgba;
@@ -1456,31 +1453,30 @@ int grRendererSetHighlight(grRenderer *r, const gvizSubgraph *highlight,
 int grRendererSetHighlightCycle(grRenderer *r, const size_t *vertices,
                                 size_t count, uint32_t nodeRgba,
                                 uint32_t edgeRgba) {
-  if (!r || !r->graph || !vertices || count < 3)
+  if (!r || !r->graph || !r->backingGraph || !vertices || count < 3)
     return -1;
 
-  const gvizGraph *g = gvizEmbeddedGraphStructure(r->graph)->g;
-  if (gvizGraphEnsureLayout((gvizGraph *)g) < 0)
-    return -1;
-  gvizSubgraph cycle = gvizSubgraphCreateEmpty(g);
-  if (!cycle.g)
-    return -1;
+  try {
+    r->backingGraph->EnsureLayout();
+    gviz::Subgraph cycle = gviz::Subgraph::CreateEmpty(*r->backingGraph);
 
-  for (size_t i = 0; i < count; i++)
-    gvizSubgraphShowVertex(&cycle, vertices[i]);
-  for (size_t i = 0; i < count; i++)
-    highlightShowBoundaryEdge(&cycle, vertices[i], vertices[(i + 1) % count]);
+    for (size_t i = 0; i < count; i++)
+      cycle.ShowVertex(vertices[i]);
+    for (size_t i = 0; i < count; i++)
+      highlightShowBoundaryEdge(cycle, vertices[i], vertices[(i + 1) % count]);
+    cycle.Rebuild();
 
-  int res = grRendererSetHighlight(r, &cycle, nodeRgba, edgeRgba);
-  gvizSubgraphRelease(&cycle);
-  return res;
+    return grRendererSetHighlight(r, cycle, nodeRgba, edgeRgba);
+  } catch (const std::exception &) {
+    return -1;
+  }
 }
 
 void grRendererClearHighlight(grRenderer *r) {
   if (!r)
     return;
   if (r->graph)
-    gvizEmbeddedGraphClearHighlight(r->graph);
+    r->graph->ClearHighlight();
   // grHighlightReset marks colorsDirty so applyColorLayers repaints
   // nodeColorsBuf/edgeColorsBuf from the client base layer alone (or the
   // global style, if none was set) -- it must NOT touch the client's base
@@ -1491,22 +1487,22 @@ void grRendererClearHighlight(grRenderer *r) {
   r->listOverlayDirty = true;
 }
 
-static void grenderActionPickFace(gvizEmbeddedGraph *eg, void *userData,
-                                  const gvizActionPayload *payload) {
-  grRenderer *r = userData;
-  if (!r || !payload)
+static void grenderActionPickFace(gviz::layout::EmbeddedGraph &eg,
+                                  void *userData,
+                                  const gviz::layout::ActionPayload &payload) {
+  grRenderer *r = (grRenderer *)userData;
+  if (!r || !r->backingGraph)
     return;
 
-  gvizSubgraph face = {0};
-  if (gvizPlanarFaceSubgraphAt(eg, payload->worldX, payload->worldY,
-                               &face) != 0) {
+  std::optional<gviz::Subgraph> face = gviz::layout::FaceSubgraphAt(
+      *r->backingGraph, eg, payload.worldX, payload.worldY);
+  if (!face) {
     grRendererClearHighlight(r);
     return;
   }
 
-  grRendererSetHighlight(r, &face, GR_RGBA8(255, 210, 80, 255),
+  grRendererSetHighlight(r, *face, GR_RGBA8(255, 210, 80, 255),
                          GR_RGBA8(255, 180, 40, 255));
-  gvizSubgraphRelease(&face);
 }
 
 /**
@@ -1558,11 +1554,11 @@ static double grHitTestVertexEpsilon(grRenderer *r, uint32_t v, double x,
  * "clicked". Returns false (leaving *outVertex untouched) when no vertex's
  * circle contains the click.
  */
-static bool grHitTestVertex(grRenderer *r, gvizEmbeddedGraph *eg,
+static bool grHitTestVertex(grRenderer *r, gviz::layout::EmbeddedGraph &eg,
                             double worldX, double worldY,
                             size_t *outVertex) {
-  size_t dim = gvizEmbeddedGraphDim(eg);
-  const double *pos = gvizEmbeddedGraphPositions(eg);
+  size_t dim = eg.Dim();
+  const double *pos = eg.Positions().data();
 
   size_t best = SIZE_MAX;
   double bestRatio2 = 0.0;
@@ -1591,14 +1587,15 @@ static bool grHitTestVertex(grRenderer *r, gvizEmbeddedGraph *eg,
   return true;
 }
 
-static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
-                                    const gvizActionPayload *payload) {
-  grRenderer *r = userData;
-  if (!r || !payload || r->topo.nodeCount == 0)
+static void grenderActionPickVertex(gviz::layout::EmbeddedGraph &eg,
+                                    void *userData,
+                                    const gviz::layout::ActionPayload &payload) {
+  grRenderer *r = (grRenderer *)userData;
+  if (!r || r->topo.nodeCount == 0)
     return;
 
   size_t nearest;
-  if (!grHitTestVertex(r, eg, payload->worldX, payload->worldY, &nearest)) {
+  if (!grHitTestVertex(r, eg, payload.worldX, payload.worldY, &nearest)) {
     grRendererClearHighlight(r);
     if (r->pickedVertexId != -1) {
       r->pickedVertexId = -1;
@@ -1613,59 +1610,58 @@ static void grenderActionPickVertex(gvizEmbeddedGraph *eg, void *userData,
     r->vertexOverlayDirty = true;
   }
 
-  const gvizSubgraph *structure = gvizEmbeddedGraphStructure(eg);
-  /* See grHighlightCopySubgraph: refresh the shared layout on demand so the
-   * full-subgraph pick works on graphs that grew since the last click. */
-  if (gvizGraphEnsureLayout((gvizGraph *)structure->g) < 0)
-    return;
-  gvizSubgraph pick = gvizSubgraphCreateEmpty(structure->g);
-  if (!pick.g)
+  // The highlight below needs raw parent-graph access (EnsureLayout, and the
+  // fallback neighbor iteration) that gviz::Subgraph deliberately never
+  // exposes -- see grRendererSetGraph's doc comment. Without a backingGraph,
+  // the picked-vertex state above still updates (so the vertex-info panel
+  // still works), but no highlight is drawn.
+  if (!r->backingGraph)
     return;
 
-  gvizSubgraphShowVertex(&pick, nearest);
+  gviz::Subgraph &structure = eg.Structure();
+  try {
+    r->backingGraph->EnsureLayout();
+    gviz::Subgraph pick = gviz::Subgraph::CreateEmpty(*r->backingGraph);
 
-  // Shift-click flips the highlight to in-edges (nearest's predecessors)
-  // instead of the default out-edges, for directed graphs only -- shift is
-  // a no-op on undirected graphs, where every edge already appears both
-  // ways in the out rows. Both branches read the embedding's SYNCED
-  // adjacency snapshot (gvizEmbeddedGraphOutNeighbors/InNeighbors), the
-  // same structure grTopologyExtract draws edges from, so the highlight can
-  // never include an edge that isn't on screen. Embeddings that never
-  // synced have no snapshot (the accessors return NULL); there the live
-  // subgraph is the committed structure and out-edges fall back to neighbor
-  // iteration, while in-edges have no source at all and shift-click
-  // degrades to highlighting just the vertex.
-  if (gvizGraphIsDirected(structure->g) && (payload->iarg & GR_MOD_SHIFT) != 0) {
-    size_t inCount;
-    const size_t *inNbrs = gvizEmbeddedGraphInNeighbors(eg, nearest, &inCount);
-    for (size_t idx = 0; idx < inCount; idx++) {
-      size_t u = inNbrs[idx];
-      gvizSubgraphShowVertex(&pick, u);
-      highlightShowBoundaryEdge(&pick, u, nearest); // edge is u -> nearest
-    }
-  } else {
-    size_t outCount;
-    const size_t *outNbrs = gvizEmbeddedGraphOutNeighbors(eg, nearest, &outCount);
-    if (outNbrs) {
-      for (size_t idx = 0; idx < outCount; idx++) {
-        gvizSubgraphShowVertex(&pick, outNbrs[idx]);
-        highlightShowBoundaryEdge(&pick, nearest, outNbrs[idx]);
+    pick.ShowVertex(nearest);
+
+    // Shift-click flips the highlight to in-edges (nearest's predecessors)
+    // instead of the default out-edges, for directed graphs only -- shift is
+    // a no-op on undirected graphs, where every edge already appears both
+    // ways in the out rows. Both branches read the embedding's SYNCED
+    // adjacency snapshot (EmbeddedGraph::OutNeighbors/InNeighbors), the same
+    // structure grTopologyExtract draws edges from, so the highlight can
+    // never include an edge that isn't on screen. Embeddings that never
+    // synced have no snapshot (the accessors return an empty span); there
+    // the live subgraph is the committed structure and out-edges fall back
+    // to neighbor iteration, while in-edges have no source at all and
+    // shift-click degrades to highlighting just the vertex.
+    if (structure.ParentIsDirected() && (payload.iarg & GR_MOD_SHIFT) != 0) {
+      for (size_t u : eg.InNeighbors(nearest)) {
+        pick.ShowVertex(u);
+        highlightShowBoundaryEdge(pick, u, nearest); // edge is u -> nearest
       }
     } else {
-      gvizSubgraphNeighborIterator nit =
-          gvizSubgraphNeighborIteratorCreate(structure, nearest);
-      size_t v;
-      while (gvizSubgraphNeighborIterate(&nit, &v)) {
-        gvizSubgraphShowVertex(&pick, v);
-        highlightShowBoundaryEdge(&pick, nearest, v);
+      std::span<const size_t> outNbrs = eg.OutNeighbors(nearest);
+      if (!outNbrs.empty()) {
+        for (size_t v : outNbrs) {
+          pick.ShowVertex(v);
+          highlightShowBoundaryEdge(pick, nearest, v);
+        }
+      } else {
+        for (size_t v : structure.Neighbors(nearest)) {
+          pick.ShowVertex(v);
+          highlightShowBoundaryEdge(pick, nearest, v);
+        }
       }
     }
-  }
-  gvizSubgraphRebuild(&pick);
+    pick.Rebuild();
 
-  grRendererSetHighlight(r, &pick, GR_RGBA8(255, 210, 80, 255),
-                         GR_RGBA8(255, 180, 40, 255));
-  gvizSubgraphRelease(&pick);
+    grRendererSetHighlight(r, pick, GR_RGBA8(255, 210, 80, 255),
+                           GR_RGBA8(255, 180, 40, 255));
+  } catch (const std::exception &) {
+    // Best-effort highlight; the picked-vertex state above already landed.
+  }
 }
 
 void grRendererFitView(grRenderer *r) { r->fitRequested = true; }
@@ -1688,7 +1684,7 @@ static bool computeVisibleBoundingBox(grRenderer *r, double bmin[3],
   if (!r->graph || r->topo.nodeCount == 0)
     return false;
 
-  const double *pos = gvizEmbeddedGraphPositions(r->graph);
+  const double *pos = r->graph->Positions().data();
   size_t srcDim = r->srcDim;
   bmin[0] = INFINITY, bmin[1] = INFINITY, bmin[2] = 0.0;
   bmax[0] = -INFINITY, bmax[1] = -INFINITY, bmax[2] = 0.0;
@@ -1696,7 +1692,7 @@ static bool computeVisibleBoundingBox(grRenderer *r, double bmin[3],
     bmin[2] = INFINITY, bmax[2] = -INFINITY;
 
   if (srcDim == 4) {
-    float *proj = malloc(sizeof(float) * r->posCapacity * 3);
+    float *proj = (float *)malloc(sizeof(float) * r->posCapacity * 3);
     if (!proj)
       return false;
     if (grPCAProjectTo3(pos, r->posCapacity, srcDim, proj, r->pcaBasis,
@@ -1795,8 +1791,8 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   // current intent.
   if (r->consoleOpen) {
     grConsoleProcessInput(r);
-    r->pendingKeys.count = 0; // don't replay this frame's keys as actions
-    r->pendingMouse.count = 0;
+    r->pendingKeys.clear(); // don't replay this frame's keys as actions
+    r->pendingMouse.clear();
     r->draggingPan = false;
     r->draggingOrbit = false;
     grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
@@ -1809,7 +1805,7 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   if (r->listSearchFocused)
     grListSearchProcessInput(r);
   else
-    r->pendingConsoleEvents.count = 0;
+    r->pendingConsoleEvents.clear();
 
   double cx, cy;
   glfwGetCursorPos(r->window, &cx, &cy);
@@ -1923,14 +1919,14 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   // navigation is the one exception: arrow keys never appear in typed text,
   // so they stay live even while the search box is focused.
   {
-    const grPendingKey *pendingKeys = r->pendingKeys.arr;
-    const grKeyBinding *bindings = r->bindings.arr;
-    for (size_t k = 0; k < r->pendingKeys.count; k++) {
+    const grPendingKey *pendingKeys = r->pendingKeys.data();
+    const grKeyBinding *bindings = r->bindings.data();
+    for (size_t k = 0; k < r->pendingKeys.size(); k++) {
       int key = pendingKeys[k].key;
       int mods = pendingKeys[k].mods;
 
       const char *actionName = NULL;
-      for (size_t i = 0; i < r->bindings.count; i++) {
+      for (size_t i = 0; i < r->bindings.size(); i++) {
         if (bindings[i].key == key) {
           actionName = bindings[i].actionName;
           break;
@@ -1956,8 +1952,8 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
           grRendererShowTextureMapImage(r, !grRendererTextureMapImageShown(r));
         else if (key == 'L')
           grRendererShowVertexList(r, !r->listVisible);
-        else if (key == 'C' && r->listSelectedIdx < r->listFilteredIds.count) {
-          const uint32_t *ids = r->listFilteredIds.arr;
+        else if (key == 'C' && r->listSelectedIdx < r->listFilteredIds.size()) {
+          const uint32_t *ids = r->listFilteredIds.data();
           grRendererFocusVertex(r, ids[r->listSelectedIdx]);
         } else if (key == GR_CONSOLE_TOGGLE_KEY)
           grConsoleOpen(r);
@@ -1968,19 +1964,19 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
       if (!r->graph)
         continue;
 
-      gvizActionPayload payload = {0};
+      gviz::layout::ActionPayload payload{};
       grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh,
                         &payload.worldX, &payload.worldY);
       payload.deltaTime = r->deltaTime;
       payload.iarg = mods; // GLFW mod bits match GR_MOD_*
-      gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
+      r->graph->InvokeAction(actionName, &payload);
     }
   }
-  r->pendingKeys.count = 0;
+  r->pendingKeys.clear();
 
-  const grPendingMouse *pendingMouse = r->pendingMouse.arr;
-  const grMouseBinding *mouseBindings = r->mouseBindings.arr;
-  for (size_t m = 0; m < r->pendingMouse.count; m++) {
+  const grPendingMouse *pendingMouse = r->pendingMouse.data();
+  const grMouseBinding *mouseBindings = r->mouseBindings.data();
+  for (size_t m = 0; m < r->pendingMouse.size(); m++) {
     int button = pendingMouse[m].button;
     int mods = pendingMouse[m].mods;
 
@@ -2003,7 +1999,7 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
       r->listSearchFocused = false;
 
     const char *actionName = NULL;
-    for (size_t i = 0; i < r->mouseBindings.count; i++) {
+    for (size_t i = 0; i < r->mouseBindings.size(); i++) {
       if (mouseBindings[i].button == button) {
         actionName = mouseBindings[i].actionName;
         break;
@@ -2018,18 +2014,18 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     // instead of unconditionally paying for the O(vertex count) hit test
     // below on every click of every app that doesn't use it.
     bool wantsVertexClicked =
-        gvizEmbeddedGraphFindAction(r->graph, GR_ACTION_VERTEX_CLICKED) != NULL;
+        r->graph->FindAction(GR_ACTION_VERTEX_CLICKED) != nullptr;
     if (!actionName && !wantsVertexClicked)
       continue;
 
-    gvizActionPayload payload = {0};
+    gviz::layout::ActionPayload payload{};
     grCameraUnproject(&r->camera, &r->cameraFrame, pendingMouse[m].xPx,
                       pendingMouse[m].yPx, fbw, fbh, &payload.worldX,
                       &payload.worldY);
     payload.deltaTime = r->deltaTime;
     payload.iarg = mods;
     if (actionName)
-      gvizEmbeddedGraphInvokeAction(r->graph, actionName, &payload);
+      r->graph->InvokeAction(actionName, &payload);
 
     // GR_ACTION_VERTEX_CLICKED dispatch is independent of, and in addition
     // to, the per-button action above: it fires on any button whose click
@@ -2038,16 +2034,15 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     // rather than the modifier bits regular key/mouse actions get there.
     if (wantsVertexClicked) {
       size_t hitVertex;
-      if (grHitTestVertex(r, r->graph, payload.worldX, payload.worldY,
+      if (grHitTestVertex(r, *r->graph, payload.worldX, payload.worldY,
                           &hitVertex)) {
-        gvizActionPayload vertexPayload = payload;
+        gviz::layout::ActionPayload vertexPayload = payload;
         vertexPayload.iarg = (int64_t)hitVertex;
-        gvizEmbeddedGraphInvokeAction(r->graph, GR_ACTION_VERTEX_CLICKED,
-                                      &vertexPayload);
+        r->graph->InvokeAction(GR_ACTION_VERTEX_CLICKED, &vertexPayload);
       }
     }
   }
-  r->pendingMouse.count = 0;
+  r->pendingMouse.clear();
 }
 
 // ------------------------------------------------------------------------------
@@ -2089,7 +2084,7 @@ static void writeGlobals(grRenderer *r, double fbw, double fbh) {
 }
 
 static void uploadPositions(grRenderer *r) {
-  const double *src = gvizEmbeddedGraphPositions(r->graph);
+  const double *src = r->graph->Positions().data();
   size_t n = r->posCapacity;
   float *dst = r->posStaging;
   if (r->srcDim == 4) {
@@ -2110,13 +2105,12 @@ static void uploadPositions(grRenderer *r) {
 }
 
 static void statsRevisionCacheSync(grRenderer *r, double fbw, double fbh) {
-  size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
-  r->statsSeriesRevisions.count = 0;
+  size_t n = r->graph->StatSeriesCount();
+  r->statsSeriesRevisions.clear();
   for (size_t i = 0; i < n; i++) {
-    const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, i);
+    const gviz::layout::StatSeries *series = r->graph->StatSeriesAt(i);
     uint64_t rev = series ? series->revision : 0;
-    if (gvizArrayPush(&r->statsSeriesRevisions, &rev) < 0)
-      return;
+    r->statsSeriesRevisions.push_back(rev);
   }
   r->statsLayoutFbw = fbw;
   r->statsLayoutFbh = fbh;
@@ -2139,12 +2133,12 @@ static bool statsOverlayNeedsRebuild(grRenderer *r, double fbw, double fbh) {
     return true;
   if (!r->statsVisible)
     return false;
-  size_t n = gvizEmbeddedGraphStatSeriesCount(r->graph);
-  if (n != r->statsSeriesRevisions.count)
+  size_t n = r->graph->StatSeriesCount();
+  if (n != r->statsSeriesRevisions.size())
     return true;
-  const uint64_t *cached = r->statsSeriesRevisions.arr;
+  const uint64_t *cached = r->statsSeriesRevisions.data();
   for (size_t i = 0; i < n; i++) {
-    const gvizStatSeries *series = gvizEmbeddedGraphStatSeriesAt(r->graph, i);
+    const gviz::layout::StatSeries *series = r->graph->StatSeriesAt(i);
     if (!series)
       continue;
     if (series->revision != cached[i])
@@ -2161,7 +2155,7 @@ static void uploadStats(grRenderer *r, double fbw, double fbh) {
   if (!statsOverlayNeedsRebuild(r, fbw, fbh))
     return;
 
-  r->statsPrims.count = 0;
+  r->statsPrims.clear();
   if (r->statsVisible)
     grStatsOverlayBuild(r, fbw, fbh);
   grVertexOverlayBuild(r, fbw, fbh);
@@ -2169,24 +2163,24 @@ static void uploadStats(grRenderer *r, double fbw, double fbh) {
   grConsoleBuild(r, fbw, fbh);
   statsRevisionCacheSync(r, fbw, fbh);
   r->vertexOverlayDirty = false;
-  if (r->statsPrims.count == 0)
+  if (r->statsPrims.empty())
     return;
 
-  if (r->statsPrims.count > r->statsBufCapacity) {
+  if (r->statsPrims.size() > r->statsBufCapacity) {
     GR_RELEASE(wgpuBufferRelease, r->statsBuf);
-    r->statsBufCapacity = r->statsPrims.count * 2;
+    r->statsBufCapacity = r->statsPrims.size() * 2;
     r->statsBuf = createBuffer(
         r, sizeof(grStatsPrim) * r->statsBufCapacity,
         WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
         "grender stats prims");
     r->bindGroupDirty = true;
     if (!r->statsBuf) {
-      r->statsPrims.count = 0;
+      r->statsPrims.clear();
       return;
     }
   }
-  wgpuQueueWriteBuffer(r->queue, r->statsBuf, 0, r->statsPrims.arr,
-                       sizeof(grStatsPrim) * r->statsPrims.count);
+  wgpuQueueWriteBuffer(r->queue, r->statsBuf, 0, r->statsPrims.data(),
+                       sizeof(grStatsPrim) * r->statsPrims.size());
 }
 
 /** Encodes the scene render pass (clear + edges + nodes) into @p target. */
@@ -2194,25 +2188,25 @@ static void encodeScenePass(grRenderer *r, WGPUCommandEncoder encoder,
                             WGPUTextureView target, WGPUTextureView depth) {
   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(
       encoder,
-      &(const WGPURenderPassDescriptor){
+      grPtr(WGPURenderPassDescriptor{
           .colorAttachmentCount = 1,
           .colorAttachments =
-              &(const WGPURenderPassColorAttachment){
+              grPtr(WGPURenderPassColorAttachment{
                   .view = target,
                   .loadOp = WGPULoadOp_Clear,
                   .storeOp = WGPUStoreOp_Store,
                   .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
                   .clearValue = {r->clearColor.r, r->clearColor.g,
                                  r->clearColor.b, r->clearColor.a},
-              },
+              }),
           .depthStencilAttachment =
-              &(const WGPURenderPassDepthStencilAttachment){
+              grPtr(WGPURenderPassDepthStencilAttachment{
                   .view = depth,
                   .depthLoadOp = WGPULoadOp_Clear,
                   .depthStoreOp = WGPUStoreOp_Store,
                   .depthClearValue = 1.0f,
-              },
-      });
+              }),
+      }));
 
   // Texture map's movable image rect, if shown: drawn first (and never
   // depth-writing) so nodes/edges always remain visible on top of it,
@@ -2245,9 +2239,9 @@ static void encodeScenePass(grRenderer *r, WGPUCommandEncoder encoder,
     }
 
     // Stats charts and the vertex-info panel always draw on top of the scene.
-    if (r->statsPrims.count) {
+    if (!r->statsPrims.empty()) {
       wgpuRenderPassEncoderSetPipeline(pass, r->statsPipeline);
-      wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->statsPrims.count, 0, 0);
+      wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->statsPrims.size(), 0, 0);
     }
   }
 
@@ -2278,7 +2272,7 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
   }
 
   WGPUTexture target = wgpuDeviceCreateTexture(
-      r->device, &(const WGPUTextureDescriptor){
+      r->device, grPtr(WGPUTextureDescriptor{
                      .label = {"grender screenshot", WGPU_STRLEN},
                      .usage = WGPUTextureUsage_RenderAttachment |
                               WGPUTextureUsage_CopySrc,
@@ -2287,36 +2281,36 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
                      .format = r->surfaceFormat,
                      .mipLevelCount = 1,
                      .sampleCount = 1,
-                 });
+                 }));
   if (!target)
     return -1;
   WGPUTextureView targetView = wgpuTextureCreateView(target, NULL);
 
   const uint32_t bytesPerRow = (w * 4 + 255) & ~255u; // 256-byte alignment
   WGPUBuffer readback = wgpuDeviceCreateBuffer(
-      r->device, &(const WGPUBufferDescriptor){
+      r->device, grPtr(WGPUBufferDescriptor{
                      .label = {"grender readback", WGPU_STRLEN},
                      .size = (uint64_t)bytesPerRow * h,
                      .usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
-                 });
+                 }));
 
   WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(r->device, NULL);
   encodeScenePass(r, encoder, targetView, r->depthView);
   grObjOverlayEncode(r, encoder, targetView, r->depthView, w, h);
   wgpuCommandEncoderCopyTextureToBuffer(
       encoder,
-      &(const WGPUTexelCopyTextureInfo){.texture = target},
-      &(const WGPUTexelCopyBufferInfo){
+      grPtr(WGPUTexelCopyTextureInfo{.texture = target}),
+      grPtr(WGPUTexelCopyBufferInfo{
           .layout = {.bytesPerRow = bytesPerRow, .rowsPerImage = h},
           .buffer = readback,
-      },
-      &(const WGPUExtent3D){w, h, 1});
+      }),
+      grPtr(WGPUExtent3D{w, h, 1}));
   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
   wgpuQueueSubmit(r->queue, 1, &commands);
   wgpuCommandBufferRelease(commands);
   wgpuCommandEncoderRelease(encoder);
 
-  WGPUMapAsyncStatus mapStatus = 0;
+  WGPUMapAsyncStatus mapStatus = WGPUMapAsyncStatus_Error;
   wgpuBufferMapAsync(readback, WGPUMapMode_Read, 0,
                      (size_t)bytesPerRow * h,
                      (const WGPUBufferMapCallbackInfo){
@@ -2327,15 +2321,15 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
 
   int result = -1;
   if (mapStatus == WGPUMapAsyncStatus_Success) {
-    const uint8_t *data =
-        wgpuBufferGetConstMappedRange(readback, 0, (size_t)bytesPerRow * h);
+    const uint8_t *data = (const uint8_t *)wgpuBufferGetConstMappedRange(
+        readback, 0, (size_t)bytesPerRow * h);
     FILE *f = data ? fopen(path, "wb") : NULL;
     if (f) {
       // Surface formats are 8-bit RGBA or BGRA; swizzle BGRA on write.
       bool bgra = r->surfaceFormat == WGPUTextureFormat_BGRA8Unorm ||
                   r->surfaceFormat == WGPUTextureFormat_BGRA8UnormSrgb;
       fprintf(f, "P6\n%u %u\n255\n", w, h);
-      uint8_t *row = malloc((size_t)w * 3);
+      uint8_t *row = (uint8_t *)malloc((size_t)w * 3);
       if (row) {
         for (uint32_t y = 0; y < h; y++) {
           const uint8_t *src = data + (size_t)y * bytesPerRow;
@@ -2394,7 +2388,7 @@ bool grRendererFrame(grRenderer *r) {
 
   if (r->graph) {
     statsMenuSyncIfNeeded(r);
-    uint64_t rev = gvizEmbeddedGraphDrawMaskRevision(r->graph);
+    uint64_t rev = r->graph->DrawMaskRevision();
     if (rev != r->drawMaskRevision) {
       r->drawMaskRevision = rev;
       r->topoDirty = true;
@@ -2437,7 +2431,7 @@ bool grRendererFrame(grRenderer *r) {
   WGPUTextureView frame = wgpuTextureCreateView(surfaceTexture.texture, NULL);
   WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(
       r->device,
-      &(const WGPUCommandEncoderDescriptor){.label = {"grender", WGPU_STRLEN}});
+      grPtr(WGPUCommandEncoderDescriptor{.label = {"grender", WGPU_STRLEN}}));
 
   encodeScenePass(r, encoder, frame, r->depthView);
   grObjOverlayEncode(r, encoder, frame, r->depthView, fbw, fbh);

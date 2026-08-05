@@ -6,8 +6,8 @@
  * The list shows every currently-visible vertex, or, while a highlight is
  * active (grRendererSetHighlight / GR_ACTION_PICK_VERTEX / GR_ACTION_PICK_FACE
  * / grConsole's "find"), only the highlighted vertices -- read straight off
- * the gvizEmbeddedGraph's highlight subgraph, the same source
- * applyColorLayers (grRenderer.c) uses to color them. The search bar
+ * the gviz::layout::EmbeddedGraph's highlight subgraph, the same source
+ * applyColorLayers (grRenderer.cpp) uses to color them. The search bar
  * further narrows that set with a fuzzy match against each vertex's DATA
  * string from grRendererSetVertexLabels; it never reads gviz's graph loader
  * directly.
@@ -21,12 +21,13 @@
 
 #include "grInternal.h"
 
-#include "ds/gvizSubgraph.h"
-
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <algorithm>
+#include <vector>
 
 // ------------------------------------------------------------------------------
 // Fuzzy matching
@@ -109,8 +110,8 @@ static void listSearchAppendChar(grRenderer *r, uint32_t cp) {
  * exclusive (the console owns all input while open).
  */
 void grListSearchProcessInput(grRenderer *r) {
-  const grPendingConsoleEvent *events = r->pendingConsoleEvents.arr;
-  for (size_t i = 0; i < r->pendingConsoleEvents.count; i++) {
+  const grPendingConsoleEvent *events = r->pendingConsoleEvents.data();
+  for (size_t i = 0; i < r->pendingConsoleEvents.size(); i++) {
     const grPendingConsoleEvent *ev = &events[i];
     if (ev->isChar) {
       listSearchAppendChar(r, (uint32_t)ev->code);
@@ -140,7 +141,7 @@ void grListSearchProcessInput(grRenderer *r) {
       break;
     }
   }
-  r->pendingConsoleEvents.count = 0;
+  r->pendingConsoleEvents.clear();
 }
 
 // ------------------------------------------------------------------------------
@@ -152,11 +153,11 @@ typedef struct grListMatch {
   int score;
 } grListMatch;
 
-static int compareMatchDesc(const void *a, const void *b) {
-  const grListMatch *ma = a, *mb = b;
-  if (ma->score != mb->score)
-    return mb->score - ma->score; // higher score first
-  return (ma->id > mb->id) - (ma->id < mb->id); // stable, deterministic order
+/** Higher score first; ties break by id for a stable, deterministic order. */
+static bool matchBeforeDesc(const grListMatch &a, const grListMatch &b) {
+  if (a.score != b.score)
+    return a.score > b.score;
+  return a.id < b.id;
 }
 
 static const char *listVertexLabel(const grRenderer *r, size_t v) {
@@ -168,68 +169,52 @@ static const char *listVertexLabel(const grRenderer *r, size_t v) {
  *  topology vertices, with none active) and r->listSearchInput. Clears
  *  listFilterDirty; does not touch r->statsPrims. */
 static void listOverlayRefreshFilter(grRenderer *r) {
-  r->listFilteredIds.count = 0;
+  r->listFilteredIds.clear();
   r->listFilterDirty = false;
   r->listSelectedIdx = SIZE_MAX; // stale index would point at the wrong row
   if (!r->graph)
     return;
 
   bool hasQuery = r->listSearchInputLen > 0;
-  const gvizSubgraph *highlight =
-      (r->highlightActive && gvizEmbeddedGraphHasHighlight(r->graph))
-          ? gvizEmbeddedGraphGetHighlight(r->graph)
+  const gviz::Subgraph *highlight =
+      (r->highlightActive && r->graph->HasHighlight())
+          ? r->graph->GetHighlight()
           : NULL;
 
   if (!hasQuery) {
     // No search text: keep natural order, no scoring needed.
     if (highlight) {
-      gvizSubgraphVertexIterator vit =
-          gvizSubgraphVertexIteratorCreate(highlight);
-      size_t u;
-      while (gvizSubgraphVertexIterate(&vit, &u)) {
-        uint32_t id = (uint32_t)u;
-        gvizArrayPush(&r->listFilteredIds, &id);
-      }
+      for (size_t u : *highlight)
+        r->listFilteredIds.push_back((uint32_t)u);
     } else {
       for (size_t i = 0; i < r->topo.nodeCount; i++)
-        gvizArrayPush(&r->listFilteredIds, &r->topo.nodeIds[i]);
+        r->listFilteredIds.push_back(r->topo.nodeIds[i]);
     }
     return;
   }
 
-  gvizArray matches;
-  gvizArrayInit(&matches, sizeof(grListMatch));
+  std::vector<grListMatch> matches;
 
   if (highlight) {
-    gvizSubgraphVertexIterator vit =
-        gvizSubgraphVertexIteratorCreate(highlight);
-    size_t u;
-    while (gvizSubgraphVertexIterate(&vit, &u)) {
+    for (size_t u : *highlight) {
       const char *label = listVertexLabel(r, u);
       int score;
-      if (label && fuzzyMatch(r->listSearchInput, label, &score)) {
-        grListMatch m = {(uint32_t)u, score};
-        gvizArrayPush(&matches, &m);
-      }
+      if (label && fuzzyMatch(r->listSearchInput, label, &score))
+        matches.push_back({(uint32_t)u, score});
     }
   } else {
     for (size_t i = 0; i < r->topo.nodeCount; i++) {
       uint32_t v = r->topo.nodeIds[i];
       const char *label = listVertexLabel(r, v);
       int score;
-      if (label && fuzzyMatch(r->listSearchInput, label, &score)) {
-        grListMatch m = {v, score};
-        gvizArrayPush(&matches, &m);
-      }
+      if (label && fuzzyMatch(r->listSearchInput, label, &score))
+        matches.push_back({v, score});
     }
   }
 
-  if (matches.count > 0)
-    qsort(matches.arr, matches.count, sizeof(grListMatch), compareMatchDesc);
-  grListMatch *m = matches.arr;
-  for (size_t i = 0; i < matches.count; i++)
-    gvizArrayPush(&r->listFilteredIds, &m[i].id);
-  gvizArrayRelease(&matches);
+  std::sort(matches.begin(), matches.end(), matchBeforeDesc);
+  for (const grListMatch &m : matches)
+    r->listFilteredIds.push_back(m.id);
 }
 
 // ------------------------------------------------------------------------------
@@ -272,14 +257,14 @@ void grListOverlayComputeLayout(grRenderer *r, double fbw, double fbh,
   out->lineH = lineH;
 
   double contentH = out->contentY1 - out->contentY0;
-  double wantH = (double)r->listFilteredIds.count * lineH;
+  double wantH = (double)r->listFilteredIds.size() * lineH;
   double maxScrollPx = wantH - contentH;
   out->maxScrollPx = maxScrollPx > 0.0 ? maxScrollPx : 0.0;
 }
 
 void grListOverlaySelectDelta(grRenderer *r, double fbw, double fbh,
                               int delta) {
-  size_t count = r->listFilteredIds.count;
+  size_t count = r->listFilteredIds.size();
   if (count == 0)
     return;
 
@@ -291,7 +276,7 @@ void grListOverlaySelectDelta(grRenderer *r, double fbw, double fbh,
   else if (delta < 0)
     r->listSelectedIdx = r->listSelectedIdx > 0 ? r->listSelectedIdx - 1 : 0;
 
-  const uint32_t *ids = r->listFilteredIds.arr;
+  const uint32_t *ids = r->listFilteredIds.data();
   int64_t vertexId = (int64_t)ids[r->listSelectedIdx];
   if (r->pickedVertexId != vertexId) {
     r->pickedVertexId = vertexId;
@@ -358,11 +343,10 @@ void grListOverlayBuild(grRenderer *r, double fbw, double fbh) {
   // grStats.c -- only A-Z, 0-9, and ".-+:/_"), so a "(n) *" style indicator
   // would silently drop those characters and leave blank gaps; "FILTERED"
   // spelled out avoids the whole class of punctuation the font can't draw.
-  bool filtered = r->highlightActive && r->graph &&
-                  gvizEmbeddedGraphHasHighlight(r->graph);
+  bool filtered = r->highlightActive && r->graph && r->graph->HasHighlight();
   char title[64];
-  snprintf(title, sizeof(title), "VERTICES: %zu%s", r->listFilteredIds.count,
-          filtered ? " FILTERED" : "");
+  snprintf(title, sizeof(title), "VERTICES: %zu%s",
+          r->listFilteredIds.size(), filtered ? " FILTERED" : "");
   grOverlayPushText(r, L.x0 + pad, L.y0 + pad, fontPx, titleColor, title);
 
   // Search bar.
@@ -402,8 +386,8 @@ void grListOverlayBuild(grRenderer *r, double fbw, double fbh) {
   // a million-vertex graph, a linear scan here would redo a million no-op
   // clip checks on every rebuild (e.g. every scroll tick) just to skip past
   // rows above the fold.
-  const uint32_t *ids = r->listFilteredIds.arr;
-  size_t count = r->listFilteredIds.count;
+  const uint32_t *ids = r->listFilteredIds.data();
+  size_t count = r->listFilteredIds.size();
   size_t startIdx = (size_t)(r->listScrollPx / L.lineH);
   if (startIdx > count)
     startIdx = count;

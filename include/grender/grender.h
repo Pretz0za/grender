@@ -5,9 +5,9 @@
  * grender - a GPU renderer for gviz embedded graphs.
  *
  * grender sits strictly on the consumer side of the gviz abstraction barrier:
- * it only reads embedded graphs through the public gvizEmbeddedGraph /
- * gvizSubgraph API and is agnostic to which embedding algorithm produced the
- * positions. It supports 2D and 3D embeddings directly, and 4D embeddings
+ * it only reads embedded graphs through the public gviz::layout::EmbeddedGraph
+ * / gviz::Subgraph API and is agnostic to which embedding algorithm produced
+ * the positions. It supports 2D and 3D embeddings directly, and 4D embeddings
  * projected to 3D with PCA for display. It renders millions of vertices
  * and edges in two instanced draw calls, and re-reads vertex positions every
  * frame so a live embedder (force-directed, GRIP rounds, ...) is rendered
@@ -17,12 +17,12 @@
  *  - Built-in navigation owned by the renderer: mouse pan/zoom (2D) or
  *    orbit/pan/dolly (3D), and 'grRendererFitView' framing.
  *  - Named actions owned by the embedded graph creator (see
- *    gvizEmbeddedGraphAddAction). The application binds input keys to action
- *    names with grRendererBindKey; the renderer dispatches payloads without
- *    knowing anything about the embedder.
+ *    gviz::layout::EmbeddedGraph::AddAction). The application binds input
+ *    keys to action names with grRendererBindKey; the renderer dispatches
+ *    payloads without knowing anything about the embedder.
  */
 
-#include "embedders/gvizEmbeddedGraph.h"
+#include "EmbeddedGraph.hpp"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -100,7 +100,7 @@ typedef struct grRendererDesc {
   bool edgeDegreeAlpha;
   /**
    * When true, the edge shader scales each edge's drawn width by its
-   * gvizGraph edge weight relative to the mean weight, so e.g. an edge
+   * gviz::Graph edge weight relative to the mean weight, so e.g. an edge
    * weighing twice the mean is drawn twice as thick -- edgeStyle.width is
    * the base thickness an average-weight edge is drawn at. The renderer
    * derives and re-uploads the weights itself on every structural change,
@@ -127,20 +127,29 @@ void grRendererDestroy(grRenderer *r);
 
 /**
  * Attaches the embedded graph to render. The renderer reads structure through
- * the gviz subgraph API and positions through gvizEmbeddedGraphPositions every
+ * the gviz subgraph API and positions through EmbeddedGraph::Positions every
  * frame, so position changes made by the caller (or by actions) between frames
  * are always visible. 2D and 3D embeddings are rendered directly; 4D
  * embeddings are PCA-projected to 3D each frame.
  *
+ * @p backingGraph is the parent gviz::Graph @p graph's subgraph was built
+ * over, optional (default NULL) but required for the highlight/pick/console
+ * features that need raw parent-graph access (EnsureLayout, GetEdgeWeight,
+ * planar face queries) gviz::Subgraph deliberately never exposes on its own
+ * -- see grRendererSetHighlight, grRendererSetHighlightCycle, and
+ * GR_ACTION_PICK_FACE/GR_ACTION_PICK_VERTEX's doc comments. Those features
+ * simply no-op (return failure / find nothing) when it's NULL.
+ *
  * @return 0 on success, -1 on unsupported dimension or GPU allocation failure.
  */
-int grRendererSetGraph(grRenderer *r, gvizEmbeddedGraph *graph);
+int grRendererSetGraph(grRenderer *r, gviz::layout::EmbeddedGraph &graph,
+                       gviz::Graph *backingGraph = nullptr);
 
 /**
  * Notifies the renderer that the *structure* of the attached graph changed
    * (vertices/edges added, removed, hidden or shown). Topology buffers are
    * rebuilt lazily before the next frame. Pure position changes and draw-mask
-   * updates (via gvizEmbeddedGraphSetDrawMaskEdgePolicy and friends) never
+   * updates (via EmbeddedGraph::SetDrawMaskEdgePolicy and friends) never
    * require this call.
    */
   void grRendererGraphStructureChanged(grRenderer *r);
@@ -180,7 +189,7 @@ bool grRendererEdgeWeightWidth(const grRenderer *r);
 
 /**
  * Uploads per-node fill colors (GR_RGBA8 packed), indexed by parent-graph
- * vertex id; @p count must equal gvizEmbeddedGraphPositionCount(). Pass NULL
+ * vertex id; @p count must equal EmbeddedGraph::PositionCount(). Pass NULL
  * to revert to the global style. The data is copied; the caller keeps
  * ownership.
  *
@@ -279,7 +288,7 @@ enum {
   GR_KEY_F1 = 290, /* F2..F12 follow consecutively */
 };
 
-/** Modifier bits reported in gvizActionPayload.iarg (bitwise OR). */
+/** Modifier bits reported in gviz::layout::ActionPayload.iarg (bitwise OR). */
 enum {
   GR_MOD_SHIFT = 1,
   GR_MOD_CTRL = 2,
@@ -297,7 +306,8 @@ enum {
 /**
  * Action name registered by grRendererSetGraph for 2D face picking and
  * highlighting. The payload worldX/worldY are filled from the click position.
- * Requires a planar combinatorial embedding (gvizPlanarApplyRotationToEmbedding).
+ * Requires a planar combinatorial embedding (gviz::layout::ApplyPlanarRotation)
+ * and a non-NULL backingGraph (see grRendererSetGraph) -- a no-op otherwise.
  */
 #define GR_ACTION_PICK_FACE "grender.pickFace"
 
@@ -325,8 +335,8 @@ enum {
 
 /**
  * Binds @p key so that pressing it invokes the action named @p actionName on
- * the attached embedded graph (see gvizEmbeddedGraphAddAction). The payload is
- * filled by the renderer:
+ * the attached embedded graph (see gviz::layout::EmbeddedGraph::AddAction).
+ * The payload is filled by the renderer:
  *   worldX/worldY - cursor position unprojected into embedding coordinates
  *                   (in 3D, on the plane through the camera target),
  *   deltaTime     - seconds since the previous frame,
@@ -367,10 +377,11 @@ void grRendererUnbindMouse(grRenderer *r, int button);
  * to that button with grRendererBindMouse.
  *
  * There is nothing to bind: register a handler the same way as any other
- * action (gvizEmbeddedGraphAddAction) and it starts firing on the next hit.
- * The payload is filled like grRendererBindKey, except @p iarg carries the
- * clicked vertex's parent-graph id (not modifier bits -- gvizActionPayload's
- * fields are contextual per trigger, see its doc comment):
+ * action (gviz::layout::EmbeddedGraph::AddAction) and it starts firing on the
+ * next hit. The payload is filled like grRendererBindKey, except @p iarg
+ * carries the clicked vertex's parent-graph id (not modifier bits --
+ * gviz::layout::ActionPayload's fields are contextual per trigger, see its
+ * doc comment):
  *   worldX/worldY - cursor position unprojected into embedding coordinates,
  *   deltaTime     - seconds since the previous frame,
  *   iarg          - the clicked vertex's parent-graph id,
@@ -382,11 +393,12 @@ void grRendererUnbindMouse(grRenderer *r, int button);
 // HIGHLIGHTS: ---------------------------------------------------------------
 
 /**
- * Stores @p highlight (a gvizSubgraph on the same parent graph as the
+ * Stores @p highlight (a gviz::Subgraph on the same parent graph as the
  * attached embedded graph) and colors its vertices/edges differently from the
  * global node/edge styles every frame. Pass 0 for @p nodeRgba or @p edgeRgba
- * to keep the global style for that element class. The subgraph is copied;
- * @p highlight may be released by the caller afterward.
+ * to keep the global style for that element class. The subgraph is copied
+ * (gviz::Subgraph's copy constructor); @p highlight may be destroyed by the
+ * caller immediately after this call returns.
  *
  * This paints over, rather than replaces, any base colors set via
  * grRendererSetNodeColors / grRendererSetEdgeColors: elements in @p
@@ -395,15 +407,18 @@ void grRendererUnbindMouse(grRenderer *r, int button);
  * unaffected by this call and reappear as-is once the highlight is cleared
  * or replaced.
  *
- * @return 0 on success, -1 on failure.
+ * @return 0 on success, -1 on failure (no graph attached, or the renderer's
+ *         attached graph has no backingGraph -- see grRendererSetGraph).
  */
-int grRendererSetHighlight(grRenderer *r, const gvizSubgraph *highlight,
+int grRendererSetHighlight(grRenderer *r, const gviz::Subgraph &highlight,
                            uint32_t nodeRgba, uint32_t edgeRgba);
 
 /**
  * Convenience for highlighting a planar face boundary: @p vertices lists the
  * dart-head cycle from the rotation system (as returned by planar face
  * enumeration). Consecutive entries are endpoints of one boundary dart.
+ * Requires a non-NULL backingGraph (see grRendererSetGraph) -- fails
+ * otherwise.
  */
 int grRendererSetHighlightCycle(grRenderer *r, const size_t *vertices,
                                 size_t count, uint32_t nodeRgba,
@@ -444,10 +459,10 @@ void grRendererFitView(grRenderer *r);
 // STATS OVERLAY: ----------------------------------------------------------
 //
 // If the creator of the attached embedded graph records stat series on it
-// (gvizEmbeddedGraphStatAppend, e.g. GRIP's "grip.heat"), the renderer charts
+// (EmbeddedGraph::StatAppend, e.g. GRIP's "grip.heat"), the renderer charts
 // them live in the top-right corner: one mini line chart per series, restyled
-// per the series' gvizStatChartKind and autoscaled every frame. The renderer
-// needs no knowledge of what the numbers mean.
+// per the series' gviz::layout::StatChartKind and autoscaled every frame. The
+// renderer needs no knowledge of what the numbers mean.
 
 /** Shows or hides the stats overlay. Visible by default (nothing is drawn
  *  when the graph has no non-empty stat series). Also toggled by the S key
@@ -490,7 +505,7 @@ void grRendererShowStatSeries(grRenderer *r, size_t idx, bool show);
 //               vertex-list overlay's current selection (see VERTEX LIST
 //               OVERLAY below).
 //
-// New commands are added in grConsole.c's command table, independent of the
+// New commands are added in grConsole.cpp's command table, independent of the
 // rest of the renderer.
 
 /** Key that opens/closes the console (GLFW's grave-accent/backtick key,
@@ -580,7 +595,7 @@ void grRendererClearObjOverlay(grRenderer *r);
 // Derives per-vertex (u, v) texture coordinates for an .obj mesh loaded into
 // the object overlay from where a live 2D embedded graph's vertices land
 // relative to a movable/resizable image rectangle in embedding space. This
-// works because gvizGraphLoadFromObjFile (gviz) and the object overlay's own
+// works because gviz::io::LoadFromObjFile (gviz) and the object overlay's own
 // .obj parser both assign vertex id i to the i-th 'v' line of the file, in
 // file order, so an embedding built on that same graph and a mesh loaded from
 // the same file always agree on vertex correspondence. Mesh regions that
@@ -604,7 +619,8 @@ typedef struct grTextureMap grTextureMap;
  *         a non-2D embedding, vertex-count mismatch, file/parse error, or
  *         GPU allocation failure.
  */
-grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
+grTextureMap *grRendererLoadTextureMap(grRenderer *r,
+                                       gviz::layout::EmbeddedGraph &graph,
                                        const char *objPath,
                                        const char *imagePath);
 
