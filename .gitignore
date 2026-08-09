@@ -1,5 +1,6 @@
 # CMake out-of-tree build directory
 /build/
+/build-wasm/
 
 # Vendored dependencies (populated once via scripts/setup-deps.sh)
 /third-party/wgpu-native/
@@ -19,5 +20,7 @@
 *.so
 *.dylib
 *.dll
+
+wasm/
 
 CLAUDE.md

@@ -91,7 +91,7 @@ All examples require a built `gviz` target from gviz.
 grender only consumes the public gviz API (`gviz::layout::EmbeddedGraph`,
 `gviz::Subgraph`, …). Embedding algorithms live in the sibling
 [`gviz`](../gviz) repo and are linked into the example apps via the
-`gviz` static library. **Do not modify gviz embedder code from grender
+`gviz` shared library. **Do not modify gviz embedder code from grender
 unless you are intentionally fixing or extending gviz itself.**
 
 ### Data structures: use gviz's / the standard library, never reimplement

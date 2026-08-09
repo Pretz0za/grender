@@ -1,7 +1,9 @@
 #include "grInternal.h"
 #include "grShaders.h"
 
+#ifndef __EMSCRIPTEN__
 #include <webgpu/wgpu.h> // wgpu-native extensions (wgpuDevicePoll)
+#endif
 
 #include <GLFW/glfw3.h>
 
@@ -387,7 +389,19 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   glfwSetCharCallback(r->window, onChar);
   glfwSetMouseButtonCallback(r->window, onMouseButton);
 
+#ifdef __EMSCRIPTEN__
+  // wgpuInstanceWaitAny (used below and in grRendererSaveScreenshot) errors
+  // out unless the instance opted into the TimedWaitAny feature up front --
+  // wgpu-native's synchronous callbacks need no such opt-in, hence native
+  // still passes NULL here.
+  WGPUInstanceFeatureName instanceFeatures[] = {WGPUInstanceFeatureName_TimedWaitAny};
+  r->instance = wgpuCreateInstance(grPtr(WGPUInstanceDescriptor{
+      .requiredFeatureCount = 1,
+      .requiredFeatures = instanceFeatures,
+  }));
+#else
   r->instance = wgpuCreateInstance(NULL);
+#endif
   if (!r->instance)
     { grRendererDestroy(r); return NULL; }
 
@@ -395,12 +409,28 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   if (!r->surface)
     { grRendererDestroy(r); return NULL; }
 
+#ifdef __EMSCRIPTEN__
+  // Unlike wgpu-native, the browser's WebGPU never resolves a callback
+  // registered with mode 0 -- it must be WaitAnyOnly, and the future must
+  // actually be waited on. -sASYNCIFY (see CMakeLists.txt) makes this wait
+  // genuinely yield to the browser event loop instead of hanging the tab,
+  // so from here down the call still reads as a blocking request.
+  WGPUFuture adapterFuture = wgpuInstanceRequestAdapter(
+      r->instance,
+      grPtr(WGPURequestAdapterOptions{.compatibleSurface = r->surface}),
+      (const WGPURequestAdapterCallbackInfo){.mode = WGPUCallbackMode_WaitAnyOnly,
+                                             .callback = onAdapterRequest,
+                                             .userdata1 = &r->adapter});
+  WGPUFutureWaitInfo adapterWait = {.future = adapterFuture};
+  wgpuInstanceWaitAny(r->instance, 1, &adapterWait, UINT64_MAX);
+#else
   // wgpu-native services these callbacks synchronously.
   wgpuInstanceRequestAdapter(
       r->instance,
       grPtr(WGPURequestAdapterOptions{.compatibleSurface = r->surface}),
       (const WGPURequestAdapterCallbackInfo){.callback = onAdapterRequest,
                                              .userdata1 = &r->adapter});
+#endif
   if (!r->adapter)
     { grRendererDestroy(r); return NULL; }
 
@@ -420,6 +450,20 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   requiredLimits.maxStorageBuffersPerShaderStage =
       adapterLimits.maxStorageBuffersPerShaderStage;
 
+#ifdef __EMSCRIPTEN__
+  WGPUFuture deviceFuture = wgpuAdapterRequestDevice(
+      r->adapter,
+      grPtr(WGPUDeviceDescriptor{
+          .label = {"grender device", WGPU_STRLEN},
+          .requiredLimits = &requiredLimits,
+          .uncapturedErrorCallbackInfo = {.callback = onUncapturedError},
+      }),
+      (const WGPURequestDeviceCallbackInfo){.mode = WGPUCallbackMode_WaitAnyOnly,
+                                            .callback = onDeviceRequest,
+                                            .userdata1 = &r->device});
+  WGPUFutureWaitInfo deviceWait = {.future = deviceFuture};
+  wgpuInstanceWaitAny(r->instance, 1, &deviceWait, UINT64_MAX);
+#else
   wgpuAdapterRequestDevice(
       r->adapter,
       grPtr(WGPUDeviceDescriptor{
@@ -429,6 +473,7 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
       }),
       (const WGPURequestDeviceCallbackInfo){.callback = onDeviceRequest,
                                             .userdata1 = &r->device});
+#endif
   if (!r->device)
     { grRendererDestroy(r); return NULL; }
 
@@ -2311,6 +2356,17 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
   wgpuCommandEncoderRelease(encoder);
 
   WGPUMapAsyncStatus mapStatus = WGPUMapAsyncStatus_Error;
+#ifdef __EMSCRIPTEN__
+  // See the adapter/device request in grRendererCreate: browser WebGPU needs
+  // WaitAnyOnly + an explicit wait instead of wgpu-native's wgpuDevicePoll.
+  WGPUFuture mapFuture = wgpuBufferMapAsync(
+      readback, WGPUMapMode_Read, 0, (size_t)bytesPerRow * h,
+      (const WGPUBufferMapCallbackInfo){.mode = WGPUCallbackMode_WaitAnyOnly,
+                                        .callback = onScreenshotMap,
+                                        .userdata1 = &mapStatus});
+  WGPUFutureWaitInfo mapWait = {.future = mapFuture};
+  wgpuInstanceWaitAny(r->instance, 1, &mapWait, UINT64_MAX);
+#else
   wgpuBufferMapAsync(readback, WGPUMapMode_Read, 0,
                      (size_t)bytesPerRow * h,
                      (const WGPUBufferMapCallbackInfo){
@@ -2318,6 +2374,7 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
                          .userdata1 = &mapStatus,
                      });
   wgpuDevicePoll(r->device, true, NULL);
+#endif
 
   int result = -1;
   if (mapStatus == WGPUMapAsyncStatus_Success) {
@@ -2438,7 +2495,12 @@ bool grRendererFrame(grRenderer *r) {
 
   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
   wgpuQueueSubmit(r->queue, 1, &commands);
+#ifndef __EMSCRIPTEN__
+  // Emdawnwebgpu has no wgpuSurfacePresent: the browser presents the canvas
+  // automatically once control returns to its requestAnimationFrame loop
+  // (see the #ifdef __EMSCRIPTEN__ branch in each example's main loop).
   wgpuSurfacePresent(r->surface);
+#endif
 
   wgpuCommandBufferRelease(commands);
   wgpuCommandEncoderRelease(encoder);
