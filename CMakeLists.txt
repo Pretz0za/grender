@@ -143,6 +143,7 @@ add_library(grender STATIC
     src/grVertexOverlay.cpp
     src/grListOverlay.cpp
     src/grConsole.cpp
+    src/grCaption.cpp
     src/grPCA.cpp
     src/grObjMesh.cpp
     src/grObjOverlay.cpp
@@ -279,6 +280,9 @@ if(GRENDER_BUILD_EXAMPLES AND TARGET gviz AND NOT EMSCRIPTEN)
 
     add_executable(treeDemo examples/treeDemo.cpp)
     target_link_libraries(treeDemo PRIVATE grender gviz)
+
+    add_executable(rtTraceDemo examples/rtTraceDemo.cpp)
+    target_link_libraries(rtTraceDemo PRIVATE grender gviz)
 
     add_executable(tutteDemo examples/tutteDemo.cpp)
     target_link_libraries(tutteDemo PRIVATE grender gviz)

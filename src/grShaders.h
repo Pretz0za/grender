@@ -30,6 +30,8 @@ static const char GR_WGSL_SOURCE[] =
     "const FLAG_EDGE_DEGREE_ALPHA : u32 = 8u;\n"
     "const FLAG_EDGE_WEIGHT_WIDTH : u32 = 16u;\n"
     "const FLAG_DIRECTED         : u32 = 32u;\n"
+    "const FLAG_NODE_ROUNDED_SQUARE : u32 = 64u;\n"
+    "const FLAG_EDGE_DASHED      : u32 = 128u;\n"
     "\n"
     // Arrowhead size relative to the edge's own drawn half-width, so a
     // thicker edge (wider edgeStyle.width or a weight-scaled edge) grows a
@@ -56,6 +58,10 @@ static const char GR_WGSL_SOURCE[] =
     "@group(0) @binding(7) var<storage, read> statsPrims : array<StatsPrim>;\n"
     "@group(0) @binding(8) var<storage, read> nodeDegrees : array<u32>;\n"
     "@group(0) @binding(9) var<storage, read> edgeWeights : array<f32>;\n"
+    // 0/1 per edge, edge-buffer order (see grRendererSetEdgeDashed); only
+    // read when FLAG_EDGE_DASHED is set, exactly like every other optional
+    // per-element attribute buffer here.
+    "@group(0) @binding(10) var<storage, read> edgeDashed : array<u32>;\n"
     "\n"
     "fn getPos(i : u32) -> vec3f {\n"
     "  let base = i * G.posDim;\n"
@@ -75,6 +81,14 @@ static const char GR_WGSL_SOURCE[] =
     "    f32((c >> 8u) & 0xFFu) / 255.0,\n"
     "    f32((c >> 16u) & 0xFFu) / 255.0,\n"
     "    f32((c >> 24u) & 0xFFu) / 255.0);\n"
+    "}\n"
+    "\n"
+    // Signed distance from p to a square of half-size (halfSize + r) with
+    // corners rounded to radius r, centered at the origin. Standard
+    // rounded-box SDF (Inigo Quilez).
+    "fn sdRoundBox(p : vec2f, halfSize : vec2f, r : f32) -> f32 {\n"
+    "  let q = abs(p) - halfSize + vec2f(r, r);\n"
+    "  return length(max(q, vec2f(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;\n"
     "}\n"
     "\n"
     // Quad corners for two CCW triangles.
@@ -127,13 +141,24 @@ static const char GR_WGSL_SOURCE[] =
     "\n"
     "@fragment\n"
     "fn fsNode(in : NodeOut) -> @location(0) vec4f {\n"
-    "  let dist = length(in.local);\n"
-    "  let outer = in.radiusPx + in.strokePx;\n"
-    "  let coverage = 1.0 - smoothstep(outer - 1.0, outer, dist);\n"
+    // sdf: signed distance from the fragment to the node's fill boundary
+    // (negative inside, 0 on the boundary, positive outside) -- 0 for the
+    // circle case reduces to the same length(in.local) - radiusPx used
+    // before this was unified with the rounded-square case below, so
+    // existing (circle) visuals are unchanged.
+    "  var sdf : f32;\n"
+    "  if ((G.flags & FLAG_NODE_ROUNDED_SQUARE) != 0u) {\n"
+    "    let cr = clamp(G.nodeSizeLimits.z, 0.0, 0.5) * in.radiusPx;\n"
+    "    let half = vec2f(in.radiusPx - cr, in.radiusPx - cr);\n"
+    "    sdf = sdRoundBox(in.local, half, cr);\n"
+    "  } else {\n"
+    "    sdf = length(in.local) - in.radiusPx;\n"
+    "  }\n"
+    "  let coverage = 1.0 - smoothstep(in.strokePx - 1.0, in.strokePx, sdf);\n"
     "  if (coverage <= 0.0) { discard; }\n"
     "  var color = in.fill;\n"
     "  if (in.strokePx > 0.0) {\n"
-    "    let t = smoothstep(in.radiusPx - 0.5, in.radiusPx + 0.5, dist);\n"
+    "    let t = smoothstep(-0.5, 0.5, sdf);\n"
     "    color = mix(in.fill, G.nodeStroke, t);\n"
     "  }\n"
     "  return vec4f(color.rgb, color.a * coverage);\n"
@@ -145,6 +170,8 @@ static const char GR_WGSL_SOURCE[] =
     "  @location(0) across : f32,\n"         // signed px across the edge
     "  @location(1) color : vec4f,\n"
     "  @location(2) @interpolate(flat) halfWidthPx : f32,\n"
+    "  @location(3) along : f32,\n"          // px along the edge from A, for dashing
+    "  @location(4) @interpolate(flat) dashed : u32,\n"
     "}\n"
     "\n"
     "@vertex\n"
@@ -152,6 +179,8 @@ static const char GR_WGSL_SOURCE[] =
     "          @builtin(instance_index) iid : u32) -> EdgeOut {\n"
     "  let a = edges[iid * 2u];\n"
     "  let b = edges[iid * 2u + 1u];\n"
+    "  var dashed = 0u;\n"
+    "  if ((G.flags & FLAG_EDGE_DASHED) != 0u) { dashed = edgeDashed[iid]; }\n"
     "  var clipA = G.viewProj * vec4f(getPos(a), 1.0);\n"
     "  var clipB = G.viewProj * vec4f(getPos(b), 1.0);\n"
     // Clamp w to keep endpoints behind a perspective camera from exploding.
@@ -228,7 +257,7 @@ static const char GR_WGSL_SOURCE[] =
     "    if (vid == 7u) { pos = arrowBase - normal * halfWidthAtB * ARROW_WIDTH_SCALE; }\n"
     "    if (vid == 8u) { pos = arrowBase + normal * halfWidthAtB * ARROW_WIDTH_SCALE; }\n"
     "    let clip = vec4f(pos * 2.0 / G.viewport * clipB.w, clipB.zw);\n"
-    "    return EdgeOut(clip, 0.0, color, 0.5);\n"
+    "    return EdgeOut(clip, 0.0, color, 0.5, len, dashed);\n"
     "  }\n"
     "\n"
     // vid 0..5 -> (end, side): triangles (A-,B-,B+),(A-,B+,A+)
@@ -257,12 +286,22 @@ static const char GR_WGSL_SOURCE[] =
     "  let quadHalf = halfWidthPx + 0.5;\n"
     "  let screen = mix(screenA, screenEndB, end) + normal * side * quadHalf;\n"
     "  let clip = vec4f(screen * 2.0 / G.viewport * clipEnd.w, clipEnd.zw);\n"
+    "  let along = mix(0.0, len, end);\n"
     "\n"
-    "  return EdgeOut(clip, side * quadHalf, color, halfWidthPx);\n"
+    "  return EdgeOut(clip, side * quadHalf, color, halfWidthPx, along, dashed);\n"
     "}\n"
+    "\n"
+    // Dash period/duty cycle are fixed rather than configurable -- this is
+    // meant for a small number of app-marked "not a real edge" connectors
+    // (see grRendererSetEdgeDashed), not a general per-edge style knob.
+    "const DASH_PERIOD_PX : f32 = 16.0;\n"
+    "const DASH_DUTY      : f32 = 0.55;\n"
     "\n"
     "@fragment\n"
     "fn fsEdge(in : EdgeOut) -> @location(0) vec4f {\n"
+    "  if (in.dashed != 0u && fract(in.along / DASH_PERIOD_PX) > DASH_DUTY) {\n"
+    "    discard;\n"
+    "  }\n"
     "  let coverage =\n"
     "      1.0 - smoothstep(in.halfWidthPx - 0.5, in.halfWidthPx + 0.5,\n"
     "                       abs(in.across));\n"

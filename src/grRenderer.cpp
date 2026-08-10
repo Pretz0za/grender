@@ -44,6 +44,8 @@ void grRendererDescInit(grRendererDesc *desc) {
       .sizeMode = GR_SIZE_PIXELS,
       .minPixelRadius = 0.0f,
       .maxPixelRadius = 0.0f,
+      .roundedSquare = false,
+      .cornerRadiusFraction = 0.3f,
   };
   desc->edgeStyle = (grEdgeStyle){
       .color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.55f),
@@ -146,13 +148,13 @@ static int createPipelines(grRenderer *r) {
   if (!r->shaderModule)
     return -1;
 
-  WGPUBindGroupLayoutEntry entries[10] = {0};
+  WGPUBindGroupLayoutEntry entries[11] = {0};
   entries[0] = (WGPUBindGroupLayoutEntry){
       .binding = 0,
       .visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
       .buffer = {.type = WGPUBufferBindingType_Uniform},
   };
-  for (int i = 1; i < 10; i++) {
+  for (int i = 1; i < 11; i++) {
     entries[i] = (WGPUBindGroupLayoutEntry){
         .binding = (uint32_t)i,
         .visibility = WGPUShaderStage_Vertex,
@@ -163,7 +165,7 @@ static int createPipelines(grRenderer *r) {
   r->bindGroupLayout = wgpuDeviceCreateBindGroupLayout(
       r->device, grPtr(WGPUBindGroupLayoutDescriptor{
                      .label = {"grender bgl", WGPU_STRLEN},
-                     .entryCount = 10,
+                     .entryCount = 11,
                      .entries = entries,
                  }));
   r->pipelineLayout = wgpuDeviceCreatePipelineLayout(
@@ -362,6 +364,7 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   r->pickedVertexId = -1;
   r->listVisible = true;
   r->listSelectedIdx = SIZE_MAX;
+  r->captionVisible = true;
   grCameraInit2D(&r->camera);
 
 #ifdef __APPLE__
@@ -444,8 +447,8 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   requiredLimits.maxStorageBufferBindingSize =
       adapterLimits.maxStorageBufferBindingSize;
   requiredLimits.maxBufferSize = adapterLimits.maxBufferSize;
-  // Bind group has 9 storage buffers (bindings 1-9); the default WebGPU
-  // baseline of 8 is one short, so ask the adapter for what it actually
+  // Bind group has 10 storage buffers (bindings 1-10); the default WebGPU
+  // baseline of 8 is short, so ask the adapter for what it actually
   // supports.
   requiredLimits.maxStorageBuffersPerShaderStage =
       adapterLimits.maxStorageBuffersPerShaderStage;
@@ -555,6 +558,7 @@ void grRendererDestroy(grRenderer *r) {
   GR_RELEASE(wgpuBufferRelease, r->edgeColorsBuf);
   GR_RELEASE(wgpuBufferRelease, r->nodeDegreesBuf);
   GR_RELEASE(wgpuBufferRelease, r->edgeWeightsBuf);
+  GR_RELEASE(wgpuBufferRelease, r->edgeDashedBuf);
   GR_RELEASE(wgpuBufferRelease, r->statsBuf);
   GR_RELEASE(wgpuBindGroupRelease, r->bindGroup);
   grObjOverlayRelease(r);
@@ -876,6 +880,7 @@ static int uploadTopology(grRenderer *r) {
   // documented indexing contract.
   r->hasEdgeColors = false;
   r->hasEdgeWeights = false;
+  r->hasEdgeDashed = false;
   free(r->edgeColorsStaging);
   r->edgeColorsStaging = NULL;
   r->edgeColorsStagingCount = 0;
@@ -922,12 +927,16 @@ static int rebuildBindGroup(grRenderer *r) {
     r->edgeWeightsBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
                                                WGPUBufferUsage_CopyDst,
                                      "grender edge weights");
+  if (!r->edgeDashedBuf)
+    r->edgeDashedBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
+                                              WGPUBufferUsage_CopyDst,
+                                    "grender edge dashed");
   if (!r->statsBuf)
     r->statsBuf = createBuffer(r, sizeof(grStatsPrim),
                                WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
                                "grender stats prims");
 
-  const WGPUBindGroupEntry entries[10] = {
+  const WGPUBindGroupEntry entries[11] = {
       {.binding = 0, .buffer = r->globalsBuf,
        .size = storageBindBytes(r, r->globalsBuf)},
       {.binding = 1, .buffer = r->positionsBuf,
@@ -948,8 +957,10 @@ static int rebuildBindGroup(grRenderer *r) {
        .size = storageBindBytes(r, r->nodeDegreesBuf)},
       {.binding = 9, .buffer = r->edgeWeightsBuf,
        .size = storageBindBytes(r, r->edgeWeightsBuf)},
+      {.binding = 10, .buffer = r->edgeDashedBuf,
+       .size = storageBindBytes(r, r->edgeDashedBuf)},
   };
-  for (size_t i = 0; i < 10; i++) {
+  for (size_t i = 0; i < 11; i++) {
     if (entries[i].size > r->maxStorageBufferBindingSize) {
       GR_LOG("bind group entry %zu size %llu exceeds storage binding limit\n",
              i, (unsigned long long)entries[i].size);
@@ -960,7 +971,7 @@ static int rebuildBindGroup(grRenderer *r) {
       r->device, grPtr(WGPUBindGroupDescriptor{
                      .label = {"grender bind group", WGPU_STRLEN},
                      .layout = r->bindGroupLayout,
-                     .entryCount = 10,
+                     .entryCount = 11,
                      .entries = entries,
                  }));
   r->bindGroupDirty = false;
@@ -1221,6 +1232,14 @@ int grRendererSetEdgeWeights(grRenderer *r, const float *weights,
   return uploadAttribute(r, &r->edgeWeightsBuf, weights,
                          count * sizeof(float), &r->hasEdgeWeights,
                          "grender edge weights");
+}
+
+int grRendererSetEdgeDashed(grRenderer *r, const uint32_t *dashed, size_t count) {
+  if (dashed && (!r->graph || count != r->topo.edgeCount))
+    return -1;
+
+  return uploadAttribute(r, &r->edgeDashedBuf, dashed, count * sizeof(uint32_t),
+                         &r->hasEdgeDashed, "grender edge dashed");
 }
 
 size_t grRendererEdgeCount(const grRenderer *r) { return r->topo.edgeCount; }
@@ -2106,7 +2125,9 @@ static void writeGlobals(grRenderer *r, double fbw, double fbh) {
             (r->hasEdgeColors ? 4u : 0u) |
             ((r->edgeDegreeAlpha && r->hasNodeDegrees) ? 8u : 0u) |
             ((r->edgeWeightWidth && r->hasEdgeWeights) ? 16u : 0u) |
-            (r->topo.directed ? 32u : 0u);
+            (r->topo.directed ? 32u : 0u) |
+            (r->nodeStyle.roundedSquare ? 64u : 0u) |
+            (r->hasEdgeDashed ? 128u : 0u);
 
   memcpy(g.nodeFill, &r->nodeStyle.fillColor, sizeof(float) * 4);
   memcpy(g.nodeStroke, &r->nodeStyle.strokeColor, sizeof(float) * 4);
@@ -2116,7 +2137,7 @@ static void writeGlobals(grRenderer *r, double fbw, double fbh) {
   g.nodeParams[3] = r->cameraFrame.proj11;
   g.nodeSizeLimits[0] = r->nodeStyle.minPixelRadius;
   g.nodeSizeLimits[1] = r->nodeStyle.maxPixelRadius;
-  g.nodeSizeLimits[2] = 0.0f;
+  g.nodeSizeLimits[2] = r->nodeStyle.cornerRadiusFraction;
   g.nodeSizeLimits[3] = 0.0f;
 
   memcpy(g.edgeColor, &r->edgeStyle.color, sizeof(float) * 4);
@@ -2164,7 +2185,8 @@ static void statsRevisionCacheSync(grRenderer *r, double fbw, double fbh) {
 }
 
 static bool statsOverlayNeedsRebuild(grRenderer *r, double fbw, double fbh) {
-  if (r->statsOverlayDirty || r->vertexOverlayDirty || r->listOverlayDirty)
+  if (r->statsOverlayDirty || r->vertexOverlayDirty || r->listOverlayDirty ||
+      r->captionDirty)
     return true;
   // The console has no revision counter like the stats/vertex panels do --
   // its text changes on every keystroke -- so just rebuild every frame it's
@@ -2205,9 +2227,11 @@ static void uploadStats(grRenderer *r, double fbw, double fbh) {
     grStatsOverlayBuild(r, fbw, fbh);
   grVertexOverlayBuild(r, fbw, fbh);
   grListOverlayBuild(r, fbw, fbh);
+  grCaptionBuild(r, fbw, fbh);
   grConsoleBuild(r, fbw, fbh);
   statsRevisionCacheSync(r, fbw, fbh);
   r->vertexOverlayDirty = false;
+  r->captionDirty = false;
   if (r->statsPrims.empty())
     return;
 

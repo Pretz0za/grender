@@ -70,6 +70,22 @@ typedef struct grNodeStyle {
    */
   float minPixelRadius;
   float maxPixelRadius;
+  /**
+   * When true, nodes are drawn as rounded squares instead of circles -- a
+   * fragment-shader shape swap only, computed from the same radius/
+   * strokeWidth/sizeMode already used for circles (including per-node
+   * overrides via grRendererSetNodeSizes), so every other node-styling
+   * feature keeps working unchanged. Off by default (circle), for every
+   * existing consumer's visuals to stay pixel-identical.
+   */
+  bool roundedSquare;
+  /**
+   * Corner radius as a fraction of the node's drawn radius, in [0, 0.5]
+   * (0 = sharp square corners, 0.5 = the square's corners are as round as
+   * its half-size allows). Only read when roundedSquare is true. Clamped
+   * at draw time; out-of-range values are not an error.
+   */
+  float cornerRadiusFraction;
 } grNodeStyle;
 
 typedef struct grEdgeStyle {
@@ -260,6 +276,21 @@ int grRendererSetEdgeColors(grRenderer *r, const uint32_t *rgba8, size_t count);
  * @return 0 on success, -1 on failure.
  */
 int grRendererSetEdgeWeights(grRenderer *r, const float *weights, size_t count);
+
+/**
+ * Marks individual edges as dashed, indexed the same way as
+ * grRendererSetEdgeColors (edge-buffer order; see grRendererGetEdges): a
+ * nonzero entry draws that edge with a fixed dash pattern instead of a solid
+ * line, for visually marking connectors that aren't "real" structural edges
+ * (e.g. a teaching visualization's contour threads) as distinct from
+ * ordinary graph edges. Not a general per-edge line-style knob -- the dash
+ * period/duty cycle are fixed, not configurable. Pass NULL to clear (every
+ * edge solid). Like grRendererSetEdgeWeights, this is dropped automatically
+ * whenever the edge order changes and must be re-uploaded afterward.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int grRendererSetEdgeDashed(grRenderer *r, const uint32_t *dashed, size_t count);
 
 /** Number of edges in the current topology buffer. */
 size_t grRendererEdgeCount(const grRenderer *r);
@@ -560,6 +591,31 @@ void grRendererShowVertexList(grRenderer *r, bool show);
 
 /** Returns whether the vertex-list overlay is currently shown. */
 bool grRendererVertexListShown(const grRenderer *r);
+
+// CAPTION OVERLAY: -----------------------------------------------------------
+//
+// A single small text banner centered near the bottom of the window, for an
+// application to narrate what's currently happening -- e.g. a teaching
+// visualization's "comparing right contour of A against left contour of B"
+// step description -- without building its own screen-space text drawing.
+// Deliberately minimal: one string, no history, no scrolling, no markup.
+
+/**
+ * Sets the caption text, replacing any previous caption. Pass "" or NULL to
+ * clear it (an empty caption draws nothing, even when shown). The string is
+ * copied; the caller may reuse or free @p text immediately after this call
+ * returns. A caption too wide to fit in one line is shrunk to fit rather
+ * than wrapped -- keep captions to one short sentence.
+ */
+void grRendererSetCaption(grRenderer *r, const char *text);
+
+/** Shows or hides the caption banner. Visible by default (nothing is drawn
+ *  while the caption text is empty, regardless of this setting). */
+void grRendererShowCaption(grRenderer *r, bool show);
+
+/** Returns whether the caption banner is currently enabled (independent of
+ *  whether any text is actually set). */
+bool grRendererCaptionShown(const grRenderer *r);
 
 // OBJECT OVERLAY: -----------------------------------------------------------
 //

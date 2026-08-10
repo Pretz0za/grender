@@ -644,7 +644,7 @@ int main(int argc, char **argv) {
 
   while (grRendererFrame(r)) {
     if (autoStep) {
-      for (size_t i = 0; i < 10; i++)
+      for (size_t i = 0; i < 1; i++)
         fe->Step();
     }
 

@@ -9,6 +9,7 @@
 #include <webgpu/webgpu.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // grender never hand-rolls a growable array: every dynamically-sized list in
@@ -271,6 +272,13 @@ void grListOverlayComputeLayout(struct grRenderer *r, double fbw, double fbh,
  * as grVertexOverlayBuild.
  */
 void grListOverlayBuild(struct grRenderer *r, double fbw, double fbh);
+
+/**
+ * Appends the caption banner (r->captionText, centered near the bottom of
+ * the window) to r->statsPrims, if r->captionVisible and r->captionText is
+ * non-empty. See grCaption.cpp.
+ */
+void grCaptionBuild(struct grRenderer *r, double fbw, double fbh);
 
 /**
  * Moves the list's selection cursor by @p delta (+1/-1) within
@@ -612,12 +620,16 @@ typedef struct grGlobalsUBO {
   uint32_t flags; /**< bit0: per-node color, bit1: per-node size,
                        bit2: per-edge color, bit3: edge degree-alpha,
                        bit4: edge weight-width, bit5: directed (draw
-                       arrowheads). */
+                       arrowheads), bit6: node shape is rounded-square
+                       instead of circle (see grNodeStyle::roundedSquare),
+                       bit7: per-edge dashed (see grRendererSetEdgeDashed). */
   float nodeFill[4];
   float nodeStroke[4];
   /** x: radius, y: strokeWidth, z: sizeMode (0 px / 1 world), w: proj11. */
   float nodeParams[4];
-  /** x: minPixelRadius, y: maxPixelRadius (0 disables each), z/w: unused. */
+  /** x: minPixelRadius, y: maxPixelRadius (0 disables each), z: corner
+   *  radius fraction (grNodeStyle::cornerRadiusFraction, read only when
+   *  bit6 of flags is set), w: unused. */
   float nodeSizeLimits[4];
   float edgeColor[4];
   /** x: width, y: sizeMode, z: maxDegree (degree-alpha),
@@ -677,6 +689,8 @@ struct grRenderer {
   WGPUBuffer edgeColorsBuf;
   WGPUBuffer nodeDegreesBuf;
   WGPUBuffer edgeWeightsBuf;
+  WGPUBuffer edgeDashedBuf; /**< 0/1 per edge, edge-buffer order; see
+                                 grRendererSetEdgeDashed. */
   size_t edgesBufCapacity; /**< In edges. */
   WGPUBindGroup bindGroup;
   bool bindGroupDirty;
@@ -690,6 +704,10 @@ struct grRenderer {
    *  combine. */
   bool hasNodeColors, hasNodeSizes, hasEdgeColors, hasNodeDegrees;
   bool hasEdgeWeights;
+  bool hasEdgeDashed; /**< Whether edgeDashedBuf currently holds real data
+                           (edge-buffer-order dependent, like hasEdgeColors/
+                           hasEdgeWeights -- invalidated on every structural
+                           change, see uploadTopology). */
   uint32_t maxNodeDegree; /**< Max value last uploaded via SetNodeDegrees. */
   float meanEdgeWeight;   /**< Mean value last uploaded via SetEdgeWeights. */
   /** CPU mirror of the last grRendererSetNodeSizes upload, indexed by
@@ -756,6 +774,21 @@ struct grRenderer {
   size_t statsMenuSeriesCount; /**< Last series count synced to the macOS menu. */
   double statsLayoutFbw, statsLayoutFbh, statsLayoutScale;
   bool statsOverlayDirty;
+
+  // caption overlay (grCaption.cpp): a single small text banner across the
+  // bottom of the window, for apps that want to narrate what's currently
+  // happening (e.g. a teaching visualization's "current step" text) without
+  // building their own screen-space text drawing. Independent of the
+  // vertex-info/stats panels; appended into the same shared statsPrims list.
+  std::string captionText; /**< Empty draws nothing. Owned/copied here --
+                                unlike vertex labels, captions are short and
+                                change often, so copying is not worth
+                                avoiding. */
+  bool captionVisible;
+  bool captionDirty; /**< Set on grRendererSetCaption/ShowCaption; forces
+                          the shared overlay-prims rebuild pass to run,
+                          same role as statsOverlayDirty/vertexOverlayDirty/
+                          listOverlayDirty. */
 
   // vertex-info overlay (click-to-inspect vertex string data; appended to
   // the stats overlay's prim list, buffer, and pipeline)
