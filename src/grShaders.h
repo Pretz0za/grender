@@ -40,15 +40,6 @@ static const char GR_WGSL_SOURCE[] =
     "const ARROW_LENGTH_SCALE : f32 = 11.0;\n"
     "const ARROW_WIDTH_SCALE  : f32 = 4.5;\n"
     "\n"
-    // Screen-space overlay primitive; must match grStatsPrim in grInternal.h.
-    "struct StatsPrim {\n"
-    "  ab        : vec4f,\n" // rect: min/max corners; line: endpoints (px)
-    "  color     : u32,\n"
-    "  kind      : u32,\n"   // 0 = rect, 1 = line
-    "  halfWidth : f32,\n"
-    "  pad       : f32,\n"
-    "}\n"
-    "\n"
     "@group(0) @binding(0) var<uniform> G : Globals;\n"
     "@group(0) @binding(1) var<storage, read> positions  : array<f32>;\n"
     "@group(0) @binding(2) var<storage, read> nodeIds    : array<u32>;\n"
@@ -56,13 +47,12 @@ static const char GR_WGSL_SOURCE[] =
     "@group(0) @binding(4) var<storage, read> nodeSizes  : array<f32>;\n"
     "@group(0) @binding(5) var<storage, read> edges      : array<u32>;\n"
     "@group(0) @binding(6) var<storage, read> edgeColors : array<u32>;\n"
-    "@group(0) @binding(7) var<storage, read> statsPrims : array<StatsPrim>;\n"
-    "@group(0) @binding(8) var<storage, read> nodeDegrees : array<u32>;\n"
-    "@group(0) @binding(9) var<storage, read> edgeWeights : array<f32>;\n"
+    "@group(0) @binding(7) var<storage, read> nodeDegrees : array<u32>;\n"
+    "@group(0) @binding(8) var<storage, read> edgeWeights : array<f32>;\n"
     // 0/1 per edge, edge-buffer order (see grRendererSetEdgeDashed); only
     // read when FLAG_EDGE_DASHED is set, exactly like every other optional
     // per-element attribute buffer here.
-    "@group(0) @binding(10) var<storage, read> edgeDashed : array<u32>;\n"
+    "@group(0) @binding(9) var<storage, read> edgeDashed : array<u32>;\n"
     "\n"
     "fn getPos(i : u32) -> vec3f {\n"
     "  let base = i * G.posDim;\n"
@@ -315,64 +305,7 @@ static const char GR_WGSL_SOURCE[] =
     "  if (coverage <= 0.0) { discard; }\n"
     "  return vec4f(in.color.rgb, in.color.a * coverage);\n"
     "}\n"
-    "\n"
-    // -------------------------------------------------- stats overlay --
-    // Screen-space rects and anti-aliased line segments, in framebuffer
-    // pixels with the origin at the top-left corner.
-    "struct StatsOut {\n"
-    "  @builtin(position) clip : vec4f,\n"
-    "  @location(0) across : f32,\n"
-    "  @location(1) color : vec4f,\n"
-    "  @location(2) @interpolate(flat) halfWidthPx : f32,\n"
-    "  @location(3) @interpolate(flat) kind : u32,\n"
-    "}\n"
-    "\n"
-    "fn pxToClip(px : vec2f) -> vec4f {\n"
-    "  return vec4f(px.x / G.viewport.x * 2.0 - 1.0,\n"
-    "               1.0 - px.y / G.viewport.y * 2.0, 0.0, 1.0);\n"
-    "}\n"
-    "\n"
-    "@vertex\n"
-    "fn vsStats(@builtin(vertex_index) vid : u32,\n"
-    "           @builtin(instance_index) iid : u32) -> StatsOut {\n"
-    "  let prim = statsPrims[iid];\n"
-    "  let color = unpackColor(prim.color);\n"
-    "\n"
-    "  if (prim.kind == 0u) {\n" // rect
-    "    let corner = CORNERS[vid] * 0.5 + 0.5;\n"
-    "    let px = mix(prim.ab.xy, prim.ab.zw, corner);\n"
-    "    return StatsOut(pxToClip(px), 0.0, color, 1.0, 0u);\n"
-    "  }\n"
-    "\n" // line segment, same billboarding as vsEdge
-    "  let a = prim.ab.xy;\n"
-    "  let b = prim.ab.zw;\n"
-    "  var dir = b - a;\n"
-    "  let len = length(dir);\n"
-    "  if (len < 1e-6) { dir = vec2f(1.0, 0.0); } else { dir = dir / len; }\n"
-    "  let normal = vec2f(-dir.y, dir.x);\n"
-    "\n"
-    "  var end = 0.0;\n"
-    "  if (vid == 1u || vid == 2u || vid == 4u) { end = 1.0; }\n"
-    "  var side = -1.0;\n"
-    "  if (vid == 2u || vid == 4u || vid == 5u) { side = 1.0; }\n"
-    "\n"
-    "  let quadHalf = prim.halfWidth + 0.5;\n"
-    // Extend caps by quadHalf so adjacent polyline segments join cleanly.
-    "  let px = mix(a, b, end) + dir * (end * 2.0 - 1.0) * prim.halfWidth\n"
-    "           + normal * side * quadHalf;\n"
-    "  return StatsOut(pxToClip(px), side * quadHalf, color,\n"
-    "                  prim.halfWidth, 1u);\n"
-    "}\n"
-    "\n"
-    "@fragment\n"
-    "fn fsStats(in : StatsOut) -> @location(0) vec4f {\n"
-    "  if (in.kind == 0u) { return in.color; }\n"
-    "  let coverage =\n"
-    "      1.0 - smoothstep(in.halfWidthPx - 0.5, in.halfWidthPx + 0.5,\n"
-    "                       abs(in.across));\n"
-    "  if (coverage <= 0.0) { discard; }\n"
-    "  return vec4f(in.color.rgb, in.color.a * coverage);\n"
-    "}\n";
+    ;
 
 /**
  * WGSL for the object overlay: a small self-contained panel (background +

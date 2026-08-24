@@ -6,6 +6,8 @@
 # Vendored dependencies (populated once via scripts/setup-deps.sh)
 /third-party/wgpu-native/
 /third-party/glfw/
+/third-party/imgui/
+/third-party/implot/
 
 # Editor / language-server cache
 .cache/

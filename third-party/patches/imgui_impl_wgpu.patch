@@ -1,0 +1,31 @@
+--- a/backends/imgui_impl_wgpu.cpp	2026-08-24 11:19:37
++++ b/backends/imgui_impl_wgpu.cpp	2026-08-24 11:19:37
+@@ -60,9 +60,12 @@
+ #include <limits.h>
+ #include <webgpu/webgpu.h>
+ 
+-#ifdef IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+ // Dawn renamed WGPUProgrammableStageDescriptor to WGPUComputeState (see: https://github.com/webgpu-native/webgpu-headers/pull/413)
+-// Using type alias until WGPU adopts the same naming convention (#8369)
++// Using type alias until WGPU adopts the same naming convention (#8369) --
++// GRENDER PATCH: wgpu-native has since adopted it too (confirmed against the
++// version pinned in scripts/setup-deps.sh), so alias for both backends
++// instead of DAWN only. See scripts/setup-deps.sh's imgui patch step.
++#if defined(IMGUI_IMPL_WEBGPU_BACKEND_DAWN) || defined(IMGUI_IMPL_WEBGPU_BACKEND_WGPU)
+ using WGPUProgrammableStageDescriptor = WGPUComputeState;
+ #endif
+ 
+@@ -685,9 +688,12 @@
+     graphics_pipeline_desc.vertex.entryPoint = vertex_shader_desc.entryPoint;
+ 
+     // Vertex input configuration
++    // GRENDER PATCH: WGPUVertexAttribute gained a leading nextInChain field
++    // in the same header revision that removed WGPUProgrammableStageDescriptor
++    // (see the alias above) -- true for wgpu-native as pinned, not just Dawn.
+     WGPUVertexAttribute attribute_desc[] =
+     {
+-#ifdef IMGUI_IMPL_WEBGPU_BACKEND_DAWN
++#if defined(IMGUI_IMPL_WEBGPU_BACKEND_DAWN) || defined(IMGUI_IMPL_WEBGPU_BACKEND_WGPU)
+         { nullptr, WGPUVertexFormat_Float32x2, (uint64_t)offsetof(ImDrawVert, pos), 0 },
+         { nullptr, WGPUVertexFormat_Float32x2, (uint64_t)offsetof(ImDrawVert, uv),  1 },
+         { nullptr, WGPUVertexFormat_Unorm8x4,  (uint64_t)offsetof(ImDrawVert, col), 2 },

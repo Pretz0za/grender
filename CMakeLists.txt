@@ -152,6 +152,67 @@ if(GRENDER_BUILD_EXAMPLES AND EXISTS "${GRENDER_GVIZ_DIR}/CMakeLists.txt")
 endif()
 
 # ------------------------------------------------------------------------------
+# Dear ImGui + ImPlot: every on-screen overlay (stats charts, vertex list,
+# vertex-info panel, caption banner, command console) is an ImGui/ImPlot
+# window drawn on top of the WebGPU surface via the official imgui_impl_wgpu
+# + imgui_impl_glfw backends -- lifecycle wiring lives in grRenderer.cpp next
+# to the GLFW/WebGPU device it depends on; window-building code lives in
+# grStats.cpp/grListOverlay.cpp/grVertexOverlay.cpp/grCaption.cpp/
+# grConsole.cpp, one per overlay, unchanged from before this migration. Only
+# the two graph instanced draw calls and the .obj picture-in-picture panel
+# stay native WebGPU (grRenderer.cpp / grObjOverlay.cpp).
+#
+# Vendored as extracted source under third-party/ (see scripts/setup-deps.sh),
+# the same pinned-not-FetchContent convention as GLFW/wgpu-native. Unlike
+# GLFW, upstream ImGui/ImPlot ship no CMakeLists.txt of their own, so there's
+# no add_subdirectory() step -- their sources are just added to the grender
+# target directly below.
+# ------------------------------------------------------------------------------
+set(GRENDER_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third-party/imgui" CACHE PATH
+    "Path to extracted Dear ImGui source tree")
+set(GRENDER_IMPLOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third-party/implot" CACHE PATH
+    "Path to extracted ImPlot source tree")
+
+if(NOT EXISTS "${GRENDER_IMGUI_DIR}/imgui.cpp")
+    message(FATAL_ERROR
+        "Dear ImGui not found at ${GRENDER_IMGUI_DIR}.\n"
+        "Run ./scripts/setup-deps.sh once, or set -DGRENDER_IMGUI_DIR=...")
+endif()
+if(NOT EXISTS "${GRENDER_IMPLOT_DIR}/implot.cpp")
+    message(FATAL_ERROR
+        "ImPlot not found at ${GRENDER_IMPLOT_DIR}.\n"
+        "Run ./scripts/setup-deps.sh once, or set -DGRENDER_IMPLOT_DIR=...")
+endif()
+
+add_library(imgui STATIC
+    "${GRENDER_IMGUI_DIR}/imgui.cpp"
+    "${GRENDER_IMGUI_DIR}/imgui_draw.cpp"
+    "${GRENDER_IMGUI_DIR}/imgui_tables.cpp"
+    "${GRENDER_IMGUI_DIR}/imgui_widgets.cpp"
+    "${GRENDER_IMGUI_DIR}/backends/imgui_impl_glfw.cpp"
+    "${GRENDER_IMGUI_DIR}/backends/imgui_impl_wgpu.cpp"
+    "${GRENDER_IMPLOT_DIR}/implot.cpp"
+    "${GRENDER_IMPLOT_DIR}/implot_items.cpp"
+)
+target_include_directories(imgui PUBLIC
+    "${GRENDER_IMGUI_DIR}"
+    "${GRENDER_IMGUI_DIR}/backends"
+    "${GRENDER_IMPLOT_DIR}"
+)
+target_link_libraries(imgui PUBLIC glfw wgpu_native)
+if(NOT EMSCRIPTEN)
+    # Exactly one of these must be defined for imgui_impl_wgpu.cpp when not
+    # targeting Emscripten (its own emdawnwebgpu port is auto-detected by the
+    # backend instead) -- see imgui_impl_wgpu.h. grender pins wgpu-native
+    # (scripts/setup-deps.sh), not Dawn.
+    target_compile_definitions(imgui PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_WGPU)
+endif()
+if(NOT MSVC)
+    # Vendored code: don't hold it to grender's own -Wall -Wextra below.
+    target_compile_options(imgui PRIVATE -w)
+endif()
+
+# ------------------------------------------------------------------------------
 # grender library
 # ------------------------------------------------------------------------------
 add_library(grender STATIC
@@ -210,7 +271,7 @@ endif()
 
 target_link_libraries(grender
     PUBLIC wgpu_native
-    PRIVATE glfw
+    PRIVATE glfw imgui
 )
 if(GRENDER_OPENBLAS)
     target_link_libraries(grender PRIVATE ${GRENDER_OPENBLAS})
@@ -323,6 +384,13 @@ if(GRENDER_BUILD_EXAMPLES AND TARGET gviz AND NOT EMSCRIPTEN)
     target_link_libraries(textureMapDemo PRIVATE grender gviz)
 
     add_executable(textureMapUnitTest examples/textureMapUnitTest.cpp)
+    # This test reaches past grender's public API into grInternal.h directly
+    # (see textureMapUnitTest.cpp) to exercise grTextureMapComputeUV/
+    # ComputeFaceValidity, the pure-CPU helpers split out for exactly this --
+    # no gviz/GPU types involved. grInternal.h now pulls in imgui.h/implot.h
+    # too (for the overlay declarations every other grInternal.h consumer
+    # needs), so this target needs imgui's include dirs even though it never
+    # calls into ImGui itself.
     target_include_directories(textureMapUnitTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_link_libraries(textureMapUnitTest PRIVATE grender gviz)
+    target_link_libraries(textureMapUnitTest PRIVATE grender gviz imgui)
 endif()

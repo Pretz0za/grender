@@ -8,6 +8,17 @@
 
 #include <webgpu/webgpu.h>
 
+// Every overlay (stats charts, vertex list, vertex-info panel, caption
+// banner, command console) is an ImGui/ImPlot window -- see grStats.cpp,
+// grListOverlay.cpp, grVertexOverlay.cpp, grCaption.cpp, grConsole.cpp.
+// Included here (rather than separately in each of those .cpp files) since
+// every one of them already pulls in grInternal.h. The imgui_impl_glfw.h/
+// imgui_impl_wgpu.h backend headers are NOT included here -- only
+// grRenderer.cpp needs them, for the Init/NewFrame/Shutdown lifecycle calls
+// next to the GLFW/WebGPU device they wrap.
+#include "imgui.h"
+#include "implot.h"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -245,120 +256,30 @@ uint32_t grTopologyVertexDegree(const grTopology *topo, size_t v);
 // Stats overlay (charts for gviz::layout::StatSeries recorded by the embedder)
 // ------------------------------------------------------------------------------
 
-/** One screen-space overlay primitive. Must match struct StatsPrim in
- *  grShaders.h (32 bytes, vec4f-aligned). */
-typedef struct grStatsPrim {
-  /** Rect: min corner (xy) and max corner (zw). Line: endpoints a (xy) and
-   *  b (zw). Framebuffer pixels, origin top-left. */
-  float ab[4];
-  uint32_t color; /**< GR_RGBA8 packed. */
-  uint32_t kind;  /**< 0 = rect, 1 = anti-aliased line segment. */
-  float halfWidth;
-  float pad;
-} grStatsPrim;
-
 struct grRenderer;
 
-/** Advance of one character cell, in font pixels; and glyph height, in font
- *  rows. Shared layout constants for the tiny bitmap font in grStats.cpp. */
-#define GR_FONT_ADVANCE 6.0
-#define GR_FONT_ROWS 7
+/**
+ * Draws an ImGui window ("Stats") holding one ImPlot line chart per
+ * non-empty, currently-shown stat series of the attached graph, stacked
+ * top-to-bottom. Must run between ImGui::NewFrame() and ImGui::Render() (see
+ * grRendererFrame). Only reads the graph through EmbeddedGraph::StatSeries*;
+ * no-op when no graph is attached. Autoscales every frame -- ImPlot recomputes
+ * axis limits from the live sample data itself, so there is no cached range
+ * to invalidate the way the old bitmap-font renderer needed.
+ */
+void grStatsOverlayBuild(struct grRenderer *r);
 
 /**
- * Rebuilds the overlay primitive list (r->statsPrims) from the stat series of
- * the attached graph: one mini line chart per non-empty series, stacked in the
- * top-right corner. Only reads the graph through EmbeddedGraph::StatSeries*.
+ * Draws an ImGui window ("Vertex Info") showing the grRendererSetVertexLabels
+ * label of the last vertex picked via GR_ACTION_PICK_VERTEX (or selected from
+ * the vertex-list overlay), word-wrapped by ImGui::TextWrapped. Draws nothing
+ * (not even an empty window) when the panel is hidden
+ * (grRendererShowVertexInfo), no vertex is picked, or it has no label -- see
+ * grRendererShowVertexInfo's doc comment for the exact contract. Labels come
+ * entirely from grRendererSetVertexLabels; this never reads gviz's graph
+ * loader directly.
  */
-void grStatsOverlayBuild(struct grRenderer *r, double fbw, double fbh);
-
-/** Screen-space width, in pixels, of @p text set at @p px font-pixel size. */
-double grOverlayTextWidth(const char *text, double px);
-
-/** Pushes a filled rect into r->statsPrims. */
-void grOverlayPushRect(struct grRenderer *r, double x0, double y0, double x1,
-                       double y1, uint32_t color);
-
-/** Pushes an anti-aliased line segment into r->statsPrims. */
-void grOverlayPushLine(struct grRenderer *r, double x0, double y0, double x1,
-                       double y1, double halfWidth, uint32_t color);
-
-/** Pushes a thin rect frame (four edges) into r->statsPrims. */
-void grOverlayPushFrame(struct grRenderer *r, double x0, double y0, double x1,
-                        double y1, double thickness, uint32_t color);
-
-/** Draws @p text with its top-left corner at (x, y) into r->statsPrims;
- *  @p px is the size of one font pixel. */
-void grOverlayPushText(struct grRenderer *r, double x, double y, double px,
-                       uint32_t color, const char *text);
-
-/** Like grOverlayPushText, but skips any glyph row entirely outside
- *  [clipY0, clipY1) -- used to scroll text within a fixed-height panel
- *  without spilling past its edges. */
-void grOverlayPushTextClipped(struct grRenderer *r, double x, double y,
-                              double px, uint32_t color, const char *text,
-                              double clipY0, double clipY1);
-
-/** Whether @p c has a glyph in the tiny bitmap font (case-insensitive).
- *  grOverlayPushText silently skips characters without one, so callers doing
- *  their own line-wrapping must not count those characters' width either --
- *  otherwise wrapping reserves screen space for a character that never
- *  actually draws anything. */
-bool grOverlayCharHasGlyph(char c);
-
-/**
- * Fixed-width line buffer for grVertexOverlayLayout.lines: one word-wrapped,
- * whitespace-collapsed display line. A struct wrapping the char array, not a
- * bare `typedef char grVertexOverlayLine[96]` array type as in the old C
- * code: std::vector<T> requires T to be copy-constructible/-assignable,
- * which a raw array type is not (arrays can't be assigned in C++). The
- * conversion operators and operator[] below let every existing array-style
- * use (`buf[0] = ...`, `sizeof(buf)`, passing a `const grVertexOverlayLine&`
- * where a `const char*` is expected) keep working unchanged at call sites.
- */
-struct grVertexOverlayLine {
-  char data[96];
-  char &operator[](size_t i) noexcept { return data[i]; }
-  const char &operator[](size_t i) const noexcept { return data[i]; }
-  operator char *() noexcept { return data; }
-  operator const char *() const noexcept { return data; }
-};
-
-/** Panel geometry and scroll extent for the vertex-info overlay, computed
- *  without emitting any draw primitives. Shared by grRendererFrame's input
- *  handling (to hit-test the mouse against the panel and clamp scroll input)
- *  and by grVertexOverlayBuild (to actually draw it), so both agree on where
- *  the panel is without duplicating layout math. */
-typedef struct grVertexOverlayLayout {
-  bool visible;
-  double x0, y0, x1, y1;       /**< Panel bounds, framebuffer pixels. */
-  double contentY0, contentY1; /**< Vertical clip range for scrollable text,
-                                     inside the padding and below the title. */
-  double lineH;
-  double maxScrollPx; /**< 0 if all lines fit without scrolling. */
-} grVertexOverlayLayout;
-
-/**
- * Computes the vertex-info panel's bounds and re-wraps its text into
- * r->vertexOverlayLines (of grVertexOverlayLine), without touching
- * r->statsPrims. @p out->visible is false (all other fields zeroed) if the
- * panel is hidden (grRendererShowVertexInfo), no vertex is currently
- * picked, or it has no label.
- */
-void grVertexOverlayComputeLayout(struct grRenderer *r, double fbw,
-                                  double fbh, grVertexOverlayLayout *out);
-
-/**
- * Appends the vertex-info panel (the parent-graph vertex id and label of the
- * last vertex picked via GR_ACTION_PICK_VERTEX) to r->statsPrims, if a
- * picked vertex with a non-NULL label is set. Labels come from
- * grRendererSetVertexLabels; this never reads gviz directly. The label is
- * split on real newlines, whitespace-collapsed, and word-wrapped -- gviz's
- * graph loader hands back pretty-printed JSON with one field per line, and
- * this is what actually turns that into readable, non-overflowing text (see
- * grVertexOverlayComputeLayout). Scrolls via r->vertexOverlayScrollPx when
- * the wrapped text is taller than the panel.
- */
-void grVertexOverlayBuild(struct grRenderer *r, double fbw, double fbh);
+void grVertexOverlayBuild(struct grRenderer *r);
 
 // ------------------------------------------------------------------------------
 // Vertex list overlay (scrollable list of vertices, filtered by the active
@@ -366,77 +287,42 @@ void grVertexOverlayBuild(struct grRenderer *r, double fbw, double fbh);
 // grListOverlay.cpp)
 // ------------------------------------------------------------------------------
 
-/** Panel geometry for the vertex-list overlay, computed without emitting any
- *  draw primitives or re-running the fuzzy filter -- mirrors
- *  grVertexOverlayLayout's role of letting grRendererFrame's input handling
- *  hit-test the panel (search bar vs. list body) and clamp scroll input
- *  without duplicating layout math. maxScrollPx is derived from the *cached*
- *  r->listFilteredIds count, so calling this every frame (as processInput
- *  does, for hit-testing) never re-runs the filter itself. */
-typedef struct grListOverlayLayout {
-  bool visible;
-  double x0, y0, x1, y1;       /**< Panel bounds, framebuffer pixels. */
-  double searchY0, searchY1;   /**< Search-bar row, inside the panel. */
-  double contentY0, contentY1; /**< Vertical clip range for the scrollable
-                                     vertex list, below the search bar. */
-  double lineH;
-  double maxScrollPx; /**< 0 if all filtered rows fit without scrolling. */
-} grListOverlayLayout;
-
 /**
- * Computes the vertex-list panel's bounds, without touching r->statsPrims or
- * r->listFilteredIds. @p out->visible is false (all other fields zeroed) when
- * the overlay is hidden, no graph is attached, or the framebuffer is too
- * small to fit it.
- */
-void grListOverlayComputeLayout(struct grRenderer *r, double fbw, double fbh,
-                                grListOverlayLayout *out);
-
-/**
- * Appends the vertex-list panel (search bar + scrollable rows) to
- * r->statsPrims, if visible. When r->listFilterDirty, first rebuilds
+ * Draws an ImGui window ("Vertices") holding the search bar
+ * (ImGui::InputText, writing into r->listSearchInput) and the scrollable,
+ * filtered vertex list below it. When r->listFilterDirty, first rebuilds
  * r->listFilteredIds: the vertices of the active highlight (or, with no
  * highlight active, every visible vertex in the current topology), further
- * narrowed to those whose grRendererSetVertexLabels DATA string fuzzy-matches
- * r->listSearchInput (vertices with a NULL label never match a non-empty
- * query), ranked best-match-first when a query is active. Labels are read
- * exactly as supplied -- this never touches gviz's graph loader directly, the
- * same "supplied by the caller, indexed by parent-graph vertex id" contract
- * as grVertexOverlayBuild.
+ * narrowed to those whose grRendererSetVertexLabels DATA string
+ * fuzzy-matches r->listSearchInput (vertices with a NULL label never match a
+ * non-empty query), ranked best-match-first when a query is active. Labels
+ * are read exactly as supplied -- this never touches gviz's graph loader
+ * directly, the same "supplied by the caller, indexed by parent-graph vertex
+ * id" contract as grVertexOverlayBuild. Sets r->listSearchInputFocused to
+ * whether the search box has ImGui keyboard focus as of this call, which
+ * processInput (grRenderer.cpp) reads to decide whether Escape should clear
+ * the query. No-op when the overlay is hidden or no graph is attached.
  */
-void grListOverlayBuild(struct grRenderer *r, double fbw, double fbh);
+void grListOverlayBuild(struct grRenderer *r);
 
 /**
- * Appends the caption banner (r->captionText, centered near the bottom of
- * the window) to r->statsPrims, if r->captionVisible and r->captionText is
- * non-empty. See grCaption.cpp.
+ * Draws an ImGui window (no title bar, semi-transparent, centered near the
+ * bottom of the window) holding r->captionText, if r->captionVisible and
+ * r->captionText is non-empty. @p fbw/@p fbh position it relative to the
+ * current framebuffer size. See grCaption.cpp.
  */
 void grCaptionBuild(struct grRenderer *r, double fbw, double fbh);
 
 /**
  * Moves the list's selection cursor by @p delta (+1/-1) within
  * r->listFilteredIds, wiring the newly selected row up exactly like clicking
- * its vertex would for the vertex-info panel: sets r->pickedVertexId (and
- * resets r->vertexOverlayScrollPx) so that vertex's grRendererSetVertexLabels
- * DATA string shows there, without touching the current highlight or
- * re-running the list's own filter. Scrolls the panel (r->listScrollPx) just
- * enough to keep the newly selected row within view. No-op when the list is
- * empty. @p fbw/@p fbh are needed to compute the panel's current layout for
- * that scroll-into-view adjustment.
+ * its vertex would for the vertex-info panel: sets r->pickedVertexId so that
+ * vertex's grRendererSetVertexLabels DATA string shows there, without
+ * touching the current highlight or re-running the list's own filter.
+ * Scrolls the newly selected row into view via ImGui::SetScrollHereY the
+ * next time grListOverlayBuild runs. No-op when the list is empty.
  */
-void grListOverlaySelectDelta(struct grRenderer *r, double fbw, double fbh,
-                              int delta);
-
-/**
- * Consumes this frame's queued input (r->pendingConsoleEvents) as vertex-list
- * search-box text editing: printable characters append to
- * r->listSearchInput, Backspace deletes, Enter defocuses (keeping the
- * query), Escape clears the query and defocuses. Mutually exclusive with the
- * console's own use of the same queue -- only called while
- * r->listSearchFocused, which grRendererFrame's input handling never sets
- * while the console is open.
- */
-void grListSearchProcessInput(struct grRenderer *r);
+void grListOverlaySelectDelta(struct grRenderer *r, int delta);
 
 // ------------------------------------------------------------------------------
 // Command console (stateless command line, e.g. "find <id>"; see grConsole.cpp)
@@ -450,31 +336,19 @@ void grConsoleOpen(struct grRenderer *r);
 void grConsoleClose(struct grRenderer *r);
 
 /**
- * Consumes this frame's queued input (r->pendingConsoleEvents, in delivery
- * order) as console text input: printable characters append to
- * r->consoleInput, Backspace deletes, Enter runs the line (see grConsoleRun)
- * and clears it, Escape closes the console. Drains the queue unconditionally,
- * so any key/char event delivered while the console is open is consumed here
- * and never reaches grRenderer's own navigation/action dispatch. Only
- * meaningful (and only called) while r->consoleOpen.
- */
-void grConsoleProcessInput(struct grRenderer *r);
-
-/**
  * Parses @p line as "<command> [args...]" (whitespace-separated) and runs it
  * against the console's built-in command table, writing a result or error
  * message into r->consoleMessage for the next grConsoleBuild to display. An
- * empty or all-whitespace line is a silent no-op. Exposed as its own entry
- * point (rather than folded into grConsoleProcessInput) so a line can be run
- * without going through the interactive input queue.
+ * empty or all-whitespace line is a silent no-op.
  */
 void grConsoleRun(struct grRenderer *r, const char *line);
 
 /**
- * Appends the console panel -- the input line with its prompt and cursor,
- * plus the last command's result/error message -- to r->statsPrims, the same
- * primitive list and instanced draw pass used by the stats and vertex-info
- * overlays. No-op when the console is closed.
+ * Draws an ImGui window (no title bar, docked to the bottom of the window,
+ * @p fbw/@p fbh wide) holding the input line (ImGui::InputText with
+ * ImGuiInputTextFlags_EnterReturnsTrue -- Enter runs it via grConsoleRun and
+ * clears the buffer) and the last command's result/error message below it.
+ * No-op when the console is closed.
  */
 void grConsoleBuild(struct grRenderer *r, double fbw, double fbh);
 
@@ -717,22 +591,6 @@ typedef struct grPendingMouse {
   double yPx;
 } grPendingMouse;
 
-/**
- * One console input event, in the chronological order GLFW delivered it:
- * either a key press (only Enter/Escape/Backspace matter; others are
- * ignored) or a typed character. Both onKey and onChar push into this same
- * queue (in addition to onKey's own grPendingKey queue, used for navigation/
- * action dispatch when the console is closed) specifically so
- * grConsoleProcessInput can apply "type '3', then press Enter" in the order
- * it actually happened -- draining two independently-ordered queues (keys,
- * then chars) would instead let a same-frame Enter run against input that's
- * missing the character typed just before it.
- */
-typedef struct grPendingConsoleEvent {
-  bool isChar;
-  int32_t code; /**< GLFW key code if !isChar, Unicode codepoint if isChar. */
-} grPendingConsoleEvent;
-
 /** Must match struct Globals in grShaders.h (16-byte aligned rows). */
 typedef struct grGlobalsUBO {
   float viewProj[16];
@@ -784,7 +642,6 @@ struct grRenderer {
   WGPUPipelineLayout pipelineLayout;
   WGPURenderPipeline nodePipeline;
   WGPURenderPipeline edgePipeline;
-  WGPURenderPipeline statsPipeline;
   WGPUTexture depthTexture;
   WGPUTextureView depthView;
 
@@ -914,39 +771,26 @@ struct grRenderer {
   bool nodeDegreeScale;
   float nodeDegreeScaleFactor;
 
-  // stats overlay
+  // stats overlay (grStats.cpp): one ImPlot line chart per stat series,
+  // drawn fresh from EmbeddedGraph::StatSeries* every frame it's visible --
+  // no cached-revision dirty tracking needed anymore (see buildOverlayWindows
+  // in grRenderer.cpp for why).
   bool statsVisible;
-  std::vector<grStatsPrim> statsPrims; /**< CPU staging list, rebuilt when
-                             series revision, the picked vertex, or layout
-                             changes. Holds both the stats charts and the
-                             vertex-info panel (see grVertexOverlayBuild). */
-  WGPUBuffer statsBuf;
-  size_t statsBufCapacity; /**< In primitives. */
-  std::vector<uint64_t> statsSeriesRevisions; /**< Cached
-                                       StatSeries::revision per index. */
   bool *statsSeriesVisible; /**< Per-series chart visibility (render only). */
   size_t statsSeriesVisibleCount;
   size_t statsMenuSeriesCount; /**< Last series count synced to the macOS menu. */
-  double statsLayoutFbw, statsLayoutFbh, statsLayoutScale;
-  bool statsOverlayDirty;
 
-  // caption overlay (grCaption.cpp): a single small text banner across the
+  // caption overlay (grCaption.cpp): a single small ImGui window across the
   // bottom of the window, for apps that want to narrate what's currently
   // happening (e.g. a teaching visualization's "current step" text) without
-  // building their own screen-space text drawing. Independent of the
-  // vertex-info/stats panels; appended into the same shared statsPrims list.
+  // building their own on-screen text drawing.
   std::string captionText; /**< Empty draws nothing. Owned/copied here --
                                 unlike vertex labels, captions are short and
                                 change often, so copying is not worth
                                 avoiding. */
   bool captionVisible;
-  bool captionDirty; /**< Set on grRendererSetCaption/ShowCaption; forces
-                          the shared overlay-prims rebuild pass to run,
-                          same role as statsOverlayDirty/vertexOverlayDirty/
-                          listOverlayDirty. */
 
-  // vertex-info overlay (click-to-inspect vertex string data; appended to
-  // the stats overlay's prim list, buffer, and pipeline)
+  // vertex-info overlay (click-to-inspect vertex string data; grVertexOverlay.cpp)
   const char *const *vertexLabels; /**< Optional, set via
                                         grRendererSetVertexLabels; not owned,
                                         indexed by parent-graph vertex id. */
@@ -958,36 +802,34 @@ struct grRenderer {
                                Independent of whether a vertex is picked or
                                labels are set -- when false, nothing is drawn
                                even if both are present. */
-  bool vertexOverlayDirty;
-  double vertexOverlayScrollPx; /**< Scroll offset into the wrapped label
-                                      text, in pixels; reset to 0 whenever a
-                                      different vertex is picked. */
-  std::vector<grVertexOverlayLine> vertexOverlayLines; /**< Rebuilt by
-                                      grVertexOverlayComputeLayout every time
-                                      it runs (including every frame, from
-                                      input handling, purely to hit-test the
-                                      panel -- the text is short enough that
-                                      re-wrapping it is not worth caching). */
+  int64_t vertexOverlayShownId; /**< pickedVertexId as of the last
+                                      grVertexOverlayBuild call that actually
+                                      drew a panel; used only to detect "a
+                                      different vertex was just picked" so
+                                      the panel's ImGui scroll position can be
+                                      reset to the top, mirroring the old
+                                      vertexOverlayScrollPx reset. */
 
   // vertex list overlay (searchable "Vertex N" list, filtered by the active
   // highlight and a fuzzy search over vertex labels; grListOverlay.cpp)
   bool listVisible;
-  bool listSearchFocused;     /**< Search bar has keyboard focus: typed keys
-                                    edit listSearchInput instead of driving
-                                    camera nav / bound actions. */
-  char listSearchInput[128];
-  size_t listSearchInputLen;
-  double listScrollPx;        /**< Scroll offset into the filtered row list,
-                                    in pixels; reset to 0 whenever the filter
-                                    is rebuilt with a different result set. */
+  bool listSearchInputFocused; /**< Whether the search box (ImGui::InputText)
+                                    had ImGui keyboard focus as of the most
+                                    recent grListOverlayBuild call; read by
+                                    processInput (grRenderer.cpp) so Escape
+                                    can clear the query while it's focused --
+                                    see grListOverlaySelectDelta's doc. */
+  char listSearchInput[128];   /**< ImGui::InputText's buffer directly --
+                                    ImGui null-terminates and manages the
+                                    content in place; no separate length
+                                    field needed. */
   std::vector<uint32_t> listFilteredIds;  /**< Parent-graph vertex ids
                                     currently shown, after the highlight
                                     filter and fuzzy search, best match first.
                                     Only rebuilt when listFilterDirty (see
-                                    grListOverlayBuild) -- unlike the vertex-
-                                    info panel's per-frame rewrap, this can be
-                                    O(vertex count) so it must not run every
-                                    frame just to hit-test the panel. */
+                                    grListOverlayBuild) -- this can be
+                                    O(vertex count), so it must not run every
+                                    frame regardless of visibility. */
   size_t listSelectedIdx; /**< Index into listFilteredIds of the row selected
                                 via Up/Down (see grListOverlaySelectDelta), or
                                 SIZE_MAX for no selection. Reset to SIZE_MAX
@@ -997,30 +839,23 @@ struct grRenderer {
   bool listFilterDirty; /**< Set on search text changes, highlight changes,
                              topology/label changes, and the panel's first
                              show; cleared once grListOverlayBuild has re-run
-                             the filter. Deliberately separate from
-                             listOverlayDirty below: scrolling must redraw
-                             the panel every tick without re-running an
-                             O(vertex count) filter each time. */
-  bool listOverlayDirty; /**< Forces the shared overlay-prims rebuild pass
-                              (see statsOverlayNeedsRebuild) to run, e.g. on
-                              scroll or visibility toggle -- does not by
-                              itself imply the filter needs re-running; see
-                              listFilterDirty for that. */
+                             the filter. */
+  bool listScrollToSelected; /**< Set by grListOverlaySelectDelta; consumed
+                                  by the next grListOverlayBuild to call
+                                  ImGui::SetScrollHereY on the newly selected
+                                  row instead of grender computing the scroll
+                                  offset itself. */
 
-  // command console (stateless command line, e.g. "find <id>"; input handled
-  // by grConsoleProcessInput, commands by grConsoleRun, drawing by
-  // grConsoleBuild -- see grConsole.cpp)
+  // command console (stateless command line, e.g. "find <id>"; commands by
+  // grConsoleRun, input + drawing both via ImGui::InputText in grConsoleBuild
+  // -- see grConsole.cpp)
   bool consoleOpen;
-  char consoleInput[256];      /**< Current, unsubmitted input line. */
-  size_t consoleInputLen;
+  char consoleInput[256];      /**< ImGui::InputText's buffer directly, like
+                                     listSearchInput above -- no separate
+                                     length field. */
   char consoleMessage[128];    /**< Result/error from the last run command,
                                      empty if none yet. */
   bool consoleMessageIsError;
-  std::vector<grPendingConsoleEvent> pendingConsoleEvents; /**< Queued by
-                                        onKey/onChar, drained by
-                                        grConsoleProcessInput while the
-                                        console is open, and discarded each
-                                        frame it isn't (see processInput). */
 
   // object overlay (rotating .obj mesh preview, independent of the graph)
   grObjOverlay objOverlay;

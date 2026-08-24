@@ -7,6 +7,11 @@
 
 #include <GLFW/glfw3.h>
 
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_wgpu.h"
+#include "implot.h"
+
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -147,13 +152,13 @@ static int createPipelines(grRenderer *r) {
   if (!r->shaderModule)
     return -1;
 
-  WGPUBindGroupLayoutEntry entries[11] = {0};
+  WGPUBindGroupLayoutEntry entries[10] = {0};
   entries[0] = (WGPUBindGroupLayoutEntry){
       .binding = 0,
       .visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment,
       .buffer = {.type = WGPUBufferBindingType_Uniform},
   };
-  for (int i = 1; i < 11; i++) {
+  for (int i = 1; i < 10; i++) {
     entries[i] = (WGPUBindGroupLayoutEntry){
         .binding = (uint32_t)i,
         .visibility = WGPUShaderStage_Vertex,
@@ -164,7 +169,7 @@ static int createPipelines(grRenderer *r) {
   r->bindGroupLayout = wgpuDeviceCreateBindGroupLayout(
       r->device, grPtr(WGPUBindGroupLayoutDescriptor{
                      .label = {"grender bgl", WGPU_STRLEN},
-                     .entryCount = 11,
+                     .entryCount = 10,
                      .entries = entries,
                  }));
   r->pipelineLayout = wgpuDeviceCreatePipelineLayout(
@@ -191,20 +196,19 @@ static int createPipelines(grRenderer *r) {
       .writeMask = WGPUColorWriteMask_All,
   };
 
-  const char *labels[3] = {"grender nodes", "grender edges", "grender stats"};
-  const char *vsEntries[3] = {"vsNode", "vsEdge", "vsStats"};
-  const char *fsEntries[3] = {"fsNode", "fsEdge", "fsStats"};
-  WGPURenderPipeline pipelines[3] = {0};
+  const char *labels[2] = {"grender nodes", "grender edges"};
+  const char *vsEntries[2] = {"vsNode", "vsEdge"};
+  const char *fsEntries[2] = {"fsNode", "fsEdge"};
+  WGPURenderPipeline pipelines[2] = {0};
 
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 2; i++) {
     const WGPUDepthStencilState depthState = {
         .format = WGPUTextureFormat_Depth24Plus,
         // Nodes write depth so edges/nodes behind them are occluded in 3D;
-        // edges only test. The stats overlay ignores scene depth entirely.
+        // edges only test.
         .depthWriteEnabled =
             (i == 0) ? WGPUOptionalBool_True : WGPUOptionalBool_False,
-        .depthCompare = (i == 2) ? WGPUCompareFunction_Always
-                                 : WGPUCompareFunction_LessEqual,
+        .depthCompare = WGPUCompareFunction_LessEqual,
         .stencilFront = {.compare = WGPUCompareFunction_Always},
         .stencilBack = {.compare = WGPUCompareFunction_Always},
         .stencilReadMask = 0xFFFFFFFF,
@@ -235,7 +239,6 @@ static int createPipelines(grRenderer *r) {
 
   r->nodePipeline = pipelines[0];
   r->edgePipeline = pipelines[1];
-  r->statsPipeline = pipelines[2];
   return 0;
 }
 
@@ -272,46 +275,77 @@ static void onFramebufferSize(GLFWwindow *window, int width, int height) {
 }
 
 static void onScroll(GLFWwindow *window, double dx, double dy) {
-  (void)dx;
   grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
-  if (r)
-    r->scrollAccum += dy;
+  if (!r)
+    return;
+  ImGui_ImplGlfw_ScrollCallback(window, dx, dy);
+  // A scroll that landed on an ImGui window (a stats chart, the vertex
+  // list, ...) already drove that widget's own scrolling; it must not also
+  // zoom the camera underneath -- see processInput's matching check.
+  if (ImGui::GetIO().WantCaptureMouse)
+    return;
+  r->scrollAccum += dy;
 }
 
 static void onKey(GLFWwindow *window, int key, int scancode, int action,
                   int mods) {
-  (void)scancode;
   grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
-  if (!r || (action != GLFW_PRESS && action != GLFW_REPEAT))
+  if (!r)
     return;
 
-  grPendingKey pk = {key, mods};
-  r->pendingKeys.push_back(pk);
+  // The console toggle key is deliberately never handed to ImGui at all
+  // (neither here nor in onChar's matching codepoint check below): with the
+  // console open, its ImGui::InputText normally has keyboard focus, and if
+  // ImGui saw this key it would just type a backtick into the input line
+  // instead of closing the console. processInput checks r->pendingKeys for
+  // it unconditionally, regardless of what ImGui wants this frame.
+  bool isConsoleToggle = key == GR_CONSOLE_TOGGLE_KEY;
+  if (!isConsoleToggle)
+    ImGui_ImplGlfw_KeyCallback(window, key, scancode, action, mods);
 
-  // Also recorded in the console's own chronologically-ordered queue (see
-  // grPendingConsoleEvent) so Enter/Escape/Backspace interleave correctly
-  // with typed characters from onChar below; harmless/unused when the
-  // console is closed (processInput discards it every such frame).
-  grPendingConsoleEvent ce = {.isChar = false, .code = key};
-  r->pendingConsoleEvents.push_back(ce);
+  if (action != GLFW_PRESS && action != GLFW_REPEAT)
+    return;
+
+  // Escape and the vertex-list's Up/Down selection stay live even while an
+  // ImGui widget (the console's or search box's own input line) has
+  // keyboard focus -- see processInput's unconditional handling of them.
+  // Every other key is dropped here if ImGui wants it, so a bound action
+  // like "F" typed while filtering the vertex list doesn't also fit the
+  // view underneath the search box.
+  bool alwaysLive = isConsoleToggle || key == GR_KEY_ESCAPE ||
+                    key == GR_KEY_UP || key == GR_KEY_DOWN;
+  if (!alwaysLive && ImGui::GetIO().WantCaptureKeyboard)
+    return;
+
+  r->pendingKeys.push_back({key, mods});
 }
 
 static void onChar(GLFWwindow *window, unsigned int codepoint) {
   grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
   if (!r)
     return;
-
-  grPendingConsoleEvent ce = {.isChar = true, .code = (int32_t)codepoint};
-  r->pendingConsoleEvents.push_back(ce);
+  if (codepoint == (unsigned)GR_CONSOLE_TOGGLE_KEY)
+    return; // never typed into any ImGui text field -- see onKey above
+  ImGui_ImplGlfw_CharCallback(window, codepoint);
 }
 
 static void onMouseButton(GLFWwindow *window, int button, int action,
                           int mods) {
   grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
-  if (!r || button < 0 || button > 2)
+  if (!r)
+    return;
+  ImGui_ImplGlfw_MouseButtonCallback(window, button, action, mods);
+  if (button < 0 || button > 2)
     return;
 
   if (action == GLFW_PRESS) {
+    // A press that lands on an ImGui window doesn't start a grender-tracked
+    // click at all, so its eventual release can never dispatch a bound/pick
+    // action -- mirrors onScroll's WantCaptureMouse check above.
+    if (ImGui::GetIO().WantCaptureMouse) {
+      r->mouseDown[button] = false;
+      return;
+    }
     r->mouseDown[button] = true;
     r->mouseDragged[button] = false;
     glfwGetCursorPos(window, &r->mousePressX, &r->mousePressY);
@@ -368,6 +402,7 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   r->accentVertexId = -1;
   r->accentVertexRgba = 0;
   r->vertexInfoVisible = true;
+  r->vertexOverlayShownId = -2; // != pickedVertexId's initial -1
   r->listVisible = true;
   r->listSelectedIdx = SIZE_MAX;
   r->captionVisible = true;
@@ -399,6 +434,22 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   glfwSetKeyCallback(r->window, onKey);
   glfwSetCharCallback(r->window, onChar);
   glfwSetMouseButtonCallback(r->window, onMouseButton);
+
+  // ImGui/ImPlot: every overlay (stats charts, vertex list, vertex-info
+  // panel, caption banner, command console -- see grStats.cpp et al.) is an
+  // ImGui/ImPlot window drawn on top of the WebGPU surface via the official
+  // backends. install_callbacks=false: grender already owns the GLFW
+  // callbacks set just above (its own key/mouse-binding system needs them
+  // regardless of ImGui), so events are forwarded to ImGui manually from
+  // inside onKey/onChar/onMouseButton/onScroll instead of letting this
+  // backend install/chain its own. The WGPU half of the backend
+  // (ImGui_ImplWGPU_Init) can't start yet -- it needs r->device and
+  // r->surfaceFormat, both created further down -- so it's deferred to
+  // just after createPipelines() below.
+  ImGui::CreateContext();
+  ImPlot::CreateContext();
+  ImGui::GetIO().IniFilename = NULL; // no imgui.ini: window layout is fixed
+  ImGui_ImplGlfw_InitForOther(r->window, false);
 
 #ifdef __EMSCRIPTEN__
   // wgpuInstanceWaitAny (used below and in grRendererSaveScreenshot) errors
@@ -567,6 +618,18 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
       r, sizeof(grGlobalsUBO),
       WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "grender globals");
 
+  {
+    ImGui_ImplWGPU_InitInfo initInfo{};
+    initInfo.Device = r->device;
+    initInfo.RenderTargetFormat = r->surfaceFormat;
+    initInfo.DepthStencilFormat = WGPUTextureFormat_Undefined; // no depth
+    if (!ImGui_ImplWGPU_Init(&initInfo)) {
+      GR_LOG("ImGui_ImplWGPU_Init failed\n");
+      grRendererDestroy(r);
+      return NULL;
+    }
+  }
+
   glfwGetCursorPos(r->window, &r->dragLastX, &r->dragLastY);
   r->lastFrameTime = glfwGetTime();
   return r;
@@ -584,6 +647,21 @@ void grRendererDestroy(grRenderer *r) {
   if (!r)
     return;
 
+  // ImGui/ImPlot own no reference to `r`, but their WGPU device objects
+  // (font texture, pipelines, ...) must be torn down before the device
+  // itself -- see the release order below. grRendererCreate can call
+  // grRendererDestroy on a partial-init failure path before either backend
+  // (or even the ImGui context itself) was ever set up, so each Shutdown is
+  // individually guarded on the resource its matching Init needed.
+  if (r->device)
+    ImGui_ImplWGPU_Shutdown();
+  if (r->window)
+    ImGui_ImplGlfw_Shutdown();
+  if (ImPlot::GetCurrentContext())
+    ImPlot::DestroyContext();
+  if (ImGui::GetCurrentContext())
+    ImGui::DestroyContext();
+
   GR_RELEASE(wgpuBufferRelease, r->globalsBuf);
   GR_RELEASE(wgpuBufferRelease, r->positionsBuf);
   GR_RELEASE(wgpuBufferRelease, r->nodeIdsBuf);
@@ -594,12 +672,10 @@ void grRendererDestroy(grRenderer *r) {
   GR_RELEASE(wgpuBufferRelease, r->nodeDegreesBuf);
   GR_RELEASE(wgpuBufferRelease, r->edgeWeightsBuf);
   GR_RELEASE(wgpuBufferRelease, r->edgeDashedBuf);
-  GR_RELEASE(wgpuBufferRelease, r->statsBuf);
   GR_RELEASE(wgpuBindGroupRelease, r->bindGroup);
   grObjOverlayRelease(r);
   GR_RELEASE(wgpuRenderPipelineRelease, r->nodePipeline);
   GR_RELEASE(wgpuRenderPipelineRelease, r->edgePipeline);
-  GR_RELEASE(wgpuRenderPipelineRelease, r->statsPipeline);
   GR_RELEASE(wgpuPipelineLayoutRelease, r->pipelineLayout);
   GR_RELEASE(wgpuBindGroupLayoutRelease, r->bindGroupLayout);
   GR_RELEASE(wgpuShaderModuleRelease, r->shaderModule);
@@ -682,7 +758,6 @@ void grRendererShowStatSeries(grRenderer *r, size_t idx, bool show) {
       r->statsSeriesVisible[idx] == show)
     return;
   r->statsSeriesVisible[idx] = show;
-  r->statsOverlayDirty = true;
   grPlatformStatsMenuRefresh(r);
 }
 
@@ -690,10 +765,6 @@ void grRendererShowStats(grRenderer *r, bool show) {
   if (r->statsVisible == show)
     return;
   r->statsVisible = show;
-  if (show)
-    r->statsOverlayDirty = true;
-  else
-    r->statsPrims.clear();
   grPlatformStatsMenuRefresh(r);
 }
 
@@ -714,9 +785,6 @@ void grRendererShowVertexList(grRenderer *r, bool show) {
   if (!r || r->listVisible == show)
     return;
   r->listVisible = show;
-  r->listOverlayDirty = true;
-  if (!show)
-    r->listSearchFocused = false;
 }
 
 bool grRendererVertexListShown(const grRenderer *r) {
@@ -811,10 +879,7 @@ static int ensurePositionBuffers(grRenderer *r) {
   r->colorsDirty = true;
   r->vertexLabels = NULL;
   r->vertexLabelsCount = 0;
-  if (r->pickedVertexId != -1) {
-    r->pickedVertexId = -1;
-    r->vertexOverlayDirty = true;
-  }
+  r->pickedVertexId = -1;
   return 0;
 }
 
@@ -916,7 +981,6 @@ static int uploadTopology(grRenderer *r) {
   r->colorsDirty = true;
   r->bindGroupDirty = true;
   r->listFilterDirty = true; // visible vertex set changed
-  r->listOverlayDirty = true;
 
   // Auto-maintained attributes: with degree-alpha, node degree-scale, or
   // weight-width enabled, the data those shader modes index is a pure
@@ -959,13 +1023,8 @@ static int rebuildBindGroup(grRenderer *r) {
     r->edgeDashedBuf =
         createBuffer(r, 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
                      "grender edge dashed");
-  if (!r->statsBuf)
-    r->statsBuf =
-        createBuffer(r, sizeof(grStatsPrim),
-                     WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-                     "grender stats prims");
 
-  const WGPUBindGroupEntry entries[11] = {
+  const WGPUBindGroupEntry entries[10] = {
       {.binding = 0,
        .buffer = r->globalsBuf,
        .size = storageBindBytes(r, r->globalsBuf)},
@@ -988,19 +1047,16 @@ static int rebuildBindGroup(grRenderer *r) {
        .buffer = r->edgeColorsBuf,
        .size = storageBindBytes(r, r->edgeColorsBuf)},
       {.binding = 7,
-       .buffer = r->statsBuf,
-       .size = storageBindBytes(r, r->statsBuf)},
-      {.binding = 8,
        .buffer = r->nodeDegreesBuf,
        .size = storageBindBytes(r, r->nodeDegreesBuf)},
-      {.binding = 9,
+      {.binding = 8,
        .buffer = r->edgeWeightsBuf,
        .size = storageBindBytes(r, r->edgeWeightsBuf)},
-      {.binding = 10,
+      {.binding = 9,
        .buffer = r->edgeDashedBuf,
        .size = storageBindBytes(r, r->edgeDashedBuf)},
   };
-  for (size_t i = 0; i < 11; i++) {
+  for (size_t i = 0; i < 10; i++) {
     if (entries[i].size > r->maxStorageBufferBindingSize) {
       GR_LOG("bind group entry %zu size %llu exceeds storage binding limit\n",
              i, (unsigned long long)entries[i].size);
@@ -1011,7 +1067,7 @@ static int rebuildBindGroup(grRenderer *r) {
       r->device, grPtr(WGPUBindGroupDescriptor{
                      .label = {"grender bind group", WGPU_STRLEN},
                      .layout = r->bindGroupLayout,
-                     .entryCount = 11,
+                     .entryCount = 10,
                      .entries = entries,
                  }));
   r->bindGroupDirty = false;
@@ -1048,14 +1104,9 @@ int grRendererSetGraph(grRenderer *r, G &structure,
   r->pickedVertexId = -1;
   r->accentVertexId = -1;
   r->accentVertexRgba = 0;
-  r->vertexOverlayDirty = true;
-  r->listSearchFocused = false;
   r->listSearchInput[0] = '\0';
-  r->listSearchInputLen = 0;
-  r->listScrollPx = 0.0;
   r->listSelectedIdx = SIZE_MAX;
   r->listFilterDirty = true;
-  r->listOverlayDirty = true;
   if (dim == 3 || dim == 4)
     grCameraInit3D(&r->camera);
   else
@@ -1065,9 +1116,6 @@ int grRendererSetGraph(grRenderer *r, G &structure,
     return -1;
   r->topoDirty = false;
   r->drawMaskRevision = embedding.DrawMaskRevision();
-  r->statsSeriesRevisions.clear();
-  r->statsOverlayDirty = true;
-  r->statsPrims.clear();
   r->pcaBasisValid = false;
   statsVisibilitySync(r);
   r->statsMenuSeriesCount = embedding.StatSeriesCount();
@@ -1275,9 +1323,7 @@ int grRendererSetVertexLabels(grRenderer *r, const char *const *labels,
 
   r->vertexLabels = labels;
   r->vertexLabelsCount = labels ? count : 0;
-  r->vertexOverlayDirty = true;
   r->listFilterDirty = true; // search text now matches against new labels
-  r->listOverlayDirty = true;
   return 0;
 }
 
@@ -1638,7 +1684,6 @@ int grRendererSetHighlight(grRenderer *r, const gviz::Subgraph &highlight,
   r->accentVertexRgba = 0;
   r->colorsDirty = true;
   r->listFilterDirty = true; // the list's vertex set follows the highlight
-  r->listOverlayDirty = true;
   return 0;
 }
 
@@ -1676,7 +1721,6 @@ void grRendererClearHighlight(grRenderer *r) {
   // clears any accent vertex (same lifetime as the highlight set).
   grHighlightReset(r);
   r->listFilterDirty = true; // the list's vertex set follows the highlight
-  r->listOverlayDirty = true;
 }
 
 void grRendererSetAccentVertex(grRenderer *r, size_t vertexId, uint32_t rgba) {
@@ -1811,18 +1855,11 @@ grenderActionPickVertex(gviz::layout::EmbeddedGraph &eg, void *userData,
   size_t nearest;
   if (!grHitTestVertex(r, eg, payload.worldX, payload.worldY, &nearest)) {
     grRendererClearHighlight(r);
-    if (r->pickedVertexId != -1) {
-      r->pickedVertexId = -1;
-      r->vertexOverlayDirty = true;
-    }
+    r->pickedVertexId = -1;
     return;
   }
 
-  if (r->pickedVertexId != (int64_t)nearest) {
-    r->pickedVertexId = (int64_t)nearest;
-    r->vertexOverlayScrollPx = 0.0;
-    r->vertexOverlayDirty = true;
-  }
+  r->pickedVertexId = (int64_t)nearest;
 
   // The highlight below needs raw parent-graph access (EnsureLayout) that
   // gviz::Subgraph deliberately never exposes -- see grRendererSetGraph's
@@ -1992,40 +2029,65 @@ void grRendererFocusVertex(grRenderer *r, size_t vertexId) {
 
 static void processInput(grRenderer *r, double fbw, double fbh) {
   r->viewportHeightPx = fbh;
+  ImGuiIO &io = ImGui::GetIO();
 
-  // While the console is open it owns all keyboard/mouse input: typed keys
-  // and characters go to the input line (grConsoleProcessInput), and camera
-  // navigation / action dispatch below never run, so e.g. typing "find" does
-  // not also fit the view (F) or orbit the camera. Clicks that land while
-  // the console has focus are discarded rather than queued for later, since
-  // by the time the console closes they no longer reflect the cursor's
-  // current intent.
+  // The console toggle key and Escape are never forwarded to ImGui at all
+  // (see onKey/onChar) specifically so pressing them while the console's or
+  // the list search box's own ImGui::InputText has keyboard focus closes/
+  // clears it instead of being typed into the input line -- handle them
+  // (and list Up/Down, which also stay live while the search box is
+  // focused) unconditionally here, before anything below reads
+  // WantCaptureKeyboard.
+  for (const grPendingKey &pk : r->pendingKeys) {
+    if (pk.key == GR_CONSOLE_TOGGLE_KEY) {
+      if (r->consoleOpen)
+        grConsoleClose(r);
+      else
+        grConsoleOpen(r);
+    } else if (pk.key == GR_KEY_ESCAPE) {
+      if (r->consoleOpen) {
+        grConsoleClose(r);
+      } else if (r->listSearchInputFocused && r->listSearchInput[0] != '\0') {
+        // Clears the query; does not also blur the box (ImGui::ClearActiveID
+        // is an imgui_internal.h function grender deliberately doesn't pull
+        // in for one call) -- close enough to "blurs" for this to matter in
+        // practice, since Escape again with an already-empty query has
+        // nothing left to clear.
+        r->listSearchInput[0] = '\0';
+        r->listFilterDirty = true;
+      }
+    } else if (r->listVisible && !r->consoleOpen) {
+      if (pk.key == GR_KEY_UP)
+        grListOverlaySelectDelta(r, -1);
+      else if (pk.key == GR_KEY_DOWN)
+        grListOverlaySelectDelta(r, 1);
+    }
+  }
+
+  // While the console is open it owns all keyboard/mouse input: its own
+  // ImGui::InputText already consumed this frame's key/char events during
+  // buildOverlayWindows above, so camera navigation and action dispatch
+  // below just don't run, exactly as before this migration.
   if (r->consoleOpen) {
-    grConsoleProcessInput(r);
-    r->pendingKeys.clear(); // don't replay this frame's keys as actions
+    r->pendingKeys.clear();
     r->pendingMouse.clear();
     r->draggingPan = false;
     r->draggingOrbit = false;
     grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
     return;
   }
-  // The vertex-list search box is the console's only other user of this
-  // queue; the two are mutually exclusive (the branch above already
-  // returned if the console owns input), so it's safe to route the whole
-  // queue to whichever one currently has focus, or discard it if neither does.
-  if (r->listSearchFocused)
-    grListSearchProcessInput(r);
-  else
-    r->pendingConsoleEvents.clear();
+
+  bool wantMouse = io.WantCaptureMouse;
+  bool wantKeyboard = io.WantCaptureKeyboard;
 
   double cx, cy;
   glfwGetCursorPos(r->window, &cx, &cy);
   double cxPx = cx * r->contentScale, cyPx = cy * r->contentScale;
 
-  bool leftDown =
-      glfwGetMouseButton(r->window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-  bool rightDown =
-      glfwGetMouseButton(r->window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+  bool leftDown = !wantMouse && glfwGetMouseButton(r->window,
+                                    GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+  bool rightDown = !wantMouse && glfwGetMouseButton(r->window,
+                                     GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
   bool shiftDown = glfwGetKey(r->window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
                    glfwGetKey(r->window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
 
@@ -2060,54 +2122,15 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   r->dragLastX = cx;
   r->dragLastY = cy;
 
-  if (r->orbitKey >= 0 && !r->listSearchFocused &&
+  if (r->orbitKey >= 0 && !wantKeyboard &&
       glfwGetKey(r->window, r->orbitKey) == GLFW_PRESS) {
     grCameraOrbit(&r->camera, r->orbitRadPerSec * r->deltaTime, 0.0);
   }
 
-  grVertexOverlayLayout vertexOverlayLayout;
-  grVertexOverlayComputeLayout(r, fbw, fbh, &vertexOverlayLayout);
-  bool overVertexOverlay =
-      vertexOverlayLayout.visible && cxPx >= vertexOverlayLayout.x0 &&
-      cxPx <= vertexOverlayLayout.x1 && cyPx >= vertexOverlayLayout.y0 &&
-      cyPx <= vertexOverlayLayout.y1;
-
-  if (overVertexOverlay && r->scrollAccum != 0.0) {
-    double newScroll = r->vertexOverlayScrollPx +
-                       r->scrollAccum * vertexOverlayLayout.lineH * 3.0;
-    if (newScroll < 0.0)
-      newScroll = 0.0;
-    if (newScroll > vertexOverlayLayout.maxScrollPx)
-      newScroll = vertexOverlayLayout.maxScrollPx;
-    if (newScroll != r->vertexOverlayScrollPx) {
-      r->vertexOverlayScrollPx = newScroll;
-      r->vertexOverlayDirty = true;
-    }
-    r->scrollAccum = 0.0;
-  }
-
-  grListOverlayLayout listOverlayLayout;
-  grListOverlayComputeLayout(r, fbw, fbh, &listOverlayLayout);
-  bool overListOverlay =
-      listOverlayLayout.visible && cxPx >= listOverlayLayout.x0 &&
-      cxPx <= listOverlayLayout.x1 && cyPx >= listOverlayLayout.y0 &&
-      cyPx <= listOverlayLayout.y1;
-
-  if (overListOverlay && r->scrollAccum != 0.0) {
-    double newScroll =
-        r->listScrollPx + r->scrollAccum * listOverlayLayout.lineH * 3.0;
-    if (newScroll < 0.0)
-      newScroll = 0.0;
-    if (newScroll > listOverlayLayout.maxScrollPx)
-      newScroll = listOverlayLayout.maxScrollPx;
-    if (newScroll != r->listScrollPx) {
-      r->listScrollPx = newScroll;
-      r->listOverlayDirty = true;
-    }
-    r->scrollAccum = 0.0;
-  }
-
-  if (r->scrollAccum != 0.0) {
+  // A scroll that landed on an ImGui window (a stats chart, the vertex list,
+  // ...) already drove that widget's own scrolling when ImGui processed it
+  // during buildOverlayWindows; it must not also zoom the camera underneath.
+  if (!wantMouse && r->scrollAccum != 0.0) {
     double factor = pow(0.90, r->scrollAccum);
     if (!r->camera.perspective) {
       // Zoom about the cursor: keep the world point under it fixed.
@@ -2122,27 +2145,27 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     } else {
       grCameraZoom(&r->camera, factor);
     }
-    r->scrollAccum = 0.0;
   }
+  r->scrollAccum = 0.0;
 
   grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
 
   // Key dispatch: built-in fit on F unless the app bound F itself. Q/E roll
   // the camera by a fixed step -- the view's only rotation in 2D, and an
-  // independent roll about the look direction on top of orbit in 3D. Most
-  // of this is suppressed while the
-  // list's search box has focus, so typing e.g. "field" into it doesn't also
-  // fit the view (F), toggle stats (S), or fire any app-bound action --
-  // exactly like the console's own exclusive input capture, just scoped to
-  // key dispatch rather than all input. Up/Down list navigation is the one
-  // exception: arrow keys never appear in typed text, so they stay live even
-  // while the search box is focused.
+  // independent roll about the look direction on top of orbit in 3D.
+  // Suppressed whenever ImGui wants the keyboard (typing in the search box,
+  // the console -- already returned above -- or any other ImGui widget with
+  // focus), same as the old listSearchFocused-only gate but now covering
+  // every overlay uniformly.
   {
-    const grPendingKey *pendingKeys = r->pendingKeys.data();
     const grKeyBinding *bindings = r->bindings.data();
-    for (size_t k = 0; k < r->pendingKeys.size(); k++) {
-      int key = pendingKeys[k].key;
-      int mods = pendingKeys[k].mods;
+    for (const grPendingKey &pk : r->pendingKeys) {
+      int key = pk.key, mods = pk.mods;
+      if (key == GR_CONSOLE_TOGGLE_KEY || key == GR_KEY_ESCAPE ||
+          key == GR_KEY_UP || key == GR_KEY_DOWN)
+        continue; // handled unconditionally above
+      if (wantKeyboard)
+        continue;
 
       const char *actionName = NULL;
       for (size_t i = 0; i < r->bindings.size(); i++) {
@@ -2153,16 +2176,6 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
       }
 
       if (!actionName) {
-        if (r->listVisible && key == GR_KEY_UP) {
-          grListOverlaySelectDelta(r, fbw, fbh, -1);
-          continue;
-        }
-        if (r->listVisible && key == GR_KEY_DOWN) {
-          grListOverlaySelectDelta(r, fbw, fbh, 1);
-          continue;
-        }
-        if (r->listSearchFocused)
-          continue; // F/Q/E/S/I/L/C/console-toggle stay suppressed while typing
         if (key == 'F')
           r->fitRequested = true;
         else if (key == 'Q')
@@ -2178,12 +2191,9 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
         else if (key == 'C' && r->listSelectedIdx < r->listFilteredIds.size()) {
           const uint32_t *ids = r->listFilteredIds.data();
           grRendererFocusVertex(r, ids[r->listSelectedIdx]);
-        } else if (key == GR_CONSOLE_TOGGLE_KEY)
-          grConsoleOpen(r);
+        }
         continue;
       }
-      if (r->listSearchFocused)
-        continue; // app-bound actions stay suppressed while typing too
       if (!r->graph)
         continue;
 
@@ -2197,29 +2207,15 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   }
   r->pendingKeys.clear();
 
+  // Mouse dispatch (pick vertex / app-bound mouse actions / vertex-clicked).
+  // A click that landed on an ImGui window never made it into pendingMouse
+  // at all -- see onMouseButton's own WantCaptureMouse check -- so there is
+  // nothing left to filter here, unlike before this migration.
   const grPendingMouse *pendingMouse = r->pendingMouse.data();
   const grMouseBinding *mouseBindings = r->mouseBindings.data();
   for (size_t m = 0; m < r->pendingMouse.size(); m++) {
     int button = pendingMouse[m].button;
     int mods = pendingMouse[m].mods;
-
-    // Clicks landing on the list panel never reach the graph: inside the
-    // search bar they focus it (so subsequent keys type into the query
-    // instead of dispatching), anywhere else in the panel they just blur it.
-    // A click outside the panel blurs a focused search box too, but then
-    // falls through to dispatch normally (e.g. still picks a vertex).
-    if (listOverlayLayout.visible &&
-        pendingMouse[m].xPx >= listOverlayLayout.x0 &&
-        pendingMouse[m].xPx <= listOverlayLayout.x1 &&
-        pendingMouse[m].yPx >= listOverlayLayout.y0 &&
-        pendingMouse[m].yPx <= listOverlayLayout.y1) {
-      r->listSearchFocused =
-          pendingMouse[m].yPx >= listOverlayLayout.searchY0 &&
-          pendingMouse[m].yPx <= listOverlayLayout.searchY1;
-      continue;
-    }
-    if (r->listSearchFocused)
-      r->listSearchFocused = false;
 
     const char *actionName = NULL;
     for (size_t i = 0; i < r->mouseBindings.size(); i++) {
@@ -2331,86 +2327,25 @@ static void uploadPositions(grRenderer *r) {
                        sizeof(float) * n * r->posDim);
 }
 
-static void statsRevisionCacheSync(grRenderer *r, double fbw, double fbh) {
-  size_t n = r->graph->StatSeriesCount();
-  r->statsSeriesRevisions.clear();
-  for (size_t i = 0; i < n; i++) {
-    const gviz::layout::StatSeries *series = r->graph->StatSeriesAt(i);
-    uint64_t rev = series ? series->revision : 0;
-    r->statsSeriesRevisions.push_back(rev);
-  }
-  r->statsLayoutFbw = fbw;
-  r->statsLayoutFbh = fbh;
-  r->statsLayoutScale = r->contentScale > 0.0 ? r->contentScale : 1.0;
-  r->statsOverlayDirty = false;
-}
-
-static bool statsOverlayNeedsRebuild(grRenderer *r, double fbw, double fbh) {
-  if (r->statsOverlayDirty || r->vertexOverlayDirty || r->listOverlayDirty ||
-      r->captionDirty)
-    return true;
-  // The console has no revision counter like the stats/vertex panels do --
-  // its text changes on every keystroke -- so just rebuild every frame it's
-  // open. The primitive list is tiny (a couple of rects and two short text
-  // lines), so this is cheap.
-  if (r->consoleOpen)
-    return true;
-  double scale = r->contentScale > 0.0 ? r->contentScale : 1.0;
-  if (fbw != r->statsLayoutFbw || fbh != r->statsLayoutFbh ||
-      scale != r->statsLayoutScale)
-    return true;
-  if (!r->statsVisible)
-    return false;
-  size_t n = r->graph->StatSeriesCount();
-  if (n != r->statsSeriesRevisions.size())
-    return true;
-  const uint64_t *cached = r->statsSeriesRevisions.data();
-  for (size_t i = 0; i < n; i++) {
-    const gviz::layout::StatSeries *series = r->graph->StatSeriesAt(i);
-    if (!series)
-      continue;
-    if (series->revision != cached[i])
-      return true;
-  }
-  return false;
-}
-
-/** Rebuilds overlay primitives (stat charts if shown, the vertex-info panel,
- *  the vertex-list panel if shown, and the command console if open) when
- *  stat data, the picked vertex, the list's filter, console state, or layout
- *  changed; uploads (grow-only buffer). */
-static void uploadStats(grRenderer *r, double fbw, double fbh) {
-  if (!statsOverlayNeedsRebuild(r, fbw, fbh))
-    return;
-
-  r->statsPrims.clear();
+/**
+ * Builds every ImGui/ImPlot overlay window for this frame (stat charts if
+ * shown, the vertex-info panel, the vertex-list panel if shown, the caption
+ * banner, and the command console if open). Must run between
+ * ImGui::NewFrame() and ImGui::Render() -- see grRendererFrame. Unlike the
+ * old primitive-list build this used to feed, there is no dirty-flag gate:
+ * ImGui rebuilds its own draw data from scratch every frame regardless, so
+ * skipping a rebuild here would save nothing (the overlays are cheap ImGui
+ * widget calls, not GPU work) while adding a second source of truth to keep
+ * in sync -- see the CLAUDE.md note on this migration for why the old
+ * revision-cache/dirty-flag machinery was removed rather than ported.
+ */
+static void buildOverlayWindows(grRenderer *r, double fbw, double fbh) {
   if (r->statsVisible)
-    grStatsOverlayBuild(r, fbw, fbh);
-  grVertexOverlayBuild(r, fbw, fbh);
-  grListOverlayBuild(r, fbw, fbh);
+    grStatsOverlayBuild(r);
+  grVertexOverlayBuild(r);
+  grListOverlayBuild(r);
   grCaptionBuild(r, fbw, fbh);
   grConsoleBuild(r, fbw, fbh);
-  statsRevisionCacheSync(r, fbw, fbh);
-  r->vertexOverlayDirty = false;
-  r->captionDirty = false;
-  if (r->statsPrims.empty())
-    return;
-
-  if (r->statsPrims.size() > r->statsBufCapacity) {
-    GR_RELEASE(wgpuBufferRelease, r->statsBuf);
-    r->statsBufCapacity = r->statsPrims.size() * 2;
-    r->statsBuf =
-        createBuffer(r, sizeof(grStatsPrim) * r->statsBufCapacity,
-                     WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-                     "grender stats prims");
-    r->bindGroupDirty = true;
-    if (!r->statsBuf) {
-      r->statsPrims.clear();
-      return;
-    }
-  }
-  wgpuQueueWriteBuffer(r->queue, r->statsBuf, 0, r->statsPrims.data(),
-                       sizeof(grStatsPrim) * r->statsPrims.size());
 }
 
 /** Encodes the scene render pass (clear + edges + nodes) into @p target. */
@@ -2465,14 +2400,35 @@ static void encodeScenePass(grRenderer *r, WGPUCommandEncoder encoder,
         }
       }
     }
-
-    // Stats charts and the vertex-info panel always draw on top of the scene.
-    if (!r->statsPrims.empty()) {
-      wgpuRenderPassEncoderSetPipeline(pass, r->statsPipeline);
-      wgpuRenderPassEncoderDraw(pass, 6, (uint32_t)r->statsPrims.size(), 0, 0);
-    }
   }
 
+  wgpuRenderPassEncoderEnd(pass);
+  wgpuRenderPassEncoderRelease(pass);
+}
+
+/** Encodes a second pass over @p target (load, not clear -- everything the
+ *  scene pass already drew must survive) that just draws ImGui/ImPlot's
+ *  draw data on top: the stats charts, vertex list, vertex-info panel,
+ *  caption banner, and command console. No depth attachment -- none of
+ *  those overlays test or write scene depth. No-op (encodes nothing) when
+ *  ImGui has no draw data yet (e.g. the very first call before any
+ *  ImGui::NewFrame()/Render()). */
+static void encodeImGuiPass(WGPUCommandEncoder encoder,
+                            WGPUTextureView target) {
+  ImDrawData *drawData = ImGui::GetDrawData();
+  if (!drawData || drawData->CmdListsCount == 0)
+    return;
+  WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(
+      encoder, grPtr(WGPURenderPassDescriptor{
+                   .colorAttachmentCount = 1,
+                   .colorAttachments = grPtr(WGPURenderPassColorAttachment{
+                       .view = target,
+                       .loadOp = WGPULoadOp_Load,
+                       .storeOp = WGPUStoreOp_Store,
+                       .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
+                   }),
+               }));
+  ImGui_ImplWGPU_RenderDrawData(drawData, pass);
   wgpuRenderPassEncoderEnd(pass);
   wgpuRenderPassEncoderRelease(pass);
 }
@@ -2494,10 +2450,19 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
   writeGlobals(r, w, h);
   if (r->graph) {
     uploadPositions(r);
-    uploadStats(r, w, h);
     if (r->bindGroupDirty && rebuildBindGroup(r) < 0)
       return -1;
   }
+
+  // Build one throwaway ImGui frame so the screenshot includes the same
+  // overlays a live grRendererFrame would show -- this is the headless
+  // verification path (see the class doc + README), so it needs to be a
+  // faithful render, not just the native scene.
+  ImGui_ImplWGPU_NewFrame();
+  ImGui_ImplGlfw_NewFrame();
+  ImGui::NewFrame();
+  buildOverlayWindows(r, w, h);
+  ImGui::Render();
 
   WGPUTexture target = wgpuDeviceCreateTexture(
       r->device,
@@ -2525,6 +2490,7 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
   WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(r->device, NULL);
   encodeScenePass(r, encoder, targetView, r->depthView);
   grObjOverlayEncode(r, encoder, targetView, r->depthView, w, h);
+  encodeImGuiPass(encoder, targetView);
   wgpuCommandEncoderCopyTextureToBuffer(
       encoder, grPtr(WGPUTexelCopyTextureInfo{.texture = target}),
       grPtr(WGPUTexelCopyBufferInfo{
@@ -2621,6 +2587,19 @@ bool grRendererFrame(grRenderer *r) {
     r->surfaceDirty = false;
   }
 
+  // Build this frame's ImGui/ImPlot windows (stats/list/vertex-info/caption/
+  // console) before processInput: processInput's camera-nav and bound-action
+  // dispatch below is gated on ImGui::GetIO().WantCaptureMouse/
+  // WantCaptureKeyboard, which only reflects windows/widgets actually built
+  // this frame -- e.g. a click landing on the vertex-list's search box must
+  // not also pick a vertex underneath it. See processInput's own comment for
+  // the few keys (console toggle, list Up/Down/Escape) that intentionally
+  // bypass this gate.
+  ImGui_ImplWGPU_NewFrame();
+  ImGui_ImplGlfw_NewFrame();
+  ImGui::NewFrame();
+  buildOverlayWindows(r, fbw, fbh);
+
   processInput(r, fbw, fbh);
   grObjOverlayUpdate(r, r->deltaTime);
 
@@ -2632,8 +2611,10 @@ bool grRendererFrame(grRenderer *r) {
       r->topoDirty = true;
     }
     if (r->topoDirty) {
-      if (ensurePositionBuffers(r) < 0 || uploadTopology(r) < 0)
+      if (ensurePositionBuffers(r) < 0 || uploadTopology(r) < 0) {
+        ImGui::EndFrame(); // discard the frame we already started above
         return false;
+      }
       r->topoDirty = false;
     }
     applyColorLayers(r);
@@ -2647,10 +2628,13 @@ bool grRendererFrame(grRenderer *r) {
 
   if (r->graph) {
     uploadPositions(r);
-    uploadStats(r, fbw, fbh);
-    if (r->bindGroupDirty && rebuildBindGroup(r) < 0)
+    if (r->bindGroupDirty && rebuildBindGroup(r) < 0) {
+      ImGui::EndFrame();
       return false;
+    }
   }
+
+  ImGui::Render();
 
   // acquire frame
   WGPUSurfaceTexture surfaceTexture;
@@ -2673,6 +2657,7 @@ bool grRendererFrame(grRenderer *r) {
 
   encodeScenePass(r, encoder, frame, r->depthView);
   grObjOverlayEncode(r, encoder, frame, r->depthView, fbw, fbh);
+  encodeImGuiPass(encoder, frame);
 
   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
   wgpuQueueSubmit(r->queue, 1, &commands);
