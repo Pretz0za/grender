@@ -109,7 +109,12 @@ static void cmdFind(grRenderer *r, int argc, char **argv,
      * the full-subgraph pick works on graphs that grew since the last use. */
     r->backingGraph->EnsureLayout();
     gviz::Subgraph pick = gviz::Subgraph::CreateEmpty(*r->backingGraph);
-    pick.ShowVertex((size_t)id);
+    // (size_t)id is a local index (this command's own contract, matching
+    // the rest of grender's public API -- see grRendererSetGraph's INDEXING
+    // CONVENTION); Subgraph::ShowVertex needs the backing graph's raw id.
+    size_t raw = r->structureView ? r->structureView->LocalToRaw((size_t)id)
+                                  : (size_t)id;
+    pick.ShowVertex(raw);
     pick.Rebuild();
     grRendererSetHighlight(r, pick, GR_RGBA8(255, 210, 80, 255), 0);
   } catch (const std::exception &) {

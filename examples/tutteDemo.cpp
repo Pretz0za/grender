@@ -1,16 +1,23 @@
 /**
  * Live Tutte barycentric embedding demo.
  *
- * A planar graph is combinatorially embedded via Boyer-Myrvold, then relaxed by
- * gviz's Tutte embedder while grender draws every frame. The embedder registers
- * "tutte.step" and "tutte.fixOuterFace" on its embedded graph; grender
- * registers "grender.pickFace" when the graph is attached.
+ * gviz::layout::Tutte no longer tests planarity or auto-picks a boundary
+ * face itself (that responsibility -- and the whole Planar.hpp dependency --
+ * was deliberately removed from Tutte; see Tutte.hpp's class doc): this demo
+ * now does that combinatorial setup itself, once, up front --
+ * gviz::layout::ApplyPlanarRotation + LargestFaceBoundary -- purely to pick a
+ * reasonable initial outer boundary, then hands it to
+ * Tutte::FixConvexPolygon(). Since Tutte itself never becomes "planar
+ * embedded" anymore (only the Planar embedder does -- see
+ * EmbeddedGraph::IsPlanarEmbedded()'s doc comment), the old right-click
+ * face-pick / B-to-refix-boundary interactivity (which needed exactly that
+ * flag) no longer applies to a Tutte-driven layout, and has been dropped
+ * from this demo rather than faked. gviz's Planar embedder is the one to
+ * reach for if live face-picking is the point.
  *
  * Controls:
  *   R        - run one Tutte relaxation step
  *   space    - toggle continuous stepping
- *   B        - pin the highlighted face as the new outer boundary and re-embed
- *   right click - highlight the face under the cursor
  *   F        - fit view
  *   S        - toggle stats overlay
  *   drag     - pan
@@ -25,6 +32,7 @@
  */
 
 #include "grender/grender.h"
+#include "grender/grStepProfiling.h"
 
 #include "gviz.hpp"
 
@@ -98,14 +106,26 @@ int main(int argc, char **argv) {
   graph.BuildLayout();
 
   gviz::Subgraph sg = gviz::Subgraph::CreateFull(graph);
-  std::optional<gviz::layout::Tutte> tutte;
-  tutte.emplace(graph, std::move(sg), 2);
 
+  // Combinatorial setup Tutte no longer does itself (see this file's header
+  // comment): test planarity + install a CCW rotation system, then pick the
+  // largest face as the outer boundary.
+  std::vector<size_t> boundary;
   try {
-    tutte->Begin();
+    gviz::layout::ApplyPlanarRotation(graph, sg);
+    boundary = gviz::layout::LargestFaceBoundary(graph, sg);
   } catch (const std::exception &e) {
-    fprintf(stderr, "Tutte begin failed (graph may be non-planar): %s\n",
+    fprintf(stderr, "planar rotation failed (graph may be non-planar): %s\n",
             e.what());
+    return 1;
+  }
+
+  std::optional<gviz::layout::Tutte<gviz::Subgraph>> tutte;
+  tutte.emplace(std::move(sg), 2);
+
+  if (!tutte->FixConvexPolygon(boundary, /*radius=*/20.0)) {
+    fprintf(stderr, "Tutte boundary setup failed (need >= 3 boundary "
+                    "vertices)\n");
     return 1;
   }
 
@@ -127,16 +147,14 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (grRendererSetGraph(r, *tutte, &graph) < 0) {
+  if (grRendererSetGraph(r, tutte->Structure(), *tutte, &graph) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     return 1;
   }
 
   grRendererBindKey(r, 'R', "tutte.step");
-  grRendererBindKey(r, 'B', "tutte.fixOuterFace");
   grRendererBindKey(r, GR_KEY_SPACE, "demo.toggleAuto");
-  grRendererBindMouse(r, GR_MOUSE_BUTTON_RIGHT, GR_ACTION_PICK_FACE);
 
   if (obj && grRendererLoadObjOverlay(r, obj) < 0)
     fprintf(stderr, "object overlay: failed to load '%s'\n", obj);
@@ -148,7 +166,9 @@ int main(int argc, char **argv) {
     if (autoStep && !tutte->Converged()) {
       double dt = grRendererDeltaTime(r);
       for (size_t i = 0; i < 20; i++) {
+        GR_PROF_STEP_BEGIN();
         tutte->Step(dt);
+        GR_PROF_STEP_END();
       }
     }
 

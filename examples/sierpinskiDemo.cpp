@@ -40,7 +40,7 @@ void actionToggleAuto(gviz::layout::EmbeddedGraph &eg, void *userData,
 
 struct AppState {
   grRenderer *renderer;
-  gviz::layout::GRIP *grip;
+  gviz::layout::GRIP<gviz::Subgraph> *grip;
   bool *autoRefine;
   size_t roundsPerStage;
   size_t frames = 0;
@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
 
   gviz::Subgraph sg = gviz::Subgraph::CreateFull(graph);
 
-  std::optional<gviz::layout::GRIP> grip;
+  std::optional<gviz::layout::GRIP<gviz::Subgraph>> grip;
   try {
     grip.emplace(std::move(sg), /*diameter=*/0, /*dimension=*/2);
   } catch (const std::exception &e) {
@@ -128,7 +128,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "renderer creation failed\n");
     return 1;
   }
-  if (grRendererSetGraph(r, *grip, &graph) < 0) {
+  if (grRendererSetGraph(r, grip->Structure(), *grip, &graph) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     return 1;

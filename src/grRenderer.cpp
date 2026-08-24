@@ -15,6 +15,7 @@
 
 #include <new>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 #define GR_LOG(...) fprintf(stderr, "[grender] " __VA_ARGS__)
@@ -35,9 +36,9 @@ void grRendererDescInit(grRendererDesc *desc) {
   desc->title = "grender";
   desc->width = 1280;
   desc->height = 800;
-  desc->clearColor = GR_COLOR(0.07f, 0.07f, 0.09f, 1.0f);
+  desc->clearColor = GR_COLOR(0.098f, 0.09f, 0.149f, 1.0f);
   desc->nodeStyle = (grNodeStyle){
-      .fillColor = GR_COLOR(0.95f, 0.95f, 0.98f, 1.0f),
+      .fillColor = GR_COLOR(0.753, 0.792f, 0.961f, 1.0f),
       .strokeColor = GR_COLOR(0.10f, 0.10f, 0.12f, 1.0f),
       .radius = 3.0f,
       .strokeWidth = 0.0f,
@@ -48,7 +49,7 @@ void grRendererDescInit(grRendererDesc *desc) {
       .cornerRadiusFraction = 0.3f,
   };
   desc->edgeStyle = (grEdgeStyle){
-      .color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.55f),
+      .color = GR_COLOR(0.753, 0.792f, 0.961f, 0.55f),
       .width = 1.0f,
       .sizeMode = GR_SIZE_PIXELS,
   };
@@ -89,17 +90,16 @@ static void onUncapturedError(WGPUDevice const *device, WGPUErrorType type,
          message.data);
 }
 
-static WGPUBuffer createBuffer(grRenderer *r, size_t size, WGPUBufferUsage usage,
-                               const char *label) {
+static WGPUBuffer createBuffer(grRenderer *r, size_t size,
+                               WGPUBufferUsage usage, const char *label) {
   if (size < 4)
     size = 4;
   size = (size + 3) & ~(size_t)3;
-  return wgpuDeviceCreateBuffer(r->device,
-                                grPtr(WGPUBufferDescriptor{
-                                    .label = {label, WGPU_STRLEN},
-                                    .size = size,
-                                    .usage = usage,
-                                }));
+  return wgpuDeviceCreateBuffer(r->device, grPtr(WGPUBufferDescriptor{
+                                               .label = {label, WGPU_STRLEN},
+                                               .size = size,
+                                               .usage = usage,
+                                           }));
 }
 
 static int checkStorageBinding(grRenderer *r, const char *what, size_t bytes) {
@@ -139,11 +139,10 @@ static int createPipelines(grRenderer *r) {
       r->device,
       grPtr(WGPUShaderModuleDescriptor{
           .label = {"grender shaders", WGPU_STRLEN},
-          .nextInChain =
-              (WGPUChainedStruct *)grPtr(WGPUShaderSourceWGSL{
-                  .chain = {.sType = WGPUSType_ShaderSourceWGSL},
-                  .code = {GR_WGSL_SOURCE, WGPU_STRLEN},
-              }),
+          .nextInChain = (WGPUChainedStruct *)grPtr(WGPUShaderSourceWGSL{
+              .chain = {.sType = WGPUSType_ShaderSourceWGSL},
+              .code = {GR_WGSL_SOURCE, WGPU_STRLEN},
+          }),
       }));
   if (!r->shaderModule)
     return -1;
@@ -169,12 +168,12 @@ static int createPipelines(grRenderer *r) {
                      .entries = entries,
                  }));
   r->pipelineLayout = wgpuDeviceCreatePipelineLayout(
-      r->device, grPtr(WGPUPipelineLayoutDescriptor{
-                     .label = {"grender layout", WGPU_STRLEN},
-                     .bindGroupLayoutCount = 1,
-                     .bindGroupLayouts =
-                         (const WGPUBindGroupLayout[]){r->bindGroupLayout},
-                 }));
+      r->device,
+      grPtr(WGPUPipelineLayoutDescriptor{
+          .label = {"grender layout", WGPU_STRLEN},
+          .bindGroupLayoutCount = 1,
+          .bindGroupLayouts = (const WGPUBindGroupLayout[]){r->bindGroupLayout},
+      }));
   if (!r->bindGroupLayout || !r->pipelineLayout)
     return -1;
 
@@ -204,8 +203,8 @@ static int createPipelines(grRenderer *r) {
         // edges only test. The stats overlay ignores scene depth entirely.
         .depthWriteEnabled =
             (i == 0) ? WGPUOptionalBool_True : WGPUOptionalBool_False,
-        .depthCompare =
-            (i == 2) ? WGPUCompareFunction_Always : WGPUCompareFunction_LessEqual,
+        .depthCompare = (i == 2) ? WGPUCompareFunction_Always
+                                 : WGPUCompareFunction_LessEqual,
         .stencilFront = {.compare = WGPUCompareFunction_Always},
         .stencilBack = {.compare = WGPUCompareFunction_Always},
         .stencilReadMask = 0xFFFFFFFF,
@@ -219,13 +218,12 @@ static int createPipelines(grRenderer *r) {
             .layout = r->pipelineLayout,
             .vertex = {.module = r->shaderModule,
                        .entryPoint = {vsEntries[i], WGPU_STRLEN}},
-            .fragment =
-                grPtr(WGPUFragmentState{
-                    .module = r->shaderModule,
-                    .entryPoint = {fsEntries[i], WGPU_STRLEN},
-                    .targetCount = 1,
-                    .targets = &colorTarget,
-                }),
+            .fragment = grPtr(WGPUFragmentState{
+                .module = r->shaderModule,
+                .entryPoint = {fsEntries[i], WGPU_STRLEN},
+                .targetCount = 1,
+                .targets = &colorTarget,
+            }),
             .primitive = {.topology = WGPUPrimitiveTopology_TriangleList,
                           .cullMode = WGPUCullMode_None},
             .depthStencil = &depthState,
@@ -249,15 +247,16 @@ static void recreateDepthTexture(grRenderer *r) {
     wgpuTextureRelease(r->depthTexture);
   }
   r->depthTexture = wgpuDeviceCreateTexture(
-      r->device, grPtr(WGPUTextureDescriptor{
-                     .label = {"grender depth", WGPU_STRLEN},
-                     .usage = WGPUTextureUsage_RenderAttachment,
-                     .dimension = WGPUTextureDimension_2D,
-                     .size = {r->surfaceConfig.width, r->surfaceConfig.height, 1},
-                     .format = WGPUTextureFormat_Depth24Plus,
-                     .mipLevelCount = 1,
-                     .sampleCount = 1,
-                 }));
+      r->device,
+      grPtr(WGPUTextureDescriptor{
+          .label = {"grender depth", WGPU_STRLEN},
+          .usage = WGPUTextureUsage_RenderAttachment,
+          .dimension = WGPUTextureDimension_2D,
+          .size = {r->surfaceConfig.width, r->surfaceConfig.height, 1},
+          .format = WGPUTextureFormat_Depth24Plus,
+          .mipLevelCount = 1,
+          .sampleCount = 1,
+      }));
   r->depthView = wgpuTextureCreateView(r->depthTexture, NULL);
 }
 
@@ -306,7 +305,8 @@ static void onChar(GLFWwindow *window, unsigned int codepoint) {
   r->pendingConsoleEvents.push_back(ce);
 }
 
-static void onMouseButton(GLFWwindow *window, int button, int action, int mods) {
+static void onMouseButton(GLFWwindow *window, int button, int action,
+                          int mods) {
   grRenderer *r = (grRenderer *)glfwGetWindowUserPointer(window);
   if (!r || button < 0 || button > 2)
     return;
@@ -330,7 +330,8 @@ static void onMouseButton(GLFWwindow *window, int button, int action, int mods) 
   double cx, cy;
   glfwGetCursorPos(window, &cx, &cy);
 
-  grPendingMouse pm = {button, mods, cx * r->contentScale, cy * r->contentScale};
+  grPendingMouse pm = {button, mods, cx * r->contentScale,
+                       cy * r->contentScale};
   r->pendingMouse.push_back(pm);
 }
 
@@ -360,8 +361,13 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   r->edgeStyle = descIn->edgeStyle;
   r->edgeDegreeAlpha = descIn->edgeDegreeAlpha;
   r->edgeWeightWidth = descIn->edgeWeightWidth;
+  r->nodeDegreeScale = false;
+  r->nodeDegreeScaleFactor = 0.0f;
   r->statsVisible = true;
   r->pickedVertexId = -1;
+  r->accentVertexId = -1;
+  r->accentVertexRgba = 0;
+  r->vertexInfoVisible = true;
   r->listVisible = true;
   r->listSelectedIdx = SIZE_MAX;
   r->captionVisible = true;
@@ -379,11 +385,13 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   grPlatformInitApplication();
 
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-  r->window = glfwCreateWindow((int)descIn->width, (int)descIn->height,
-                               descIn->title ? descIn->title : "grender", NULL,
-                               NULL);
-  if (!r->window)
-    { grRendererDestroy(r); return NULL; }
+  r->window =
+      glfwCreateWindow((int)descIn->width, (int)descIn->height,
+                       descIn->title ? descIn->title : "grender", NULL, NULL);
+  if (!r->window) {
+    grRendererDestroy(r);
+    return NULL;
+  }
 
   glfwSetWindowUserPointer(r->window, r);
   glfwSetFramebufferSizeCallback(r->window, onFramebufferSize);
@@ -397,7 +405,8 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   // out unless the instance opted into the TimedWaitAny feature up front --
   // wgpu-native's synchronous callbacks need no such opt-in, hence native
   // still passes NULL here.
-  WGPUInstanceFeatureName instanceFeatures[] = {WGPUInstanceFeatureName_TimedWaitAny};
+  WGPUInstanceFeatureName instanceFeatures[] = {
+      WGPUInstanceFeatureName_TimedWaitAny};
   r->instance = wgpuCreateInstance(grPtr(WGPUInstanceDescriptor{
       .requiredFeatureCount = 1,
       .requiredFeatures = instanceFeatures,
@@ -405,12 +414,16 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
 #else
   r->instance = wgpuCreateInstance(NULL);
 #endif
-  if (!r->instance)
-    { grRendererDestroy(r); return NULL; }
+  if (!r->instance) {
+    grRendererDestroy(r);
+    return NULL;
+  }
 
   r->surface = grPlatformCreateSurface(r->instance, r->window);
-  if (!r->surface)
-    { grRendererDestroy(r); return NULL; }
+  if (!r->surface) {
+    grRendererDestroy(r);
+    return NULL;
+  }
 
 #ifdef __EMSCRIPTEN__
   // Unlike wgpu-native, the browser's WebGPU never resolves a callback
@@ -421,7 +434,8 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   WGPUFuture adapterFuture = wgpuInstanceRequestAdapter(
       r->instance,
       grPtr(WGPURequestAdapterOptions{.compatibleSurface = r->surface}),
-      (const WGPURequestAdapterCallbackInfo){.mode = WGPUCallbackMode_WaitAnyOnly,
+      (const WGPURequestAdapterCallbackInfo){.mode =
+                                                 WGPUCallbackMode_WaitAnyOnly,
                                              .callback = onAdapterRequest,
                                              .userdata1 = &r->adapter});
   WGPUFutureWaitInfo adapterWait = {.future = adapterFuture};
@@ -434,13 +448,18 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
       (const WGPURequestAdapterCallbackInfo){.callback = onAdapterRequest,
                                              .userdata1 = &r->adapter});
 #endif
-  if (!r->adapter)
-    { grRendererDestroy(r); return NULL; }
+  if (!r->adapter) {
+    grRendererDestroy(r);
+    return NULL;
+  }
 
   WGPULimits adapterLimits = WGPU_LIMITS_INIT;
   if (wgpuAdapterGetLimits(r->adapter, &adapterLimits) != WGPUStatus_Success) {
     GR_LOG("failed to query adapter limits\n");
-    { grRendererDestroy(r); return NULL; }
+    {
+      grRendererDestroy(r);
+      return NULL;
+    }
   }
 
   WGPULimits requiredLimits = WGPU_LIMITS_INIT;
@@ -461,7 +480,8 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
           .requiredLimits = &requiredLimits,
           .uncapturedErrorCallbackInfo = {.callback = onUncapturedError},
       }),
-      (const WGPURequestDeviceCallbackInfo){.mode = WGPUCallbackMode_WaitAnyOnly,
+      (const WGPURequestDeviceCallbackInfo){.mode =
+                                                WGPUCallbackMode_WaitAnyOnly,
                                             .callback = onDeviceRequest,
                                             .userdata1 = &r->device});
   WGPUFutureWaitInfo deviceWait = {.future = deviceFuture};
@@ -477,8 +497,10 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
       (const WGPURequestDeviceCallbackInfo){.callback = onDeviceRequest,
                                             .userdata1 = &r->device});
 #endif
-  if (!r->device)
-    { grRendererDestroy(r); return NULL; }
+  if (!r->device) {
+    grRendererDestroy(r);
+    return NULL;
+  }
 
   {
     WGPULimits deviceLimits = WGPU_LIMITS_INIT;
@@ -498,7 +520,18 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
 
   WGPUSurfaceCapabilities caps = {0};
   wgpuSurfaceGetCapabilities(r->surface, r->adapter, &caps);
+  // Prefer a non-sRGB format: every color in this codebase (clear color,
+  // node/edge style, shaders) is written as a plain display-space value with
+  // no gamma handling, so an sRGB surface would silently re-encode them and
+  // wash out dark colors (formats[0] is not guaranteed to be non-sRGB).
   r->surfaceFormat = caps.formats[0];
+  for (size_t i = 0; i < caps.formatCount; i++) {
+    if (caps.formats[i] == WGPUTextureFormat_BGRA8Unorm ||
+        caps.formats[i] == WGPUTextureFormat_RGBA8Unorm) {
+      r->surfaceFormat = caps.formats[i];
+      break;
+    }
+  }
 
   WGPUPresentMode presentMode = WGPUPresentMode_Fifo;
   if (!descIn->vsync) {
@@ -524,17 +557,19 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
 
   if (createPipelines(r) < 0) {
     GR_LOG("pipeline creation failed\n");
-    { grRendererDestroy(r); return NULL; }
+    {
+      grRendererDestroy(r);
+      return NULL;
+    }
   }
 
-  r->globalsBuf = createBuffer(r, sizeof(grGlobalsUBO),
-                               WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
-                               "grender globals");
+  r->globalsBuf = createBuffer(
+      r, sizeof(grGlobalsUBO),
+      WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "grender globals");
 
   glfwGetCursorPos(r->window, &r->dragLastX, &r->dragLastY);
   r->lastFrameTime = glfwGetTime();
   return r;
-
 }
 
 #define GR_RELEASE(fn, x)                                                      \
@@ -673,9 +708,7 @@ void grRendererShowConsole(grRenderer *r, bool show) {
     grConsoleClose(r);
 }
 
-bool grRendererConsoleShown(const grRenderer *r) {
-  return r && r->consoleOpen;
-}
+bool grRendererConsoleShown(const grRenderer *r) { return r && r->consoleOpen; }
 
 void grRendererShowVertexList(grRenderer *r, bool show) {
   if (!r || r->listVisible == show)
@@ -703,8 +736,8 @@ static int ensurePositionBuffers(grRenderer *r) {
   size_t count = r->graph->PositionCount();
   size_t srcDim = r->graph->Dim();
   size_t renderDim = srcDim == 4 ? 3 : srcDim;
-  if (count == r->posCapacity && srcDim == r->srcDim && renderDim == r->posDim &&
-      r->positionsBuf)
+  if (count == r->posCapacity && srcDim == r->srcDim &&
+      renderDim == r->posDim && r->positionsBuf)
     return 0;
 
   free(r->posStaging);
@@ -717,8 +750,8 @@ static int ensurePositionBuffers(grRenderer *r) {
   if (checkStorageBinding(r, "positions", posBytes) < 0)
     return -1;
   r->positionsBuf = createBuffer(
-      r, posBytes,
-      WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst, "grender positions");
+      r, posBytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+      "grender positions");
   if (!r->positionsBuf)
     return -1;
 
@@ -785,20 +818,10 @@ static int ensurePositionBuffers(grRenderer *r) {
   return 0;
 }
 
-/* Degree of raw vertex @p v as the drawn structure defines it: the
- * embedding's synced out+in rows when a snapshot exists (matching exactly
- * what grTopologyExtract drew), the live subgraph otherwise. */
-static uint32_t topoVertexDegree(gviz::layout::EmbeddedGraph &graph, size_t v) {
-  std::span<const size_t> outNbrs = graph.OutNeighbors(v);
-  if (!outNbrs.empty())
-    return (uint32_t)(outNbrs.size() + graph.InDegree(v));
-  return (uint32_t)graph.Structure().Degree(v);
-}
-
 /* Recomputes and re-uploads the per-vertex degrees the edge shader's
  * degree-alpha mode reads. Called on every structural change, so degrees
- * stay current as the graph grows -- a new edge changes its endpoints'
- * degrees even when both vertices are old. */
+ * stay current as the visible/hidden set changes -- a new edge changes its
+ * endpoints' degrees even when both vertices are old. */
 static int refreshNodeDegrees(grRenderer *r) {
   if (r->posCapacity == 0)
     return 0;
@@ -807,7 +830,7 @@ static int refreshNodeDegrees(grRenderer *r) {
     return -1;
   for (size_t i = 0; i < r->topo.nodeCount; i++) {
     uint32_t v = r->topo.nodeIds[i];
-    degrees[v] = topoVertexDegree(*r->graph, v);
+    degrees[v] = grTopologyVertexDegree(&r->topo, v);
   }
   int res = grRendererSetNodeDegrees(r, degrees, r->posCapacity);
   free(degrees);
@@ -827,12 +850,16 @@ static int refreshEdgeWeights(grRenderer *r) {
   // gviz::Subgraph deliberately never exposes its parent graph, so real
   // weights need r->backingGraph (see grRendererSetGraph); with none
   // attached every edge just reports the default weight of 1.0, same as an
-  // edge whose weight was never explicitly set.
+  // edge whose weight was never explicitly set. r->topo.edges holds LOCAL
+  // indices; GetEdgeWeight needs the backing graph's own native (raw) ids.
   gviz::Graph *g = r->backingGraph;
   for (size_t i = 0; i < edgeCount; i++) {
     double w = 1.0;
-    if (g)
-      g->GetEdgeWeight(r->topo.edges[2 * i], r->topo.edges[2 * i + 1], w);
+    if (g && r->structureView) {
+      size_t rawU = r->structureView->LocalToRaw(r->topo.edges[2 * i]);
+      size_t rawV = r->structureView->LocalToRaw(r->topo.edges[2 * i + 1]);
+      g->GetEdgeWeight(rawU, rawV, w);
+    }
     weights[i] = (float)w;
   }
   int res = grRendererSetEdgeWeights(r, weights, edgeCount);
@@ -842,10 +869,12 @@ static int refreshEdgeWeights(grRenderer *r) {
 
 /** Uploads topology-derived buffers (node id remap + edge endpoint pairs). */
 static int uploadTopology(grRenderer *r) {
-  if (grTopologyExtract(&r->topo, *r->graph) < 0)
+  if (!r->structureView ||
+      grTopologyExtract(&r->topo, *r->structureView, *r->graph) < 0)
     return -1;
 
-  size_t nodeBytes = sizeof(uint32_t) * (r->topo.nodeCount ? r->topo.nodeCount : 1);
+  size_t nodeBytes =
+      sizeof(uint32_t) * (r->topo.nodeCount ? r->topo.nodeCount : 1);
   size_t edgeBytes =
       sizeof(uint32_t) * 2 * (r->topo.edgeCount ? r->topo.edgeCount : 1);
 
@@ -855,10 +884,9 @@ static int uploadTopology(grRenderer *r) {
 
   // Node-id and edge buffers are recreated on structural change only.
   GR_RELEASE(wgpuBufferRelease, r->nodeIdsBuf);
-  r->nodeIdsBuf =
-      createBuffer(r, nodeBytes,
-                   WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-                   "grender node ids");
+  r->nodeIdsBuf = createBuffer(
+      r, nodeBytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+      "grender node ids");
   GR_RELEASE(wgpuBufferRelease, r->edgesBuf);
   r->edgesBuf = createBuffer(r, edgeBytes,
                              WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
@@ -890,12 +918,12 @@ static int uploadTopology(grRenderer *r) {
   r->listFilterDirty = true; // visible vertex set changed
   r->listOverlayDirty = true;
 
-  // Auto-maintained attributes: with degree-alpha or weight-width enabled,
-  // the data those shader modes index is a pure function of the structure
-  // just uploaded, so the renderer refreshes it here instead of every
-  // client having to chase structural changes (which made both modes
-  // unusable on growing graphs).
-  if (r->edgeDegreeAlpha && refreshNodeDegrees(r) < 0)
+  // Auto-maintained attributes: with degree-alpha, node degree-scale, or
+  // weight-width enabled, the data those shader modes index is a pure
+  // function of the structure just uploaded, so the renderer refreshes it
+  // here instead of every client having to chase structural changes (which
+  // made both modes unusable on growing graphs).
+  if ((r->edgeDegreeAlpha || r->nodeDegreeScale) && refreshNodeDegrees(r) < 0)
     return -1;
   if (r->edgeWeightWidth && refreshEdgeWeights(r) < 0)
     return -1;
@@ -908,56 +936,68 @@ static int rebuildBindGroup(grRenderer *r) {
   // Optional attribute buffers get 4-byte placeholders so the bind group is
   // always complete; shaders never read them unless the matching flag is set.
   if (!r->nodeColorsBuf)
-    r->nodeColorsBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
-                                              WGPUBufferUsage_CopyDst,
-                                    "grender node colors");
+    r->nodeColorsBuf =
+        createBuffer(r, 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                     "grender node colors");
   if (!r->nodeSizesBuf)
-    r->nodeSizesBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
-                                             WGPUBufferUsage_CopyDst,
-                                   "grender node sizes");
+    r->nodeSizesBuf =
+        createBuffer(r, 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                     "grender node sizes");
   if (!r->edgeColorsBuf)
-    r->edgeColorsBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
-                                              WGPUBufferUsage_CopyDst,
-                                    "grender edge colors");
+    r->edgeColorsBuf =
+        createBuffer(r, 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                     "grender edge colors");
   if (!r->nodeDegreesBuf)
-    r->nodeDegreesBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
-                                               WGPUBufferUsage_CopyDst,
-                                     "grender node degrees");
+    r->nodeDegreesBuf =
+        createBuffer(r, 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                     "grender node degrees");
   if (!r->edgeWeightsBuf)
-    r->edgeWeightsBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
-                                               WGPUBufferUsage_CopyDst,
-                                     "grender edge weights");
+    r->edgeWeightsBuf =
+        createBuffer(r, 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                     "grender edge weights");
   if (!r->edgeDashedBuf)
-    r->edgeDashedBuf = createBuffer(r, 4, WGPUBufferUsage_Storage |
-                                              WGPUBufferUsage_CopyDst,
-                                    "grender edge dashed");
+    r->edgeDashedBuf =
+        createBuffer(r, 4, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                     "grender edge dashed");
   if (!r->statsBuf)
-    r->statsBuf = createBuffer(r, sizeof(grStatsPrim),
-                               WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-                               "grender stats prims");
+    r->statsBuf =
+        createBuffer(r, sizeof(grStatsPrim),
+                     WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                     "grender stats prims");
 
   const WGPUBindGroupEntry entries[11] = {
-      {.binding = 0, .buffer = r->globalsBuf,
+      {.binding = 0,
+       .buffer = r->globalsBuf,
        .size = storageBindBytes(r, r->globalsBuf)},
-      {.binding = 1, .buffer = r->positionsBuf,
+      {.binding = 1,
+       .buffer = r->positionsBuf,
        .size = storageBindBytes(r, r->positionsBuf)},
-      {.binding = 2, .buffer = r->nodeIdsBuf,
+      {.binding = 2,
+       .buffer = r->nodeIdsBuf,
        .size = storageBindBytes(r, r->nodeIdsBuf)},
-      {.binding = 3, .buffer = r->nodeColorsBuf,
+      {.binding = 3,
+       .buffer = r->nodeColorsBuf,
        .size = storageBindBytes(r, r->nodeColorsBuf)},
-      {.binding = 4, .buffer = r->nodeSizesBuf,
+      {.binding = 4,
+       .buffer = r->nodeSizesBuf,
        .size = storageBindBytes(r, r->nodeSizesBuf)},
-      {.binding = 5, .buffer = r->edgesBuf,
+      {.binding = 5,
+       .buffer = r->edgesBuf,
        .size = storageBindBytes(r, r->edgesBuf)},
-      {.binding = 6, .buffer = r->edgeColorsBuf,
+      {.binding = 6,
+       .buffer = r->edgeColorsBuf,
        .size = storageBindBytes(r, r->edgeColorsBuf)},
-      {.binding = 7, .buffer = r->statsBuf,
+      {.binding = 7,
+       .buffer = r->statsBuf,
        .size = storageBindBytes(r, r->statsBuf)},
-      {.binding = 8, .buffer = r->nodeDegreesBuf,
+      {.binding = 8,
+       .buffer = r->nodeDegreesBuf,
        .size = storageBindBytes(r, r->nodeDegreesBuf)},
-      {.binding = 9, .buffer = r->edgeWeightsBuf,
+      {.binding = 9,
+       .buffer = r->edgeWeightsBuf,
        .size = storageBindBytes(r, r->edgeWeightsBuf)},
-      {.binding = 10, .buffer = r->edgeDashedBuf,
+      {.binding = 10,
+       .buffer = r->edgeDashedBuf,
        .size = storageBindBytes(r, r->edgeDashedBuf)},
   };
   for (size_t i = 0; i < 11; i++) {
@@ -978,21 +1018,36 @@ static int rebuildBindGroup(grRenderer *r) {
   return r->bindGroup ? 0 : -1;
 }
 
-int grRendererSetGraph(grRenderer *r, gviz::layout::EmbeddedGraph &graph,
+template <gviz::GraphLike G>
+int grRendererSetGraph(grRenderer *r, G &structure,
+                       gviz::layout::EmbeddedGraph &embedding,
                        gviz::Graph *backingGraph) {
-  size_t dim = graph.Dim();
+  size_t dim = embedding.Dim();
   if (dim != 2 && dim != 3 && dim != 4) {
     GR_LOG("unsupported embedding dimension %zu (only 2, 3, and 4)\n", dim);
     return -1;
   }
 
-  r->graph = &graph;
-  r->backingGraph = backingGraph;
-  graph.AddAction(GR_ACTION_PICK_FACE, grenderActionPickFace, r);
-  graph.AddAction(GR_ACTION_PICK_VERTEX, grenderActionPickVertex, r);
+  r->graph = &embedding;
+  // See grRendererSetGraph's doc comment: for a Graph-backed embedding,
+  // `structure` already IS the backing graph, so a null backingGraph is
+  // filled in automatically instead of requiring the caller to pass the
+  // same reference twice.
+  if constexpr (std::is_same_v<G, gviz::Graph>) {
+    r->backingGraph = backingGraph ? backingGraph : &structure;
+  } else {
+    r->backingGraph = backingGraph;
+  }
+  r->structureView = std::make_unique<grGraphStructureImpl<G>>(structure);
+  r->highlight.reset();
+
+  embedding.AddAction(GR_ACTION_PICK_FACE, grenderActionPickFace, r);
+  embedding.AddAction(GR_ACTION_PICK_VERTEX, grenderActionPickVertex, r);
   r->highlightActive = false;
   r->colorsDirty = false;
   r->pickedVertexId = -1;
+  r->accentVertexId = -1;
+  r->accentVertexRgba = 0;
   r->vertexOverlayDirty = true;
   r->listSearchFocused = false;
   r->listSearchInput[0] = '\0';
@@ -1009,16 +1064,41 @@ int grRendererSetGraph(grRenderer *r, gviz::layout::EmbeddedGraph &graph,
   if (ensurePositionBuffers(r) < 0 || uploadTopology(r) < 0)
     return -1;
   r->topoDirty = false;
-  r->drawMaskRevision = graph.DrawMaskRevision();
+  r->drawMaskRevision = embedding.DrawMaskRevision();
   r->statsSeriesRevisions.clear();
   r->statsOverlayDirty = true;
   r->statsPrims.clear();
   r->pcaBasisValid = false;
   statsVisibilitySync(r);
-  r->statsMenuSeriesCount = graph.StatSeriesCount();
+  r->statsMenuSeriesCount = embedding.StatSeriesCount();
   grPlatformStatsMenuRefresh(r);
   r->fitRequested = true;
   return 0;
+}
+
+// Explicit instantiation: gviz::Graph and gviz::Subgraph are the only two
+// GraphLike types gviz currently ships (see GraphLike.hpp) -- same
+// two-instantiation convention gviz's own embedder .cpp files use for their
+// template classes. Declared (not defined) in grender.h, so every other
+// translation unit that calls grRendererSetGraph<G> just links against
+// these.
+template int grRendererSetGraph<gviz::Graph>(grRenderer *, gviz::Graph &,
+                                             gviz::layout::EmbeddedGraph &,
+                                             gviz::Graph *);
+template int grRendererSetGraph<gviz::Subgraph>(grRenderer *, gviz::Subgraph &,
+                                                 gviz::layout::EmbeddedGraph &,
+                                                 gviz::Graph *);
+
+size_t grRendererVertexCount(const grRenderer *r) {
+  return r && r->structureView ? r->structureView->VertexCount() : 0;
+}
+
+size_t grRendererRawToLocal(const grRenderer *r, size_t raw) {
+  return r && r->structureView ? r->structureView->RawToLocal(raw) : 0;
+}
+
+size_t grRendererLocalToRaw(const grRenderer *r, size_t local) {
+  return r && r->structureView ? r->structureView->LocalToRaw(local) : 0;
 }
 
 void grRendererGraphStructureChanged(grRenderer *r) { r->topoDirty = true; }
@@ -1061,6 +1141,25 @@ bool grRendererEdgeWeightWidth(const grRenderer *r) {
   return r && r->edgeWeightWidth;
 }
 
+void grRendererSetNodeDegreeScale(grRenderer *r, bool enabled, float factor) {
+  if (!r)
+    return;
+  r->nodeDegreeScale = enabled;
+  r->nodeDegreeScaleFactor = factor;
+  /* Auto-derived data (see uploadTopology): refresh right away so enabling
+   * mid-run takes effect this frame, not at the next structural change. */
+  if (enabled && r->graph)
+    refreshNodeDegrees(r);
+}
+
+bool grRendererNodeDegreeScaleEnabled(const grRenderer *r) {
+  return r && r->nodeDegreeScale;
+}
+
+float grRendererNodeDegreeScaleFactor(const grRenderer *r) {
+  return r ? r->nodeDegreeScaleFactor : 0.0f;
+}
+
 static int uploadAttribute(grRenderer *r, WGPUBuffer *buf, const void *data,
                            size_t bytes, bool *flag, const char *label) {
   if (!data) {
@@ -1074,9 +1173,8 @@ static int uploadAttribute(grRenderer *r, WGPUBuffer *buf, const void *data,
     r->bindGroupDirty = true;
   }
   if (!*buf) {
-    *buf = createBuffer(r, bytes,
-                        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-                        label);
+    *buf = createBuffer(
+        r, bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst, label);
     r->bindGroupDirty = true;
     if (!*buf)
       return -1;
@@ -1229,12 +1327,12 @@ int grRendererSetEdgeWeights(grRenderer *r, const float *weights,
   if (r->meanEdgeWeight <= 0.0f)
     r->meanEdgeWeight = 1.0f;
 
-  return uploadAttribute(r, &r->edgeWeightsBuf, weights,
-                         count * sizeof(float), &r->hasEdgeWeights,
-                         "grender edge weights");
+  return uploadAttribute(r, &r->edgeWeightsBuf, weights, count * sizeof(float),
+                         &r->hasEdgeWeights, "grender edge weights");
 }
 
-int grRendererSetEdgeDashed(grRenderer *r, const uint32_t *dashed, size_t count) {
+int grRendererSetEdgeDashed(grRenderer *r, const uint32_t *dashed,
+                            size_t count) {
   if (dashed && (!r->graph || count != r->topo.edgeCount))
     return -1;
 
@@ -1303,15 +1401,21 @@ void grRendererUnbindMouse(grRenderer *r, int button) {
   }
 }
 
+void grRendererSetOrbitKey(grRenderer *r, int key, double radPerSec) {
+  r->orbitKey = key;
+  r->orbitRadPerSec = radPerSec;
+}
+
 static uint32_t colorToRgba8(const grColor *c) {
-  return GR_RGBA8((uint32_t)(c->r * 255.0f + 0.5f),
-                (uint32_t)(c->g * 255.0f + 0.5f),
-                (uint32_t)(c->b * 255.0f + 0.5f),
-                (uint32_t)(c->a * 255.0f + 0.5f));
+  return GR_RGBA8(
+      (uint32_t)(c->r * 255.0f + 0.5f), (uint32_t)(c->g * 255.0f + 0.5f),
+      (uint32_t)(c->b * 255.0f + 0.5f), (uint32_t)(c->a * 255.0f + 0.5f));
 }
 
 static void grHighlightReset(grRenderer *r) {
   r->highlightActive = false;
+  r->accentVertexId = -1;
+  r->accentVertexRgba = 0;
   r->colorsDirty = true; // recompute nodeColorsBuf/edgeColorsBuf without it
 }
 
@@ -1375,37 +1479,39 @@ static int highlightHasEdge(const gviz::Subgraph *sg, size_t u, size_t v,
 
 /**
  * Recomputes nodeColorsBuf/edgeColorsBuf -- the GPU buffers actually bound
- * for drawing -- from two layers: the persistent client base layer
+ * for drawing -- from up to three layers: the persistent client base layer
  * (nodeColorsStaging/edgeColorsStaging, set via grRendererSetNodeColors/
- * grRendererSetEdgeColors) and the transient active highlight, if any. The
- * highlight is painted *over* the base layer rather than replacing it, so
- * clearing or changing the highlight restores the client's colors instead
- * of falling back to the global style -- that fallback only happens for
- * elements the client never set a color for (or never called
+ * grRendererSetEdgeColors), the transient active highlight, if any, and the
+ * single-vertex accent (grRendererSetAccentVertex), painted last so it wins
+ * over both. Clearing or changing the highlight restores the client's colors
+ * instead of falling back to the global style -- that fallback only happens
+ * for elements the client never set a color for (or never called
  * grRendererSetNodeColors/SetEdgeColors at all), which is what keeps
  * existing callers' behavior unchanged.
  *
- * Runs once per frame, gated by colorsDirty (set on highlight set/clear,
- * client base-layer changes, and capacity/topology changes) so an unrelated
- * frame does no work.
+ * Runs once per frame, gated by colorsDirty (set on highlight/accent
+ * set/clear, client base-layer changes, and capacity/topology changes) so an
+ * unrelated frame does no work.
  */
 static void applyColorLayers(grRenderer *r) {
   if (!r->graph || !r->colorsDirty)
     return;
 
-  bool highlightOn = r->highlightActive && r->graph->HasHighlight();
-  const gviz::Subgraph *highlight =
-      highlightOn ? r->graph->GetHighlight() : NULL;
+  bool highlightOn = r->highlightActive && r->highlight.has_value();
+  const gviz::Subgraph *highlight = highlightOn ? &*r->highlight : NULL;
+  bool accentOn = r->accentVertexId >= 0;
+  bool needNodeComposite = highlightOn || accentOn;
 
   // ---- nodes ----
   size_t nodeCount = r->posCapacity;
   bool haveNodeBase = r->hasClientNodeColors && r->nodeColorsStaging &&
                       r->nodeColorsStagingCount == nodeCount;
 
-  if (!highlightOn) {
-    // No highlight: the bound buffer is exactly the client's base layer, or
-    // cleared to the global style if the client never set one (or cleared
-    // it) -- this is what restores base colors after a highlight ends.
+  if (!needNodeComposite) {
+    // No highlight and no accent: the bound buffer is exactly the client's
+    // base layer, or cleared to the global style if the client never set one
+    // (or cleared it) -- this is what restores base colors after a highlight
+    // / accent ends.
     if (haveNodeBase)
       uploadAttribute(r, &r->nodeColorsBuf, r->nodeColorsStaging,
                       nodeCount * sizeof(uint32_t), &r->hasNodeColors,
@@ -1422,10 +1528,22 @@ static void applyColorLayers(grRenderer *r) {
     for (size_t i = 0; i < nodeCount; i++)
       nodeColors[i] = haveNodeBase ? r->nodeColorsStaging[i] : baseNode;
 
-    for (size_t u : *highlight) {
-      if (r->highlightNodeRgba)
-        nodeColors[u] = r->highlightNodeRgba;
+    // *highlight iterates the parent graph's own (raw) vertex ids;
+    // nodeColors is LOCAL-indexed (see grGraphStructure's doc comment), so
+    // every id needs translating through r->structureView first.
+    if (highlightOn && r->structureView) {
+      for (size_t u : *highlight) {
+        size_t local = r->structureView->RawToLocal(u);
+        if (r->highlightNodeRgba && local < nodeCount)
+          nodeColors[local] = r->highlightNodeRgba;
+      }
     }
+
+    // Accent wins over highlight and base (product: distinguish one member
+    // of the active highlight from the rest).
+    if (accentOn && (size_t)r->accentVertexId < nodeCount &&
+        r->accentVertexRgba)
+      nodeColors[(size_t)r->accentVertexId] = r->accentVertexRgba;
 
     uploadAttribute(r, &r->nodeColorsBuf, nodeColors,
                     nodeCount * sizeof(uint32_t), &r->hasNodeColors,
@@ -1463,10 +1581,11 @@ static void applyColorLayers(grRenderer *r) {
   for (size_t i = 0; i < edgeCount; i++)
     edgeColors[i] = haveEdgeBase ? r->edgeColorsStaging[i] : baseEdge;
 
-  if (r->highlightEdgeRgba) {
+  if (r->highlightEdgeRgba && r->structureView) {
     for (size_t i = 0; i < edgeCount; i++) {
-      uint32_t eu = r->topo.edges[i * 2];
-      uint32_t ev = r->topo.edges[i * 2 + 1];
+      // r->topo.edges holds LOCAL indices; *highlight is raw-addressed.
+      size_t eu = r->structureView->LocalToRaw(r->topo.edges[i * 2]);
+      size_t ev = r->structureView->LocalToRaw(r->topo.edges[i * 2 + 1]);
       if (highlightHasEdge(highlight, eu, ev, r->topo.directed))
         edgeColors[i] = r->highlightEdgeRgba;
     }
@@ -1504,10 +1623,19 @@ int grRendererSetHighlight(grRenderer *r, const gviz::Subgraph &highlight,
   if (!copy)
     return -1;
 
-  r->graph->SetHighlight(std::move(*copy));
+  // gviz::Subgraph is move-constructible but not move-ASSIGNABLE (its
+  // const Graph& member can't be reseated), so std::optional's assignment
+  // operator is unavailable -- emplace() (placement-construct in place)
+  // is the right replacement operation, same as EmbeddedGraph's old
+  // SetHighlight/ClearHighlight used internally.
+  r->highlight.emplace(std::move(*copy));
   r->highlightActive = true;
   r->highlightNodeRgba = nodeRgba;
   r->highlightEdgeRgba = edgeRgba;
+  // Replacing the highlight set makes any prior accent stale (it was almost
+  // always a member of the previous set). App re-sets after the panel updates.
+  r->accentVertexId = -1;
+  r->accentVertexRgba = 0;
   r->colorsDirty = true;
   r->listFilterDirty = true; // the list's vertex set follows the highlight
   r->listOverlayDirty = true;
@@ -1539,16 +1667,36 @@ int grRendererSetHighlightCycle(grRenderer *r, const size_t *vertices,
 void grRendererClearHighlight(grRenderer *r) {
   if (!r)
     return;
-  if (r->graph)
-    r->graph->ClearHighlight();
+  r->highlight.reset();
   // grHighlightReset marks colorsDirty so applyColorLayers repaints
   // nodeColorsBuf/edgeColorsBuf from the client base layer alone (or the
   // global style, if none was set) -- it must NOT touch the client's base
   // layer itself (nodeColorsStaging/edgeColorsStaging), which persists
-  // across highlight clears per grRendererSetNodeColors's contract.
+  // across highlight clears per grRendererSetNodeColors's contract. It also
+  // clears any accent vertex (same lifetime as the highlight set).
   grHighlightReset(r);
   r->listFilterDirty = true; // the list's vertex set follows the highlight
   r->listOverlayDirty = true;
+}
+
+void grRendererSetAccentVertex(grRenderer *r, size_t vertexId, uint32_t rgba) {
+  if (!r)
+    return;
+  r->accentVertexId = (int64_t)vertexId;
+  r->accentVertexRgba = rgba;
+  r->colorsDirty = true;
+}
+
+void grRendererClearAccentVertex(grRenderer *r) {
+  if (!r || r->accentVertexId < 0)
+    return;
+  r->accentVertexId = -1;
+  r->accentVertexRgba = 0;
+  r->colorsDirty = true;
+}
+
+int64_t grRendererAccentVertex(const grRenderer *r) {
+  return r ? r->accentVertexId : -1;
 }
 
 static void grenderActionPickFace(gviz::layout::EmbeddedGraph &eg,
@@ -1573,18 +1721,19 @@ static void grenderActionPickFace(gviz::layout::EmbeddedGraph &eg,
  * World-space click tolerance for grenderActionPickVertex: the radius (in
  * world units, at depth (x, y, z)) that vertex @p v is actually drawn at on
  * screen right now -- honoring a per-vertex size from grRendererSetNodeSizes
- * when one is active, exactly like the vertex shader does. Ports the shader's
- * own pxPerWorld/radiusPx math (grShaders.h) to the CPU so a click only
- * counts as landing "on" a vertex when it falls within the same circle the
- * user sees, then converts that pixel radius back to world units for
- * comparison against worldX/worldY (already unprojected onto the
- * camera-target plane, same as pick-face).
+ * when one is active, and degree-based scaling (grRendererSetNodeDegreeScale)
+ * otherwise, exactly like the vertex shader does. Ports the shader's own
+ * pxPerWorld/radiusPx math (grShaders.h) to the CPU so a click only counts as
+ * landing "on" a vertex when it falls within the same circle the user sees,
+ * then converts that pixel radius back to world units for comparison against
+ * worldX/worldY (already unprojected onto the camera-target plane, same as
+ * pick-face).
  */
 static double grHitTestVertexEpsilon(grRenderer *r, uint32_t v, double x,
                                      double y, double z) {
   const float *viewProj = r->cameraFrame.viewProj;
   double clipW = (double)viewProj[3] * x + (double)viewProj[7] * y +
-                (double)viewProj[11] * z + (double)viewProj[15];
+                 (double)viewProj[11] * z + (double)viewProj[15];
   if (clipW < 1e-6)
     clipW = 1e-6;
   double pxPerWorld =
@@ -1592,10 +1741,12 @@ static double grHitTestVertexEpsilon(grRenderer *r, uint32_t v, double x,
   if (pxPerWorld <= 0.0)
     return 0.0;
 
-  double radius = (r->hasNodeSizes && r->nodeSizesStaging &&
-                   v < r->nodeSizesStagingCount)
-                      ? r->nodeSizesStaging[v]
-                      : r->nodeStyle.radius;
+  double radius = r->nodeStyle.radius;
+  if (r->nodeDegreeScale && r->hasNodeDegrees && r->graph)
+    radius *= 1.0 + r->nodeDegreeScaleFactor *
+                        sqrt((double)grTopologyVertexDegree(&r->topo, v));
+  if (r->hasNodeSizes && r->nodeSizesStaging && v < r->nodeSizesStagingCount)
+    radius = r->nodeSizesStaging[v];
   double radiusPx = radius;
   if (r->nodeStyle.sizeMode == GR_SIZE_WORLD) {
     radiusPx = radius * pxPerWorld;
@@ -1619,8 +1770,7 @@ static double grHitTestVertexEpsilon(grRenderer *r, uint32_t v, double x,
  * circle contains the click.
  */
 static bool grHitTestVertex(grRenderer *r, gviz::layout::EmbeddedGraph &eg,
-                            double worldX, double worldY,
-                            size_t *outVertex) {
+                            double worldX, double worldY, size_t *outVertex) {
   size_t dim = eg.Dim();
   const double *pos = eg.Positions().data();
 
@@ -1633,8 +1783,8 @@ static bool grHitTestVertex(grRenderer *r, gviz::layout::EmbeddedGraph &eg,
     double dy = p[1] - worldY;
     double d2 = dx * dx + dy * dy;
 
-    double epsilon = grHitTestVertexEpsilon(r, v, p[0], p[1],
-                                            dim >= 3 ? p[2] : 0.0);
+    double epsilon =
+        grHitTestVertexEpsilon(r, v, p[0], p[1], dim >= 3 ? p[2] : 0.0);
     if (epsilon <= 0.0)
       continue;
     double ratio2 = d2 / (epsilon * epsilon);
@@ -1651,9 +1801,9 @@ static bool grHitTestVertex(grRenderer *r, gviz::layout::EmbeddedGraph &eg,
   return true;
 }
 
-static void grenderActionPickVertex(gviz::layout::EmbeddedGraph &eg,
-                                    void *userData,
-                                    const gviz::layout::ActionPayload &payload) {
+static void
+grenderActionPickVertex(gviz::layout::EmbeddedGraph &eg, void *userData,
+                        const gviz::layout::ActionPayload &payload) {
   grRenderer *r = (grRenderer *)userData;
   if (!r || r->topo.nodeCount == 0)
     return;
@@ -1674,49 +1824,45 @@ static void grenderActionPickVertex(gviz::layout::EmbeddedGraph &eg,
     r->vertexOverlayDirty = true;
   }
 
-  // The highlight below needs raw parent-graph access (EnsureLayout, and the
-  // fallback neighbor iteration) that gviz::Subgraph deliberately never
-  // exposes -- see grRendererSetGraph's doc comment. Without a backingGraph,
-  // the picked-vertex state above still updates (so the vertex-info panel
-  // still works), but no highlight is drawn.
-  if (!r->backingGraph)
+  // The highlight below needs raw parent-graph access (EnsureLayout) that
+  // gviz::Subgraph deliberately never exposes -- see grRendererSetGraph's
+  // doc comment. Without a backingGraph, the picked-vertex state above
+  // still updates (so the vertex-info panel still works), but no highlight
+  // is drawn.
+  if (!r->backingGraph || !r->structureView)
     return;
 
-  gviz::Subgraph &structure = eg.Structure();
   try {
     r->backingGraph->EnsureLayout();
     gviz::Subgraph pick = gviz::Subgraph::CreateEmpty(*r->backingGraph);
 
-    pick.ShowVertex(nearest);
+    size_t rawNearest = r->structureView->LocalToRaw(nearest);
+    pick.ShowVertex(rawNearest);
 
     // Shift-click flips the highlight to in-edges (nearest's predecessors)
     // instead of the default out-edges, for directed graphs only -- shift is
     // a no-op on undirected graphs, where every edge already appears both
-    // ways in the out rows. Both branches read the embedding's SYNCED
-    // adjacency snapshot (EmbeddedGraph::OutNeighbors/InNeighbors), the same
-    // structure grTopologyExtract draws edges from, so the highlight can
-    // never include an edge that isn't on screen. Embeddings that never
-    // synced have no snapshot (the accessors return an empty span); there
-    // the live subgraph is the committed structure and out-edges fall back
-    // to neighbor iteration, while in-edges have no source at all and
-    // shift-click degrades to highlighting just the vertex.
-    if (structure.ParentIsDirected() && (payload.iarg & GR_MOD_SHIFT) != 0) {
-      for (size_t u : eg.InNeighbors(nearest)) {
-        pick.ShowVertex(u);
-        highlightShowBoundaryEdge(pick, u, nearest); // edge is u -> nearest
+    // ways in the out rows. Both branches read r->topo's own full adjacency
+    // CSR (grender's local substitute for the synced adjacency snapshot
+    // gviz::layout::EmbeddedGraph used to maintain -- see grTopology's doc
+    // comment in grInternal.h), the same structure grTopologyExtract draws
+    // edges from, so the highlight can never include an edge that isn't on
+    // screen.
+    bool shiftIn = r->structureView->IsDirected() &&
+                   (payload.iarg & GR_MOD_SHIFT) != 0;
+    if (shiftIn) {
+      for (uint32_t k = r->topo.inOffsets[nearest];
+           k < r->topo.inOffsets[nearest + 1]; k++) {
+        size_t rawU = r->structureView->LocalToRaw(r->topo.inNbrs[k]);
+        pick.ShowVertex(rawU);
+        highlightShowBoundaryEdge(pick, rawU, rawNearest); // edge is u -> nearest
       }
     } else {
-      std::span<const size_t> outNbrs = eg.OutNeighbors(nearest);
-      if (!outNbrs.empty()) {
-        for (size_t v : outNbrs) {
-          pick.ShowVertex(v);
-          highlightShowBoundaryEdge(pick, nearest, v);
-        }
-      } else {
-        for (size_t v : structure.Neighbors(nearest)) {
-          pick.ShowVertex(v);
-          highlightShowBoundaryEdge(pick, nearest, v);
-        }
+      for (uint32_t k = r->topo.outOffsets[nearest];
+           k < r->topo.outOffsets[nearest + 1]; k++) {
+        size_t rawV = r->structureView->LocalToRaw(r->topo.outNbrs[k]);
+        pick.ShowVertex(rawV);
+        highlightShowBoundaryEdge(pick, rawNearest, rawV);
       }
     }
     pick.Rebuild();
@@ -1729,6 +1875,12 @@ static void grenderActionPickVertex(gviz::layout::EmbeddedGraph &eg,
 }
 
 void grRendererFitView(grRenderer *r) { r->fitRequested = true; }
+
+void grRendererSetCameraTarget(grRenderer *r, double x, double y, double z) {
+  r->camera.target[0] = x;
+  r->camera.target[1] = y;
+  r->camera.target[2] = z;
+}
 
 void grRendererRequestClose(grRenderer *r) { r->closeRequested = true; }
 
@@ -1806,14 +1958,7 @@ static void fitViewNow(grRenderer *r, double fbw, double fbh) {
 #define GR_FOCUS_EXTENT_FRACTION 0.08
 #define GR_FOCUS_FALLBACK_RADIUS 1.0
 
-/**
- * Centers the camera on vertex @p vertexId and zooms in to comfortably frame
- * a neighborhood around it, sized relative to the graph's current bounding
- * box (see GR_FOCUS_EXTENT_FRACTION) via grCameraFitBox -- shared by the C
- * key (see processInput below) and grConsole.c's "find" command so both
- * behave identically. No-op if @p vertexId is out of range or no vertex
- * position data has been uploaded yet.
- */
+/* Public declaration + contract: include/grender/grender.h. */
 void grRendererFocusVertex(grRenderer *r, size_t vertexId) {
   if (!r || !r->posStaging || vertexId >= r->posCapacity)
     return;
@@ -1839,10 +1984,12 @@ void grRendererFocusVertex(grRenderer *r, size_t vertexId) {
     focusMax[d] = point[d] + radius;
   }
   grCameraFitBox(&r->camera, focusMin, focusMax, r->surfaceConfig.width,
-                r->surfaceConfig.height);
+                 r->surfaceConfig.height);
 }
 
 /** Applies built-in navigation and queues action dispatches. */
+#define GR_ROLL_STEP (M_PI / 36.0) // 15 degrees per Q/E press
+
 static void processInput(grRenderer *r, double fbw, double fbh) {
   r->viewportHeightPx = fbh;
 
@@ -1913,6 +2060,11 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   r->dragLastX = cx;
   r->dragLastY = cy;
 
+  if (r->orbitKey >= 0 && !r->listSearchFocused &&
+      glfwGetKey(r->window, r->orbitKey) == GLFW_PRESS) {
+    grCameraOrbit(&r->camera, r->orbitRadPerSec * r->deltaTime, 0.0);
+  }
+
   grVertexOverlayLayout vertexOverlayLayout;
   grVertexOverlayComputeLayout(r, fbw, fbh, &vertexOverlayLayout);
   bool overVertexOverlay =
@@ -1960,11 +2112,11 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
     if (!r->camera.perspective) {
       // Zoom about the cursor: keep the world point under it fixed.
       double wx0, wy0, wx1, wy1;
-      grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh,
-                        &wx0, &wy0);
+      grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh, &wx0,
+                        &wy0);
       grCameraZoom(&r->camera, factor);
-      grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh,
-                        &wx1, &wy1);
+      grCameraUnproject(&r->camera, &r->cameraFrame, cxPx, cyPx, fbw, fbh, &wx1,
+                        &wy1);
       r->camera.target[0] += wx0 - wx1;
       r->camera.target[1] += wy0 - wy1;
     } else {
@@ -1975,13 +2127,16 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
 
   grCameraFrameCompute(&r->camera, fbw, fbh, &r->cameraFrame);
 
-  // Key dispatch: built-in fit on F unless the app bound F itself. Most of
-  // this is suppressed while the list's search box has focus, so typing e.g.
-  // "field" into it doesn't also fit the view (F), toggle stats (S), or fire
-  // any app-bound action -- exactly like the console's own exclusive input
-  // capture, just scoped to key dispatch rather than all input. Up/Down list
-  // navigation is the one exception: arrow keys never appear in typed text,
-  // so they stay live even while the search box is focused.
+  // Key dispatch: built-in fit on F unless the app bound F itself. Q/E roll
+  // the camera by a fixed step -- the view's only rotation in 2D, and an
+  // independent roll about the look direction on top of orbit in 3D. Most
+  // of this is suppressed while the
+  // list's search box has focus, so typing e.g. "field" into it doesn't also
+  // fit the view (F), toggle stats (S), or fire any app-bound action --
+  // exactly like the console's own exclusive input capture, just scoped to
+  // key dispatch rather than all input. Up/Down list navigation is the one
+  // exception: arrow keys never appear in typed text, so they stay live even
+  // while the search box is focused.
   {
     const grPendingKey *pendingKeys = r->pendingKeys.data();
     const grKeyBinding *bindings = r->bindings.data();
@@ -2007,9 +2162,13 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
           continue;
         }
         if (r->listSearchFocused)
-          continue; // F/S/I/L/C/console-toggle stay suppressed while typing
+          continue; // F/Q/E/S/I/L/C/console-toggle stay suppressed while typing
         if (key == 'F')
           r->fitRequested = true;
+        else if (key == 'Q')
+          grCameraRoll(&r->camera, GR_ROLL_STEP);
+        else if (key == 'E')
+          grCameraRoll(&r->camera, -GR_ROLL_STEP);
         else if (key == 'S')
           grRendererShowStats(r, !r->statsVisible);
         else if (key == 'I')
@@ -2127,7 +2286,8 @@ static void writeGlobals(grRenderer *r, double fbw, double fbh) {
             ((r->edgeWeightWidth && r->hasEdgeWeights) ? 16u : 0u) |
             (r->topo.directed ? 32u : 0u) |
             (r->nodeStyle.roundedSquare ? 64u : 0u) |
-            (r->hasEdgeDashed ? 128u : 0u);
+            (r->hasEdgeDashed ? 128u : 0u) |
+            ((r->nodeDegreeScale && r->hasNodeDegrees) ? 256u : 0u);
 
   memcpy(g.nodeFill, &r->nodeStyle.fillColor, sizeof(float) * 4);
   memcpy(g.nodeStroke, &r->nodeStyle.strokeColor, sizeof(float) * 4);
@@ -2138,7 +2298,7 @@ static void writeGlobals(grRenderer *r, double fbw, double fbh) {
   g.nodeSizeLimits[0] = r->nodeStyle.minPixelRadius;
   g.nodeSizeLimits[1] = r->nodeStyle.maxPixelRadius;
   g.nodeSizeLimits[2] = r->nodeStyle.cornerRadiusFraction;
-  g.nodeSizeLimits[3] = 0.0f;
+  g.nodeSizeLimits[3] = r->nodeDegreeScaleFactor;
 
   memcpy(g.edgeColor, &r->edgeStyle.color, sizeof(float) * 4);
   g.edgeParams[0] = r->edgeStyle.width;
@@ -2161,7 +2321,8 @@ static void uploadPositions(grRenderer *r) {
     } else {
       r->pcaBasisValid = true;
     }
-    wgpuQueueWriteBuffer(r->queue, r->positionsBuf, 0, dst, sizeof(float) * n * 3);
+    wgpuQueueWriteBuffer(r->queue, r->positionsBuf, 0, dst,
+                         sizeof(float) * n * 3);
     return;
   }
   for (size_t i = 0; i < n * r->posDim; i++)
@@ -2238,10 +2399,10 @@ static void uploadStats(grRenderer *r, double fbw, double fbh) {
   if (r->statsPrims.size() > r->statsBufCapacity) {
     GR_RELEASE(wgpuBufferRelease, r->statsBuf);
     r->statsBufCapacity = r->statsPrims.size() * 2;
-    r->statsBuf = createBuffer(
-        r, sizeof(grStatsPrim) * r->statsBufCapacity,
-        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-        "grender stats prims");
+    r->statsBuf =
+        createBuffer(r, sizeof(grStatsPrim) * r->statsBufCapacity,
+                     WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
+                     "grender stats prims");
     r->bindGroupDirty = true;
     if (!r->statsBuf) {
       r->statsPrims.clear();
@@ -2259,22 +2420,20 @@ static void encodeScenePass(grRenderer *r, WGPUCommandEncoder encoder,
       encoder,
       grPtr(WGPURenderPassDescriptor{
           .colorAttachmentCount = 1,
-          .colorAttachments =
-              grPtr(WGPURenderPassColorAttachment{
-                  .view = target,
-                  .loadOp = WGPULoadOp_Clear,
-                  .storeOp = WGPUStoreOp_Store,
-                  .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
-                  .clearValue = {r->clearColor.r, r->clearColor.g,
-                                 r->clearColor.b, r->clearColor.a},
-              }),
-          .depthStencilAttachment =
-              grPtr(WGPURenderPassDepthStencilAttachment{
-                  .view = depth,
-                  .depthLoadOp = WGPULoadOp_Clear,
-                  .depthStoreOp = WGPUStoreOp_Store,
-                  .depthClearValue = 1.0f,
-              }),
+          .colorAttachments = grPtr(WGPURenderPassColorAttachment{
+              .view = target,
+              .loadOp = WGPULoadOp_Clear,
+              .storeOp = WGPUStoreOp_Store,
+              .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
+              .clearValue = {r->clearColor.r, r->clearColor.g, r->clearColor.b,
+                             r->clearColor.a},
+          }),
+          .depthStencilAttachment = grPtr(WGPURenderPassDepthStencilAttachment{
+              .view = depth,
+              .depthLoadOp = WGPULoadOp_Clear,
+              .depthStoreOp = WGPUStoreOp_Store,
+              .depthClearValue = 1.0f,
+          }),
       }));
 
   // Texture map's movable image rect, if shown: drawn first (and never
@@ -2341,16 +2500,16 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
   }
 
   WGPUTexture target = wgpuDeviceCreateTexture(
-      r->device, grPtr(WGPUTextureDescriptor{
-                     .label = {"grender screenshot", WGPU_STRLEN},
-                     .usage = WGPUTextureUsage_RenderAttachment |
-                              WGPUTextureUsage_CopySrc,
-                     .dimension = WGPUTextureDimension_2D,
-                     .size = {w, h, 1},
-                     .format = r->surfaceFormat,
-                     .mipLevelCount = 1,
-                     .sampleCount = 1,
-                 }));
+      r->device,
+      grPtr(WGPUTextureDescriptor{
+          .label = {"grender screenshot", WGPU_STRLEN},
+          .usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc,
+          .dimension = WGPUTextureDimension_2D,
+          .size = {w, h, 1},
+          .format = r->surfaceFormat,
+          .mipLevelCount = 1,
+          .sampleCount = 1,
+      }));
   if (!target)
     return -1;
   WGPUTextureView targetView = wgpuTextureCreateView(target, NULL);
@@ -2367,8 +2526,7 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
   encodeScenePass(r, encoder, targetView, r->depthView);
   grObjOverlayEncode(r, encoder, targetView, r->depthView, w, h);
   wgpuCommandEncoderCopyTextureToBuffer(
-      encoder,
-      grPtr(WGPUTexelCopyTextureInfo{.texture = target}),
+      encoder, grPtr(WGPUTexelCopyTextureInfo{.texture = target}),
       grPtr(WGPUTexelCopyBufferInfo{
           .layout = {.bytesPerRow = bytesPerRow, .rowsPerImage = h},
           .buffer = readback,
@@ -2391,8 +2549,7 @@ int grRendererSaveScreenshot(grRenderer *r, const char *path) {
   WGPUFutureWaitInfo mapWait = {.future = mapFuture};
   wgpuInstanceWaitAny(r->instance, 1, &mapWait, UINT64_MAX);
 #else
-  wgpuBufferMapAsync(readback, WGPUMapMode_Read, 0,
-                     (size_t)bytesPerRow * h,
+  wgpuBufferMapAsync(readback, WGPUMapMode_Read, 0, (size_t)bytesPerRow * h,
                      (const WGPUBufferMapCallbackInfo){
                          .callback = onScreenshotMap,
                          .userdata1 = &mapStatus,

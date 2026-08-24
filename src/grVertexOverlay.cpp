@@ -24,6 +24,17 @@
 #include <stdio.h>
 #include <string.h>
 
+void grRendererShowVertexInfo(grRenderer *r, bool show) {
+  if (!r || r->vertexInfoVisible == show)
+    return;
+  r->vertexInfoVisible = show;
+  r->vertexOverlayDirty = true;
+}
+
+bool grRendererVertexInfoShown(const grRenderer *r) {
+  return r && r->vertexInfoVisible;
+}
+
 static bool lineHasContent(const char *s) {
   for (; *s; s++)
     if (isalnum((unsigned char)*s))
@@ -139,7 +150,8 @@ void grVertexOverlayComputeLayout(grRenderer *r, double fbw, double fbh,
   memset(out, 0, sizeof(*out));
   r->vertexOverlayLines.clear();
 
-  if (!r->graph || r->pickedVertexId < 0 || !r->vertexLabels ||
+  if (!r->vertexInfoVisible || !r->graph || r->pickedVertexId < 0 ||
+      !r->vertexLabels ||
       (size_t)r->pickedVertexId >= r->vertexLabelsCount)
     return;
   const char *text = r->vertexLabels[r->pickedVertexId];

@@ -7,29 +7,34 @@
  * configurable) is laid out while grender draws every frame. The embedder
  * registers "forceEmbedder.step" on its embedded graph; this app merely
  * binds a key to that name without knowing what it does. Node radii are
- * scaled by degree via ForceAtlas::ConfigureRadius, and the per-vertex
- * radii are handed to grRendererSetNodeSizes so what's drawn matches the
- * circles the physics can be told to keep apart. Overlap prevention (which
- * makes repulsion actually respect those radii) starts off and is toggled
- * live with 'O' once the layout has roughly settled, mirroring Gephi's
- * "Prevent Overlap" checkbox.
+ * scaled by degree in two independent places that are kept in sync by
+ * construction, not by convention: ForceAtlas::ConfigureRadius(base,
+ * perDegree) drives the physics (what repulsion treats as each vertex's
+ * personal-space circle), and grRendererSetNodeDegreeScale(true, perDegree)
+ * with nodeStyle.radius = base drives what's actually drawn -- same
+ * formula, same two numbers, passed to both from this demo's DemoConfig
+ * (the one layer that legitimately knows about both gviz's physics and
+ * grender's rendering; neither depends on the other). Overlap prevention
+ * (which makes repulsion actually respect those radii) starts off and is
+ * toggled live with 'O' once the layout has roughly settled, mirroring
+ * Gephi's "Prevent Overlap" checkbox.
  *
- * With -G/--grow the graph is dynamic: the embedder is built over a
- * whole-graph vertex-induced view (no up-front edge-bitset layout), and 'A'
- * adds a vertex wired to one or two random existing vertices directly on
- * the gviz::Graph, committed with ForceAtlas::Sync -- the new vertex
- * appears already placed near its neighbors, visible and simulated in the
- * same frame (gviz's commit model: nothing downstream of the graph sees a
- * mutation until Sync). Everything else works as in static mode:
- * click-highlighting (the renderer refreshes the pick layout on demand),
- * per-vertex sizes (preserved by the renderer across growth), and
- * --degree-alpha/--edge-weight-width (derived by the renderer from the
- * structure on every commit).
+ * -G/--grow (the live vertex-adding mode from before gviz's GraphLike/
+ * DenseIndex refactor) is REMOVED, not adapted: gviz's embedders have no
+ * dynamic-graph-growth/Sync() support at all anymore -- ForceAtlas<G> (like
+ * every other embedder) sizes every per-vertex array once, at construction,
+ * from its DenseIndex<G> over the structure as it stood then, and an
+ * embedding is fixed for its whole lifetime once built (see
+ * EmbeddedGraph.hpp and ForceAtlas.hpp's class docs). There is no
+ * replacement API to add a vertex to an already-constructed embedder, so
+ * the flag is now rejected with an explanatory error instead of silently
+ * doing something else; the rest of this demo (click-highlighting,
+ * degree-scaled node sizes, --degree-alpha/--edge-weight-width) is
+ * otherwise unaffected.
  *
  * Controls:
  *   R      - run one relaxation step
  *   space  - toggle continuous stepping
- *   A      - add a vertex and commit it (with -G/--grow)
  *   h/l    - decrease/increase ideal edge length
  *   j/k    - decrease/increase gravity k
  *   N/M    - decrease/increase Barnes-Hut theta
@@ -51,9 +56,9 @@
  *   -d, --directed                interpret the -g/--graph file's edges as
  *                                 directed (default: undirected; ignored
  *                                 without -g/--graph)
- *   -G, --grow                    dynamic mode: vertex-induced embedding, 'A'
- *                                 grows the graph live (screenshot mode grows
- *                                 automatically while stepping)
+ *   -G, --grow                    REMOVED -- gviz has no dynamic-graph-growth
+ *                                 support anymore; this flag now errors out
+ *                                 (see the file header comment)
  *   -m, --model {linlog|fr}       force model (default linlog)
  *   -o, --screenshot PATH         save a .ppm screenshot after settling and exit
  *       --degree-alpha            fade edges by max endpoint degree (default off)
@@ -67,6 +72,7 @@
  */
 
 #include "grender/grender.h"
+#include "grender/grStepProfiling.h"
 
 #include "gviz.hpp"
 
@@ -92,7 +98,7 @@
 #define DEMO_THETA_MIN 0.1
 #define DEMO_EDGE_LENGTH_STEP 0.2
 #define DEMO_EDGE_LENGTH_MIN 0.2
-#define DEMO_RADIUS_BASE 0.5
+#define DEMO_RADIUS_BASE 10
 #define DEMO_RADIUS_PER_DEGREE 5
 #define DEMO_RADIUS_BASE_STEP 0.1
 #define DEMO_RADIUS_BASE_MIN 0.0
@@ -100,42 +106,28 @@
 using gviz::layout::ForceAtlas;
 
 /*
- * Renderer + scratch buffer + shadow config state needed by the live-tuning
- * action handlers. The old C ForceAtlas struct exposed gravityK/edgeLength/
- * theta/radiusBase/radiusPerDegree as plain fields the demo read back
- * directly for its printf readouts; the ported ForceAtlas class only offers
- * one-way Configure*() setters (see ForceAtlas.hpp), so this demo keeps its
- * own shadow copy of whatever it last configured instead -- a self-contained
+ * Renderer + shadow config state needed by the live-tuning action handlers.
+ * The old C ForceAtlas struct exposed gravityK/edgeLength/theta/radiusBase/
+ * radiusPerDegree as plain fields the demo read back directly for its
+ * printf readouts; the ported ForceAtlas class only offers one-way
+ * Configure*() setters (see ForceAtlas.hpp), so this demo keeps its own
+ * shadow copy of whatever it last configured instead -- a self-contained
  * demo-only adaptation, not a gap the renderer or gviz need to fill.
+ *
+ * nodeStyle is the renderer's own base style, shadowed here too: radiusBase
+ * changing live via '['/']' has to update nodeStyle.radius and re-push it
+ * with grRendererSetNodeStyle, and that call needs the rest of the style
+ * (fill color, size mode, pixel limits, ...) intact, not just the radius.
  */
 typedef struct DemoConfig {
   grRenderer *r = nullptr;
-  std::vector<float> radii; // scratch, sized to vertex count, reused across updates
+  grNodeStyle nodeStyle{};
   double gravityK = DEMO_GRAVITY_K_DEFAULT;
-  double edgeLength = ForceAtlas::kEdgeLengthDefault;
-  double theta = ForceAtlas::kThetaDefault;
+  double edgeLength = ForceAtlas<gviz::Subgraph>::kEdgeLengthDefault;
+  double theta = ForceAtlas<gviz::Subgraph>::kThetaDefault;
   double radiusBase = DEMO_RADIUS_BASE;
   double radiusPerDegree = DEMO_RADIUS_PER_DEGREE;
 } DemoConfig;
-
-/*
- * ForceAtlas doesn't expose its compact-index -> raw-vertex-id table
- * (vertices_ was a private old-C-struct field this demo used to read
- * directly): this demo always keeps every graph vertex admitted into a
- * dense [0, PositionCount()) subgraph (full mode, or a vertex-induced
- * "grow" mode that shows every vertex as it's added), so compact index i
- * and raw vertex id i coincide here, and PositionCount() stands in for the
- * old vertexCount. That equivalence is specific to this demo's usage, not a
- * general library guarantee.
- */
-static void refreshNodeSizes(ForceAtlas &fa, DemoConfig &ctl) {
-  size_t n = fa.PositionCount();
-  if (ctl.radii.size() < n)
-    ctl.radii.resize(n);
-  for (size_t i = 0; i < n; i++)
-    ctl.radii[i] = (float)fa.VertexRadius(i);
-  grRendererSetNodeSizes(ctl.r, ctl.radii.data(), n);
-}
 
 static void actionToggleAuto(gviz::layout::EmbeddedGraph &eg, void *userData,
                              const gviz::layout::ActionPayload &payload) {
@@ -150,7 +142,7 @@ static void actionGravityUp(gviz::layout::EmbeddedGraph &eg, void *userData,
                             const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
-  auto &fa = static_cast<ForceAtlas &>(eg);
+  auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
   cfg->gravityK += DEMO_GRAVITY_K_STEP;
   fa.ConfigureGravity(cfg->gravityK);
   printf("gravity k: %f\n", cfg->gravityK);
@@ -160,7 +152,7 @@ static void actionGravityDown(gviz::layout::EmbeddedGraph &eg, void *userData,
                               const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
-  auto &fa = static_cast<ForceAtlas &>(eg);
+  auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
   cfg->gravityK = fmax(cfg->gravityK - DEMO_GRAVITY_K_STEP, 0.0);
   fa.ConfigureGravity(cfg->gravityK);
   printf("gravity k: %f\n", cfg->gravityK);
@@ -170,7 +162,7 @@ static void actionEdgeLengthUp(gviz::layout::EmbeddedGraph &eg, void *userData,
                                const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
-  auto &fa = static_cast<ForceAtlas &>(eg);
+  auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
   cfg->edgeLength += DEMO_EDGE_LENGTH_STEP;
   fa.Configure(cfg->edgeLength, 0);
   printf("edge length: %f\n", cfg->edgeLength);
@@ -180,7 +172,7 @@ static void actionEdgeLengthDown(gviz::layout::EmbeddedGraph &eg, void *userData
                                  const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
-  auto &fa = static_cast<ForceAtlas &>(eg);
+  auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
   cfg->edgeLength = fmax(cfg->edgeLength - DEMO_EDGE_LENGTH_STEP, DEMO_EDGE_LENGTH_MIN);
   fa.Configure(cfg->edgeLength, 0);
   printf("edge length: %f\n", cfg->edgeLength);
@@ -190,7 +182,7 @@ static void actionThetaUp(gviz::layout::EmbeddedGraph &eg, void *userData,
                           const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
-  auto &fa = static_cast<ForceAtlas &>(eg);
+  auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
   cfg->theta += DEMO_THETA_STEP;
   fa.ConfigureBarnesHut(cfg->theta, 0);
   printf("theta: %f\n", cfg->theta);
@@ -200,7 +192,7 @@ static void actionThetaDown(gviz::layout::EmbeddedGraph &eg, void *userData,
                             const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
-  auto &fa = static_cast<ForceAtlas &>(eg);
+  auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
   cfg->theta = fmax(cfg->theta - DEMO_THETA_STEP, DEMO_THETA_MIN);
   fa.ConfigureBarnesHut(cfg->theta, 0);
   printf("theta: %f\n", cfg->theta);
@@ -210,10 +202,11 @@ static void actionRadiusBaseUp(gviz::layout::EmbeddedGraph &eg, void *userData,
                                const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
-  auto &fa = static_cast<ForceAtlas &>(eg);
+  auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
   cfg->radiusBase += DEMO_RADIUS_BASE_STEP;
   fa.ConfigureRadius(cfg->radiusBase, cfg->radiusPerDegree);
-  refreshNodeSizes(fa, *cfg);
+  cfg->nodeStyle.radius = (float)cfg->radiusBase;
+  grRendererSetNodeStyle(cfg->r, &cfg->nodeStyle);
   printf("radius base: %f\n", cfg->radiusBase);
 }
 
@@ -221,10 +214,11 @@ static void actionRadiusBaseDown(gviz::layout::EmbeddedGraph &eg, void *userData
                                  const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
-  auto &fa = static_cast<ForceAtlas &>(eg);
+  auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
   cfg->radiusBase = fmax(cfg->radiusBase - DEMO_RADIUS_BASE_STEP, DEMO_RADIUS_BASE_MIN);
   fa.ConfigureRadius(cfg->radiusBase, cfg->radiusPerDegree);
-  refreshNodeSizes(fa, *cfg);
+  cfg->nodeStyle.radius = (float)cfg->radiusBase;
+  grRendererSetNodeStyle(cfg->r, &cfg->nodeStyle);
   printf("radius base: %f\n", cfg->radiusBase);
 }
 
@@ -232,55 +226,9 @@ static void actionToggleOverlapPrevention(gviz::layout::EmbeddedGraph &eg, void 
                                           const gviz::layout::ActionPayload &payload) {
   (void)userData;
   (void)payload;
-  auto &fa = static_cast<ForceAtlas &>(eg);
+  auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
   fa.SetPreventOverlapEnabled(!fa.PreventOverlapEnabled());
   printf("prevent overlap: %s\n", fa.PreventOverlapEnabled() ? "on" : "off");
-}
-
-/* Everything actionGrowVertex needs: the mutable parent graph (mutated
- * directly, per gviz's commit model), an RNG stream of its own, and a flag
- * for the main loop to refresh node sizes AFTER the renderer has grown its
- * per-vertex buffers -- grRendererSetNodeSizes requires count to match the
- * renderer's position capacity, which only catches up on the frame
- * following the commit. */
-typedef struct GrowControl {
-  gviz::Graph *graph;
-  unsigned int rng;
-  bool sizesDirty;
-} GrowControl;
-
-/* Adds one vertex wired to one or two random existing vertices directly on
- * the gviz::Graph, then commits with ForceAtlas::Sync: the vertex becomes
- * visible and simulated together, already placed near its neighbors. Wiring
- * the edges BEFORE the Sync is what makes that placement possible (see
- * ForceAtlas::Sync's contract). */
-static void actionGrowVertex(gviz::layout::EmbeddedGraph &eg, void *userData,
-                             const gviz::layout::ActionPayload &payload) {
-  (void)payload;
-  GrowControl *grow = (GrowControl *)userData;
-  auto &fa = static_cast<ForceAtlas &>(eg);
-
-  size_t before = grow->graph->Size();
-  if (before == 0)
-    return;
-  size_t newId = grow->graph->AddVertex();
-  size_t target = (size_t)rand_r(&grow->rng) % before;
-  grow->graph->AddEdge(newId, target, 1.0);
-  if (before > 1 && rand_r(&grow->rng) % 2 == 0) {
-    size_t second = (size_t)rand_r(&grow->rng) % before;
-    if (second != target)
-      grow->graph->AddEdge(newId, second, 1.0);
-  }
-
-  try {
-    fa.Sync((unsigned int)rand_r(&grow->rng) | 1u);
-  } catch (const std::exception &e) {
-    fprintf(stderr, "sync failed; vertex %zu joins on a later sync: %s\n", newId,
-            e.what());
-    return;
-  }
-  grow->sizesDirty = true;
-  printf("added vertex %zu (%zu vertices)\n", newId, grow->graph->Size());
 }
 
 static int parseModel(const char *arg, bool *outLinLog) {
@@ -357,8 +305,8 @@ static void printUsage(const char *prog) {
       "  -d, --directed              interpret the -g/--graph file's edges as\n"
       "                              directed (default: undirected; ignored\n"
       "                              without -g/--graph)\n"
-      "  -G, --grow                  dynamic mode: 'A' adds a vertex live,\n"
-      "                              committed via ForceAtlas::Sync\n"
+      "  -G, --grow                  REMOVED -- gviz has no dynamic-graph-\n"
+      "                              growth support anymore; errors out\n"
       "  -m, --model {linlog|fr}     force model (default linlog)\n"
       "  -o, --screenshot PATH       save a .ppm screenshot after settling and exit\n"
       "      --degree-alpha          fade edges by max endpoint degree (default off)\n"
@@ -368,12 +316,13 @@ static void printUsage(const char *prog) {
       "                              drawn for an average-weight edge\n"
       "      --edge-weight-width     scale edge thickness by edge weight (default off)\n"
       "      --no-edge-weight-width  disable weight-based edge thickness\n"
+      "      --no-barnes-hut         exact O(V^2) repulsion instead of the Barnes-Hut\n"
+      "                              approximation (default: Barnes-Hut on)\n"
       "  -h, --help                  print this help and exit\n"
       "\n"
       "Controls:\n"
       "  R      - run one relaxation step\n"
       "  space  - toggle continuous stepping\n"
-      "  A      - add a vertex and commit it (with -G/--grow)\n"
       "  h/l    - decrease/increase ideal edge length\n"
       "  j/k    - decrease/increase gravity k\n"
       "  N/M    - decrease/increase Barnes-Hut theta\n"
@@ -391,6 +340,7 @@ enum {
   OPT_NO_DEGREE_ALPHA,
   OPT_EDGE_WEIGHT_WIDTH,
   OPT_NO_EDGE_WEIGHT_WIDTH,
+  OPT_NO_BARNES_HUT,
 };
 
 static const struct option kLongOptions[] = {
@@ -407,6 +357,7 @@ static const struct option kLongOptions[] = {
     {"edge-width", required_argument, NULL, 'w'},
     {"edge-weight-width", no_argument, NULL, OPT_EDGE_WEIGHT_WIDTH},
     {"no-edge-weight-width", no_argument, NULL, OPT_NO_EDGE_WEIGHT_WIDTH},
+    {"no-barnes-hut", no_argument, NULL, OPT_NO_BARNES_HUT},
     {"help", no_argument, NULL, 'h'},
     {NULL, 0, NULL, 0},
 };
@@ -423,6 +374,7 @@ int main(int argc, char **argv) {
   bool degreeAlpha = false;
   float edgeWidth = 1.5f;
   bool edgeWeightWidth = false;
+  bool barnesHut = true;
 
   int opt;
   while ((opt = getopt_long(argc, argv, "n:s:e:g:dGm:o:w:h", kLongOptions,
@@ -471,6 +423,9 @@ int main(int argc, char **argv) {
     case OPT_NO_EDGE_WEIGHT_WIDTH:
       edgeWeightWidth = false;
       break;
+    case OPT_NO_BARNES_HUT:
+      barnesHut = false;
+      break;
     case 'h':
       printUsage(argv[0]);
       return 0;
@@ -492,6 +447,16 @@ int main(int argc, char **argv) {
     fprintf(stderr, "--directed requires -g/--graph\n");
     return 1;
   }
+  if (grow) {
+    // See this file's header comment: gviz's embedders have no
+    // dynamic-graph-growth/Sync() support anymore, so there is no way to
+    // add a vertex to an already-constructed ForceAtlas.
+    fprintf(stderr,
+            "-G/--grow is no longer supported: gviz's embedders have no "
+            "dynamic-graph-growth/Sync() support anymore (an embedding is "
+            "fixed once constructed) -- see this file's header comment\n");
+    return 1;
+  }
 
   std::optional<gviz::Graph> graphOpt;
   if (graphName) {
@@ -503,25 +468,11 @@ int main(int argc, char **argv) {
   }
   gviz::Graph &graph = *graphOpt;
 
+  graph.BuildLayout();
+  if (graphName)
+    printf("loaded %zu vertices, %zu edges\n", graph.Size(), graph.EdgeCount());
   std::optional<gviz::Subgraph> sg;
-  if (grow) {
-    /* Dynamic mode: whole-graph vertex-induced view. No edge-bitset layout
-     * is built up front, so each growth commit is amortized O(1) capacity
-     * work plus the embedding's CSR rebuild (see EmbeddedGraph.hpp's
-     * GROWTH & SYNC section). Click-picking still works: the renderer
-     * refreshes the layout on demand (Graph::EnsureLayout) when a click
-     * needs a pick subgraph. */
-    sg.emplace(gviz::Subgraph::CreateVertexInduced(graph));
-    for (size_t i = 0; i < graph.Size(); i++)
-      sg->ShowVertex(i);
-    if (graphName)
-      printf("loaded %zu vertices\n", graph.Size());
-  } else {
-    graph.BuildLayout();
-    if (graphName)
-      printf("loaded %zu vertices, %zu edges\n", graph.Size(), graph.EdgeCount());
-    sg.emplace(gviz::Subgraph::CreateFull(graph));
-  }
+  sg.emplace(gviz::Subgraph::CreateFull(graph));
 
   std::unique_ptr<gviz::layout::ForceModel> model =
       useLinLog ? std::unique_ptr<gviz::layout::ForceModel>(
@@ -529,14 +480,14 @@ int main(int argc, char **argv) {
                 : std::unique_ptr<gviz::layout::ForceModel>(
                       std::make_unique<gviz::layout::FruchtermanReingold>());
 
-  std::optional<ForceAtlas> fe;
+  std::optional<ForceAtlas<gviz::Subgraph>> fe;
   try {
     fe.emplace(std::move(*sg), 2, std::move(model));
   } catch (const std::exception &e) {
     fprintf(stderr, "force embedder init failed: %s\n", e.what());
     return 1;
   }
-  fe->SetBarnesHutEnabled(true);
+  fe->SetBarnesHutEnabled(barnesHut);
 
   DemoConfig cfg;
   cfg.gravityK = DEMO_GRAVITY_K_DEFAULT;
@@ -547,9 +498,6 @@ int main(int argc, char **argv) {
   fe->Begin(seed);
 
   bool autoStep = false;
-  GrowControl growControl = {&graph, seed ^ 0x9e3779b9u, false};
-  if (grow)
-    fe->AddAction("demo.growVertex", actionGrowVertex, &growControl);
   fe->AddAction("demo.toggleAuto", actionToggleAuto, &autoStep);
   fe->AddAction("demo.gravityUp", actionGravityUp, &cfg);
   fe->AddAction("demo.gravityDown", actionGravityDown, &cfg);
@@ -565,7 +513,7 @@ int main(int argc, char **argv) {
   grRendererDescInit(&desc);
   desc.title =
       "grender - Force Embedder (R: step, space: auto, h/l: edge len, j/k: gravity, N/M: theta, O: overlap)";
-  desc.nodeStyle.radius = (float)DEMO_RADIUS_BASE;
+  desc.nodeStyle.radius = (float)cfg.radiusBase;
   desc.nodeStyle.sizeMode = GR_SIZE_WORLD;
   /* World-space radius keeps nodes correctly sized relative to the layout at
    * any fixed zoom, but this LinLog layout drifts outward for a long time
@@ -580,8 +528,6 @@ int main(int argc, char **argv) {
    * with already-clamped hubs as base or zoom increases. */
   desc.nodeStyle.minPixelRadius = 2.0f;
   desc.nodeStyle.maxPixelRadius = 0.0f;
-  desc.nodeStyle.fillColor = GR_COLOR(0.55f, 0.78f, 1.0f, 1.0f);
-  desc.edgeStyle.color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.45f);
   desc.edgeStyle.width = edgeWidth;
   desc.edgeDegreeAlpha = degreeAlpha;
   desc.edgeWeightWidth = edgeWeightWidth;
@@ -592,7 +538,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (grRendererSetGraph(r, *fe, &graph) < 0) {
+  if (grRendererSetGraph(r, fe->Structure(), *fe, &graph) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     return 1;
@@ -603,26 +549,27 @@ int main(int argc, char **argv) {
   // heap-allocated std::string* (see gviz::io::LoadFromGexfFile); entries
   // are NULL otherwise, which the overlay simply skips. Freed alongside
   // graph teardown below, once the renderer (the only reader of these
-  // pointers) is destroyed.
+  // pointers) is destroyed. grRendererSetVertexLabels is LOCAL-indexed (see
+  // grRendererSetGraph's INDEXING CONVENTION); translate to the graph's own
+  // raw id first.
   size_t vertexLabelCount = fe->PositionCount();
   std::vector<const char *> vertexLabels(vertexLabelCount ? vertexLabelCount : 1);
   for (size_t i = 0; i < vertexLabelCount; i++) {
-    void *data = graph.GetVertexData(i);
+    void *data = graph.GetVertexData(grRendererLocalToRaw(r, i));
     vertexLabels[i] = data ? static_cast<const std::string *>(data)->c_str() : NULL;
   }
   grRendererSetVertexLabels(r, vertexLabels.data(), vertexLabelCount);
 
-  /* Degree is fixed for the embedder's lifetime, but radiusBase can change
-   * live via '['/']', so this buffer is kept around (not freed) and reused
-   * by refreshNodeSizes on every such change instead of being a one-shot
-   * upload. */
   cfg.r = r;
-  refreshNodeSizes(*fe, cfg);
+  cfg.nodeStyle = desc.nodeStyle;
+  grRendererSetNodeDegreeScale(r, true, (float)cfg.radiusPerDegree);
 
-  /* --degree-alpha / --edge-weight-width need no uploads here: with the
-   * desc flags set, the renderer derives degrees and per-edge weights from
-   * the graph itself on every structural change, so they stay correct as
-   * the graph grows. */
+  /* --degree-alpha / --edge-weight-width / degree-scaled node sizes need no
+   * uploads here: with the flags set above, the renderer derives degrees
+   * and per-edge weights from the graph itself on every structural change,
+   * so they stay correct as the graph grows -- radiusBase changing live via
+   * '['/']' only needs grRendererSetNodeStyle (see actionRadiusBaseUp/Down),
+   * not a per-vertex re-derivation. */
 
   grRendererBindKey(r, 'R', "forceEmbedder.step");
   grRendererBindKey(r, GR_KEY_SPACE, "demo.toggleAuto");
@@ -635,8 +582,6 @@ int main(int argc, char **argv) {
   grRendererBindKey(r, 'O', "demo.toggleOverlapPrevention");
   grRendererBindKey(r, ']', "demo.radiusBaseUp");
   grRendererBindKey(r, '[', "demo.radiusBaseDown");
-  if (grow)
-    grRendererBindKey(r, 'A', "demo.growVertex");
   grRendererFitView(r);
 
   const size_t stepsBeforeShot = screenshotPath ? 300 : SIZE_MAX;
@@ -644,27 +589,11 @@ int main(int argc, char **argv) {
 
   while (grRendererFrame(r)) {
     if (autoStep) {
-      for (size_t i = 0; i < 1; i++)
+      for (size_t i = 0; i < 20; i++) {
+        GR_PROF_STEP_BEGIN();
         fe->Step();
-    }
-
-    /* Deferred by actionGrowVertex: the renderer's per-vertex buffers only
-     * grew during the grRendererFrame call above, so this is the earliest
-     * the (raw-id-indexed) radius buffer can be resized and re-uploaded at
-     * the matching count. */
-    if (growControl.sizesDirty) {
-      refreshNodeSizes(*fe, cfg);
-      growControl.sizesDirty = false;
-    }
-
-    /* Screenshot mode doubles as the dynamic pipeline's end-to-end check:
-     * keep stepping and grow a vertex every 30 frames, so the saved frame
-     * shows grown vertices that were placed, drawn, and simulated through
-     * the mutate-then-commit path. */
-    if (grow && screenshotPath) {
-      fe->Step();
-      if (totalSteps % 30 == 29)
-        fe->InvokeAction("demo.growVertex");
+        GR_PROF_STEP_END();
+      }
     }
 
     if (screenshotPath) {

@@ -11,13 +11,15 @@
  * knowing what they do.
  *
  * Controls:
- *   R      - run one GRIP refinement round
- *   N      - advance to the next (finer) GRIP layer
- *   space  - toggle continuous refinement
- *   F      - fit view
- *   S      - toggle the stats overlay (GRIP heat/displacement charts)
- *   drag   - pan (2D) / orbit (3D)
- *   scroll - zoom
+ *   R        - run one GRIP refinement round
+ *   N        - advance to the next (finer) GRIP layer
+ *   space    - toggle continuous refinement
+ *   F        - fit view
+ *   Q/E      - rotate the camera (2D embeddings only)
+ *   S        - toggle the stats overlay (GRIP heat/displacement charts)
+ *   O (hold) - orbit around center of mass (3D embeddings only)
+ *   drag     - pan (2D) / orbit (3D)
+ *   scroll   - zoom
  *
  * Usage: gripDemo [options]
  *   -t, --type NAME             sierpinski|sierpinski-tet|sierpinski-carpet|
@@ -64,6 +66,7 @@
 #include <cstring>
 #include <getopt.h>
 #include <optional>
+#include <span>
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -110,6 +113,36 @@ static void actionVertexClicked(gviz::layout::EmbeddedGraph &eg, void *userData,
   printf("vertex clicked: %lld\n", (long long)payload.iarg);
 }
 
+// Recomputes the camera's orbit/pan pivot to the live center of mass of the
+// GRIP embedding, so the O key (see grRendererSetOrbitKey) orbits around the
+// graph as it refines rather than a point fixed once at startup. For a 4D
+// embedding (-d 4) this averages the raw 4D coordinates' first 3 components
+// rather than the PCA-projected 3D render space grender uses internally for
+// display -- an approximation, not exact, but avoiding it would require new
+// API surface exposing grRenderer's internal PCA basis, which is out of
+// scope here.
+static void updateOrbitTarget(grRenderer *r,
+                              const gviz::layout::GRIP<gviz::Subgraph> &grip) {
+  std::span<const double> positions = grip.Positions();
+  size_t count = grip.PositionCount();
+  size_t dim = grip.Dim();
+  size_t dims = dim < 3 ? dim : 3;
+
+  double sum[3] = {0.0, 0.0, 0.0};
+  for (size_t i = 0; i < count; i++) {
+    for (size_t d = 0; d < dims; d++) {
+      sum[d] += positions[i * dim + d];
+    }
+  }
+  if (count > 0) {
+    for (size_t d = 0; d < dims; d++) {
+      sum[d] /= (double)count;
+    }
+  }
+
+  grRendererSetCameraTarget(r, sum[0], sum[1], sum[2]);
+}
+
 static int parseGraphType(const char *arg, DemoGraphType *out) {
   if (!arg || strcasecmp(arg, "mobius") == 0) {
     *out = DEMO_GRAPH_MOBIUS;
@@ -137,8 +170,9 @@ static int parseGraphType(const char *arg, DemoGraphType *out) {
   return 0;
 }
 
-static int parseKPolicy(const char *arg, gviz::layout::GRIP::KPolicy *out) {
-  using KPolicy = gviz::layout::GRIP::KPolicy;
+static int parseKPolicy(const char *arg,
+                        gviz::layout::GRIP<gviz::Subgraph>::KPolicy *out) {
+  using KPolicy = gviz::layout::GRIP<gviz::Subgraph>::KPolicy;
   if (!arg || strcasecmp(arg, "constant") == 0) {
     *out = KPolicy::Constant;
   } else if (strcasecmp(arg, "layer-decay") == 0) {
@@ -178,7 +212,8 @@ static gviz::Graph buildGraph(DemoGraphType type, size_t rows, size_t cols,
   case DEMO_GRAPH_KLEIN_BOTTLE:
     return gviz::graphs::BuildKleinBottle(rows, cols);
   case DEMO_GRAPH_RANDOM:
-    return gviz::graphs::BuildRandomConnectedGraph(numVertices, edgeDensity, seed);
+    return gviz::graphs::BuildRandomConnectedGraph(numVertices, edgeDensity,
+                                                   seed);
   }
   return gviz::Graph(false, 0);
 }
@@ -190,8 +225,8 @@ static bool graphTypeUsesRowsCols(DemoGraphType type) {
 
 static bool graphTypeUsesDepth(DemoGraphType type) {
   return type == DEMO_GRAPH_SIERPINSKI || type == DEMO_GRAPH_SIERPINSKI_TET ||
-         type == DEMO_GRAPH_SIERPINSKI_CARPET || type == DEMO_GRAPH_TETRA_MESH ||
-         type == DEMO_GRAPH_TRI_MESH;
+         type == DEMO_GRAPH_SIERPINSKI_CARPET ||
+         type == DEMO_GRAPH_TETRA_MESH || type == DEMO_GRAPH_TRI_MESH;
 }
 
 static int fileExists(const char *path) {
@@ -247,10 +282,12 @@ static void printUsage(const char *prog) {
       "                              sierpinski-carpet|tetra-mesh|rect-mesh|\n"
       "                              tri-mesh|knotted-rect-mesh|mobius|\n"
       "                              klein-bottle|random\n"
-      "                              (default mobius; ignored with -g/--graph)\n"
+      "                              (default mobius; ignored with "
+      "-g/--graph)\n"
       "  --rows R                    rows, for mobius/klein-bottle/rect-mesh/\n"
       "                              knotted-rect-mesh types (default %d)\n"
-      "  --cols C                    cols, for the same mesh types (default %d)\n"
+      "  --cols C                    cols, for the same mesh types (default "
+      "%d)\n"
       "  --depth D                   depth, for sierpinski/sierpinski-tet/\n"
       "                              sierpinski-carpet/tetra-mesh/tri-mesh\n"
       "                              types (default %d)\n"
@@ -267,11 +304,13 @@ static void printUsage(const char *prog) {
       "                              buffers; 0 = let GRIP pick a default\n"
       "                              (default 0)\n"
       "  --k-max K                    placement and refinement neighbor cap\n"
-      "                              (default %d; overridden by the two below)\n"
+      "                              (default %d; overridden by the two "
+      "below)\n"
       "  --placement-k K              placement neighbor cap (default %d)\n"
       "  --refinement-k K             refinement neighbor cap (default %d)\n"
       "  --k-policy NAME               constant|layer-decay|layer-grow|\n"
-      "                              placement-decay|budget (default constant)\n"
+      "                              placement-decay|budget (default "
+      "constant)\n"
       "  --knn-capacity K              per-vertex KNN storage capacity, fixed\n"
       "                              at init time; placement-k/refinement-k\n"
       "                              are clamped to it (default %d)\n"
@@ -280,13 +319,15 @@ static void printUsage(const char *prog) {
       "  -h, --help                    print this help and exit\n"
       "\n"
       "Controls:\n"
-      "  R      - run one GRIP refinement round\n"
-      "  N      - advance to the next (finer) GRIP layer\n"
-      "  space  - toggle continuous refinement\n"
-      "  F      - fit view\n"
-      "  S      - toggle the stats overlay\n"
-      "  drag   - pan (2D) / orbit (3D)\n"
-      "  scroll - zoom\n",
+      "  R        - run one GRIP refinement round\n"
+      "  N        - advance to the next (finer) GRIP layer\n"
+      "  space    - toggle continuous refinement\n"
+      "  F        - fit view\n"
+      "  Q/E      - rotate the camera (2D embeddings only)\n"
+      "  S        - toggle the stats overlay\n"
+      "  O (hold) - orbit around center of mass (3D embeddings only)\n"
+      "  drag     - pan (2D) / orbit (3D)\n"
+      "  scroll   - zoom\n",
       prog, DEMO_ROWS_DEFAULT, DEMO_COLS_DEFAULT, DEMO_DEPTH_DEFAULT,
       DEMO_VERTICES_DEFAULT, DEMO_EDGE_DENSITY_DEFAULT, DEMO_KMAX_DEFAULT,
       DEMO_KMAX_DEFAULT, DEMO_KMAX_DEFAULT, DEMO_KNN_CAPACITY_DEFAULT);
@@ -341,7 +382,8 @@ int main(int argc, char **argv) {
   size_t placementK = 0;
   size_t refinementK = 0;
   size_t knnCapacity = 0;
-  gviz::layout::GRIP::KPolicy kPolicy = gviz::layout::GRIP::KPolicy::Constant;
+  gviz::layout::GRIP<gviz::Subgraph>::KPolicy kPolicy =
+      gviz::layout::GRIP<gviz::Subgraph>::KPolicy::Constant;
   bool gripStats = true;
   const char *screenshotPath = NULL;
 
@@ -442,9 +484,10 @@ int main(int argc, char **argv) {
   size_t effectiveKnnCapacity =
       knnCapacity > 0 ? knnCapacity : DEMO_KNN_CAPACITY_DEFAULT;
   if (placementK > effectiveKnnCapacity || refinementK > effectiveKnnCapacity) {
-    fprintf(stderr,
-            "placement-k/refinement-k (%zu/%zu) must be <= knn-capacity (%zu)\n",
-            placementK, refinementK, effectiveKnnCapacity);
+    fprintf(
+        stderr,
+        "placement-k/refinement-k (%zu/%zu) must be <= knn-capacity (%zu)\n",
+        placementK, refinementK, effectiveKnnCapacity);
     return 1;
   }
 
@@ -454,20 +497,21 @@ int main(int argc, char **argv) {
     if (!graphOpt)
       return 1;
   } else {
-    graphOpt = buildGraph(type, rows, cols, depth, numVertices, edgeDensity, seed);
+    graphOpt =
+        buildGraph(type, rows, cols, depth, numVertices, edgeDensity, seed);
   }
   gviz::Graph &graph = *graphOpt;
   graph.BuildLayout();
   printf("graph: %zu vertices, %zu edges\n", graph.Size(), graph.EdgeCount());
   gviz::Subgraph sg = gviz::Subgraph::CreateFull(graph);
 
-  gviz::layout::GRIP::Config config;
+  gviz::layout::GRIP<gviz::Subgraph>::Config config;
   if (!gripStats)
     config.statsEnabled = false;
   if (knnCapacity > 0)
     config.knnCapacity = knnCapacity;
 
-  std::optional<gviz::layout::GRIP> grip;
+  std::optional<gviz::layout::GRIP<gviz::Subgraph>> grip;
   try {
     grip.emplace(std::move(sg), diameter, dim, config);
   } catch (const std::exception &e) {
@@ -485,20 +529,22 @@ int main(int argc, char **argv) {
   grRendererDesc desc;
   grRendererDescInit(&desc);
   desc.title = "grender - GRIP (R: refine, N: next stage, space: auto)";
-  desc.nodeStyle.radius = 2.5f;
-  desc.nodeStyle.fillColor = GR_COLOR(0.55f, 0.78f, 1.0f, 1.0f);
-  desc.edgeStyle.color = GR_COLOR(0.45f, 0.55f, 0.75f, 0.35f);
+  desc.nodeStyle.radius = 2.0f;
+  desc.edgeStyle.color = GR_COLOR(0.753, 0.792f, 0.961f, 0.25);
+  desc.nodeStyle.fillColor = GR_COLOR(0.753, 0.792f, 0.961f, 0.1f);
 
   grRenderer *r = grRendererCreate(&desc);
   if (!r) {
     fprintf(stderr, "renderer creation failed\n");
     return 1;
   }
-  if (grRendererSetGraph(r, *grip, &graph) < 0) {
+  if (grRendererSetGraph(r, grip->Structure(), *grip, &graph) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     return 1;
   }
+
+  desc.clearColor = GR_COLOR(0.098f, 0.09f, 0.149f, 1.0f);
 
   // Vertex string data (gexf attributes) is only present when -g/--graph
   // loaded a .gexf file, in which case each non-null entry is a
@@ -506,20 +552,28 @@ int main(int argc, char **argv) {
   // are NULL otherwise, which the overlay simply skips. Freed alongside
   // graph teardown below, once the renderer (the only reader of these
   // pointers) is destroyed.
+  // grRendererSetVertexLabels is indexed by LOCAL index (see
+  // grRendererSetGraph's INDEXING CONVENTION); translate each slot back to
+  // the graph's own raw vertex id via grRendererLocalToRaw to look up its
+  // gexf attribute string.
   size_t vertexLabelCount = grip->PositionCount();
-  std::vector<const char *> vertexLabels(vertexLabelCount ? vertexLabelCount : 1);
+  std::vector<const char *> vertexLabels(vertexLabelCount ? vertexLabelCount
+                                                          : 1);
   for (size_t i = 0; i < vertexLabelCount; i++) {
-    void *data = graph.GetVertexData(i);
-    vertexLabels[i] = data ? static_cast<const std::string *>(data)->c_str() : NULL;
+    void *data = graph.GetVertexData(grRendererLocalToRaw(r, i));
+    vertexLabels[i] =
+        data ? static_cast<const std::string *>(data)->c_str() : NULL;
   }
   grRendererSetVertexLabels(r, vertexLabels.data(), vertexLabelCount);
 
   grRendererBindKey(r, 'R', "grip.refineRound");
   grRendererBindKey(r, 'N', "grip.nextStage");
   grRendererBindKey(r, GR_KEY_SPACE, "demo.toggleAuto");
+  grRendererSetOrbitKey(r, 'O', 0.6);
 
   const size_t roundsPerStage = screenshotPath ? 150 : SIZE_MAX;
   while (grRendererFrame(r)) {
+    updateOrbitTarget(r, *grip);
     if (autoRefine) {
       if (grip->CurrentRound() >= roundsPerStage) {
         if (screenshotPath) {
@@ -535,8 +589,9 @@ int main(int argc, char **argv) {
         }
         if (grip->CurrentLayer() == 0)
           grRendererRequestClose(r);
-        else
+        else {
           grip->NextStage();
+        }
       } else {
         grip->RefineRound();
       }

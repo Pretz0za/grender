@@ -15,14 +15,27 @@
  *
  * Interaction is split in two layers:
  *  - Built-in navigation owned by the renderer: mouse pan/zoom (2D) or
- *    orbit/pan/dolly (3D), and 'grRendererFitView' framing.
+ *    orbit/pan/dolly (3D), the Q/E keys rotating the 2D camera in fixed
+ *    steps (no-op on 3D embeddings), and grRendererFitView /
+ *    grRendererFocusVertex framing.
  *  - Named actions owned by the embedded graph creator (see
  *    gviz::layout::EmbeddedGraph::AddAction). The application binds input
  *    keys to action names with grRendererBindKey; the renderer dispatches
  *    payloads without knowing anything about the embedder.
  */
 
+// gviz::layout::EmbeddedGraph.hpp no longer transitively pulls in
+// Graph.hpp/Subgraph.hpp the way the pre-refactor version did (it used to
+// hold a gviz::Subgraph directly; the current one is GraphLike-agnostic --
+// see EmbeddedGraph.hpp's class doc). This header uses gviz::Graph,
+// gviz::Subgraph, and gviz::GraphLike directly (grRendererSetGraph<G>,
+// grRendererSetHighlight, ...), so they're included explicitly here rather
+// than relied on transitively -- this header must stay self-contained
+// regardless of #include order relative to gviz.hpp at any call site.
 #include "EmbeddedGraph.hpp"
+#include "Graph.hpp"
+#include "GraphLike.hpp"
+#include "Subgraph.hpp"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -106,8 +119,10 @@ typedef struct grRendererDesc {
    * When true, the edge shader scales each edge's alpha by the higher
    * degree of its endpoints so hub edges fade. The renderer derives and
    * re-uploads the per-vertex degrees itself on every structural change
-   * (from the embedding's synced adjacency), so this stays correct as a
-   * dynamic graph grows -- no grRendererSetNodeDegrees calls needed (that
+   * (from grender's own adjacency snapshot, rebuilt on
+   * grRendererGraphStructureChanged -- see grTopology in grInternal.h),
+   * so this stays correct as the attached structure's visible/hidden set
+   * changes -- no grRendererSetNodeDegrees calls needed (that
    * API remains for custom values, but the automatic refresh overwrites
    * them on the next structural change). Per-edge colors (including
    * highlights) are unaffected and keep their uploaded alpha. Off by
@@ -141,25 +156,102 @@ grRenderer *grRendererCreate(const grRendererDesc *desc);
  *  the attached embedded graph. */
 void grRendererDestroy(grRenderer *r);
 
+#ifdef __cplusplus
+} // extern "C" -- grRendererSetGraph below is a template (see its doc
+  // comment for why), which cannot have C linkage; reopened below after it
+  // and its two translation helpers. This file has never been C-callable
+  // (see grRendererSetHighlight etc. below, already C++-only via gviz
+  // reference/class-type parameters) -- the extern "C" here is purely for
+  // linkage-name stability of the ordinary (non-template) functions.
+#endif
+
 /**
- * Attaches the embedded graph to render. The renderer reads structure through
- * the gviz subgraph API and positions through EmbeddedGraph::Positions every
- * frame, so position changes made by the caller (or by actions) between frames
- * are always visible. 2D and 3D embeddings are rendered directly; 4D
- * embeddings are PCA-projected to 3D each frame.
+ * Attaches the embedded graph to render, together with the gviz::GraphLike
+ * @p structure its embedder was built over. The renderer re-reads positions
+ * through EmbeddedGraph::Positions every frame, so position changes made by
+ * the caller (or by actions) between frames are always visible. 2D and 3D
+ * embeddings are rendered directly; 4D embeddings are PCA-projected to 3D
+ * each frame.
  *
- * @p backingGraph is the parent gviz::Graph @p graph's subgraph was built
- * over, optional (default NULL) but required for the highlight/pick/console
- * features that need raw parent-graph access (EnsureLayout, GetEdgeWeight,
- * planar face queries) gviz::Subgraph deliberately never exposes on its own
- * -- see grRendererSetHighlight, grRendererSetHighlightCycle, and
+ * WHY @p structure IS SEPARATE FROM @p embedding: gviz::layout::EmbeddedGraph
+ * -- the common base every embedder (ForceAtlas<G>, GRIP<G>, Tutte<G>,
+ * SpringTutte<G>, KamadaKawai<G>, Planar, ReingoldTilford, SchnyderWood)
+ * publicly inherits, and the only type this function used to need -- carries
+ * no structural information of its own: no Structure(), no adjacency, no
+ * highlight (see EmbeddedGraph.hpp), only a local-index-addressed position
+ * buffer, actions, stats, and a draw mask. Structure now lives solely on the
+ * concrete, compile-time-typed embedder (`G structure_`), so a renderer that
+ * wants to draw edges -- and this one draws exactly two instanced calls, one
+ * of them for edges -- has to be told @p structure explicitly. @p G is
+ * deduced from your argument and must be gviz::Graph or gviz::Subgraph (the
+ * only two types gviz ships that satisfy gviz::GraphLike); pass:
+ *   - `embedder.Structure()` for any templated embedder (ForceAtlas<G>,
+ *     GRIP<G>, Tutte<G>, SpringTutte<G>, KamadaKawai<G>) -- the exact G it
+ *     owns, by reference;
+ *   - your own retained `Graph&` for Planar/ReingoldTilford/SchnyderWood --
+ *     they hold their graph privately and never expose it back out, so you
+ *     must keep the reference you originally constructed them with (their
+ *     constructors all take `Graph&`, never move it in, precisely so you
+ *     can).
+ * Passing a structure other than the one @p embedding's own embedder was
+ * built over produces a mismatched (garbage, not memory-unsafe) render, not
+ * a crash: both are walked independently, once, at attach time.
+ *
+ * INDEXING CONVENTION: every by-index part of this API that used to be
+ * documented as "indexed by parent-graph vertex id" (grRendererSetNodeColors/
+ * SetNodeSizes/SetVertexLabels/SetNodeDegrees, picking results,
+ * grRendererSetAccentVertex/FocusVertex, the console's "find <id>",
+ * grRendererGetEdges) is now indexed by LOCAL index instead --
+ * [0, grRendererVertexCount()) -- matching
+ * gviz::layout::EmbeddedGraph::Positions()'s own addressing exactly, since
+ * that's what gets uploaded to the GPU every frame. This is also a strictly
+ * better fit than the old convention for a Subgraph-backed embedding: no
+ * more sizing every per-vertex GPU array to the parent graph's whole id
+ * range just to address a handful of sparsely-scattered view vertices,
+ * mirroring the same sizing fix gviz's own DenseIndex made upstream. Use
+ * grRendererRawToLocal / grRendererLocalToRaw to translate to/from
+ * @p structure's own native vertex handles, e.g. to correlate with an
+ * application's own id-indexed data; for a Graph-backed embedding (the
+ * common whole-graph case) the two spaces coincide
+ * (gviz::Graph::kDenseVertexHandles), so translation is a no-op.
+ *
+ * @p backingGraph is the parent gviz::Graph to use for the raw-graph-only
+ * features (EnsureLayout, GetEdgeWeight, planar face picking) that
+ * gviz::Subgraph deliberately never exposes on its own -- see
+ * grRendererSetHighlight, grRendererSetHighlightCycle, and
  * GR_ACTION_PICK_FACE/GR_ACTION_PICK_VERTEX's doc comments. Those features
- * simply no-op (return failure / find nothing) when it's NULL.
+ * simply no-op (return failure / find nothing) when it's NULL. Only
+ * meaningful when @p G is gviz::Subgraph: when @p G is gviz::Graph, @p
+ * structure already IS that graph, so a null @p backingGraph is
+ * automatically treated as @p structure -- you never need to pass it
+ * explicitly for a whole-graph embedding.
  *
  * @return 0 on success, -1 on unsupported dimension or GPU allocation failure.
  */
-int grRendererSetGraph(grRenderer *r, gviz::layout::EmbeddedGraph &graph,
+template <gviz::GraphLike G>
+int grRendererSetGraph(grRenderer *r, G &structure,
+                       gviz::layout::EmbeddedGraph &embedding,
                        gviz::Graph *backingGraph = nullptr);
+
+/** Number of vertices in the attached embedding, == its Positions() count.
+ *  Every by-LOCAL-index part of this API (see grRendererSetGraph's doc
+ *  comment) is indexed in [0, this). 0 when no graph is attached. */
+size_t grRendererVertexCount(const grRenderer *r);
+
+/** Translates the attached structure's native vertex handle @p raw (as
+ *  passed to grRendererSetGraph) to the local index this API uses
+ *  everywhere else. Unchecked: @p raw must be a handle the attached
+ *  structure actually has. 0 (no crash) if no graph is attached. */
+size_t grRendererRawToLocal(const grRenderer *r, size_t raw);
+
+/** Translates a local index (as used throughout this API) back to the
+ *  attached structure's native vertex handle. Unchecked: @p local must be
+ *  < grRendererVertexCount(). 0 if no graph is attached. */
+size_t grRendererLocalToRaw(const grRenderer *r, size_t local);
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /**
  * Notifies the renderer that the *structure* of the attached graph changed
@@ -204,19 +296,19 @@ void grRendererSetEdgeWeightWidth(grRenderer *r, bool enabled);
 bool grRendererEdgeWeightWidth(const grRenderer *r);
 
 /**
- * Uploads per-node fill colors (GR_RGBA8 packed), indexed by parent-graph
- * vertex id; @p count must equal EmbeddedGraph::PositionCount(). Pass NULL
+ * Uploads per-node fill colors (GR_RGBA8 packed), indexed by local vertex
+ * index (see grRendererSetGraph's INDEXING CONVENTION); @p count must equal
+ * EmbeddedGraph::PositionCount(). Pass NULL
  * to revert to the global style. The data is copied; the caller keeps
  * ownership.
  *
  * This is a persistent base layer: it survives until replaced by another
  * call (or cleared by passing NULL) and is NOT affected by
- * grRendererSetHighlight / grRendererClearHighlight. A highlight, while
- * active, is painted over these colors -- vertices in the highlight show the
- * highlight color, vertices outside it keep showing whatever was set here
- * (or the global style, for vertices this was never called with non-NULL
- * data for). Clearing the highlight simply removes that overlay and these
- * colors reappear unchanged.
+ * grRendererSetHighlight / grRendererClearHighlight or
+ * grRendererSetAccentVertex. A highlight, while active, is painted over
+ * these colors; an accent (if set) is painted over both. Clearing the
+ * highlight/accent simply removes that overlay and these colors reappear
+ * unchanged.
  *
  * @return 0 on success, -1 on failure.
  */
@@ -226,10 +318,11 @@ int grRendererSetNodeColors(grRenderer *r, const uint32_t *rgba8, size_t count);
 int grRendererSetNodeSizes(grRenderer *r, const float *radii, size_t count);
 
 /**
- * Per-vertex subgraph degrees (uint32), indexed by parent-graph vertex id
- * with the same count rules as grRendererSetNodeColors. Used by the edge
- * shader when edge-degree-alpha is enabled. Pass NULL to clear. The caller
- * keeps ownership; values are copied to the GPU.
+ * Per-vertex subgraph degrees (uint32), indexed by local vertex index with
+ * the same count rules as grRendererSetNodeColors. Used by the edge
+ * shader when edge-degree-alpha is enabled, and by the node shader when
+ * degree-based node sizing (grRendererSetNodeDegreeScale) is enabled. Pass
+ * NULL to clear. The caller keeps ownership; values are copied to the GPU.
  *
  * @return 0 on success, -1 on failure.
  */
@@ -237,12 +330,42 @@ int grRendererSetNodeDegrees(grRenderer *r, const uint32_t *degrees,
                              size_t count);
 
 /**
- * Optional per-vertex string labels, indexed by parent-graph vertex id, same
+ * Enables or disables shader-side degree-based node sizing. When enabled
+ * (and degrees are present via grRendererSetNodeDegrees), each node's world
+ * radius is computed as nodeStyle.radius * (1 + @p factor * sqrt(degree))
+ * instead of the plain global default -- same formula shape as
+ * gviz::layout::ForceAtlas::VertexRadius, so an application driving both
+ * ForceAtlas's overlap-prevention physics and this rendering feature from
+ * the same (base, perDegree) pair gets a simulated layout and a drawing
+ * that agree on what "radius" means, without grender depending on
+ * ForceAtlas or gviz depending on grender -- the caller is the only layer
+ * that legitimately knows about both, so it's the one responsible for
+ * passing matching numbers to both APIs.
+ *
+ * A per-vertex override from grRendererSetNodeSizes, where set for a given
+ * vertex, replaces this computed radius entirely -- same highest-precedence
+ * behavior it already has over the plain global default. Off by default
+ * (equivalent to factor 0, i.e. every node at nodeStyle.radius).
+ */
+void grRendererSetNodeDegreeScale(grRenderer *r, bool enabled, float factor);
+
+/** Returns whether degree-based node sizing is currently enabled. */
+bool grRendererNodeDegreeScaleEnabled(const grRenderer *r);
+
+/** Returns the degree-scale factor last set via grRendererSetNodeDegreeScale
+ *  (0 if never set). */
+float grRendererNodeDegreeScaleFactor(const grRenderer *r);
+
+/**
+ * Optional per-vertex string labels, indexed by local vertex index, same
  * count rules as grRendererSetNodeColors. When set, clicking a vertex (the
- * default GR_ACTION_PICK_VERTEX binding) shows that vertex's label in an
- * overlay panel; a vertex with a NULL label, or a click that hits nothing,
- * clears the panel. The renderer does not take ownership or copy the
- * strings -- entries must stay valid for as long as they might be
+ * default GR_ACTION_PICK_VERTEX binding) shows that vertex's label in the
+ * vertex-info overlay panel (see VERTEX INFO OVERLAY below); a vertex with
+ * a NULL label, or a click that hits nothing, clears the panel (draws
+ * nothing -- there is no empty chrome). The panel can also be suppressed
+ * unconditionally with grRendererShowVertexInfo(false), even while labels
+ * are set and a vertex is picked. The renderer does not take ownership or
+ * copy the strings -- entries must stay valid for as long as they might be
  * displayed, i.e. until this is called again or the renderer is destroyed.
  * Pass NULL to clear.
  *
@@ -398,6 +521,21 @@ int grRendererBindMouse(grRenderer *r, int button, const char *actionName);
 void grRendererUnbindMouse(grRenderer *r, int button);
 
 /**
+ * Binds @p key so that holding it down continuously orbits the camera
+ * around its current target at @p radPerSec radians/second of yaw, for as
+ * long as the key stays down -- unlike grRendererBindKey (which fires a
+ * graph action once per press), this drives grCameraOrbit directly every
+ * frame, the same continuous-poll style already used for the mouse-drag
+ * orbit and the Shift-pan modifier. Positive @p radPerSec matches
+ * grCameraOrbit's dYaw sign (increasing yaw). Only one key can be bound at
+ * a time; a later call replaces the previous binding. Pass @p key < 0 to
+ * disable. No-op while the console is open or the vertex-list search box
+ * has focus, same as the other single-letter shortcuts (F/Q/E/S/I/L/C).
+ * 3D (perspective) cameras only -- grCameraOrbit itself no-ops on 2D.
+ */
+void grRendererSetOrbitKey(grRenderer *r, int key, double radPerSec);
+
+/**
  * Action name invoked whenever a click (press and release without a drag,
  * on any mouse button) lands on a vertex's drawn circle -- the same hit test
  * GR_ACTION_PICK_VERTEX uses, so a click only counts as landing "on" a
@@ -410,12 +548,12 @@ void grRendererUnbindMouse(grRenderer *r, int button);
  * There is nothing to bind: register a handler the same way as any other
  * action (gviz::layout::EmbeddedGraph::AddAction) and it starts firing on the
  * next hit. The payload is filled like grRendererBindKey, except @p iarg
- * carries the clicked vertex's parent-graph id (not modifier bits --
+ * carries the clicked vertex's local index (not modifier bits --
  * gviz::layout::ActionPayload's fields are contextual per trigger, see its
  * doc comment):
  *   worldX/worldY - cursor position unprojected into embedding coordinates,
  *   deltaTime     - seconds since the previous frame,
- *   iarg          - the clicked vertex's parent-graph id,
+ *   iarg          - the clicked vertex's local index,
  *   darg          - 0.
  * A click that misses every vertex does not invoke it.
  */
@@ -436,7 +574,8 @@ void grRendererUnbindMouse(grRenderer *r, int button);
  * highlight show the highlight color, and everything else keeps showing its
  * base color (or the global style, if none was set). Those base colors are
  * unaffected by this call and reappear as-is once the highlight is cleared
- * or replaced.
+ * or replaced. Any prior accent vertex is cleared (see
+ * grRendererSetAccentVertex); re-set it after the panel updates if needed.
  *
  * @return 0 on success, -1 on failure (no graph attached, or the renderer's
  *         attached graph has no backingGraph -- see grRendererSetGraph).
@@ -459,9 +598,42 @@ int grRendererSetHighlightCycle(grRenderer *r, const size_t *vertices,
  * Clears the stored highlight. Elements revert to whatever base colors were
  * set via grRendererSetNodeColors / grRendererSetEdgeColors (unaffected by
  * this call), or the global node/edge styles for elements with no base
- * color set.
+ * color set. Also clears any accent vertex (see grRendererSetAccentVertex).
  */
 void grRendererClearHighlight(grRenderer *r);
+
+/**
+ * Accents a single vertex so it renders in @p rgba on top of both the client
+ * base colors (grRendererSetNodeColors) and the active highlight. Compositing
+ * order is: global style / base colors, then highlight, then accent. Use this
+ * when an external UI (e.g. an HTML side panel listing highlight members)
+ * wants one vertex visually distinguished without disturbing the highlight or
+ * the base color layer.
+ *
+ * @p vertexId is a local vertex index (same space as
+ * grRendererSetNodeColors / GR_ACTION_VERTEX_CLICKED's iarg -- see
+ * grRendererSetGraph's INDEXING CONVENTION). @p rgba is GR_RGBA8 packed; pass
+ * 0 to leave the accent slot set but skip painting (same convention as
+ * highlight nodeRgba). Safe and cheap to call at interactive rates between
+ * frames (O(1); marks colorsDirty so applyColorLayers repaints on the next
+ * grRendererFrame). Does not require a frame to have run first, though an
+ * out-of-range id is a no-op at paint time until posCapacity covers it.
+ *
+ * Lifetime:
+ * - Cleared by grRendererClearAccentVertex, grRendererClearHighlight,
+ *   grRendererSetHighlight / SetHighlightCycle (replacing the highlight set
+ *   makes a prior accent stale), and grRendererSetGraph.
+ * - Survives pure position updates and topology changes; at paint time an
+ *   id >= current posCapacity is simply skipped.
+ * - Does not modify the highlight subgraph or the client base color arrays.
+ */
+void grRendererSetAccentVertex(grRenderer *r, size_t vertexId, uint32_t rgba);
+
+/** Clears any accent set by grRendererSetAccentVertex. No-op if none is set. */
+void grRendererClearAccentVertex(grRenderer *r);
+
+/** Parent-graph id of the accented vertex, or -1 if none. */
+int64_t grRendererAccentVertex(const grRenderer *r);
 
 // FRAME LOOP: -------------------------------------------------------------
 
@@ -486,6 +658,39 @@ double grRendererDeltaTime(const grRenderer *r);
 /** Reframes the camera to fit the bounding box of the live vertex positions.
  *  Also bound to the F key by default. */
 void grRendererFitView(grRenderer *r);
+
+/**
+ * Sets the camera's orbit/pan pivot ("target") directly to (@p x, @p y,
+ * @p z) in the graph's live embedding coordinates (already PCA-projected to
+ * 3D for a 4D embedding, same space grRendererFocusVertex reads), without
+ * touching distance, yaw, pitch, or roll. Unlike grRendererFitView/
+ * grRendererFocusVertex, this never changes zoom -- useful for apps that
+ * want to keep a custom point (e.g. a computed center of mass) as the pivot
+ * for orbiting/panning while leaving the user's current framing alone.
+ */
+void grRendererSetCameraTarget(grRenderer *r, double x, double y, double z);
+
+/**
+ * Centers the camera on vertex @p vertexId and zooms in to frame a
+ * neighborhood around it, sized as a fraction of the graph's current
+ * visible bounding-box extent (same behavior as the C key and the console
+ * "find <id>" command). Uses the renderer's last staged positions
+ * (already PCA-projected to 3D for a 4D embedding), so it stays correct
+ * across 2D/3D/4D without the caller redoing that projection.
+ *
+ * Safe to call from host code between frames and from a gviz Action
+ * handler invoked via EmbeddedGraph::InvokeAction (including during
+ * grRendererFrame's input processing). Applies immediately to the camera;
+ * the next draw (or the remainder of the current frame, if called from an
+ * action during that frame) reflects the new framing.
+ *
+ * No-op if @p r is NULL, @p vertexId is out of range of the currently
+ * staged position buffer, or no position buffer has been allocated yet
+ * (attach a graph with grRendererSetGraph and let at least one
+ * grRendererFrame complete so positions are staged). Does not require the
+ * vertex to be currently visible in the draw mask.
+ */
+void grRendererFocusVertex(grRenderer *r, size_t vertexId);
 
 // STATS OVERLAY: ----------------------------------------------------------
 //
@@ -554,10 +759,33 @@ void grRendererShowConsole(grRenderer *r, bool show);
 /** Returns whether the console is currently open. */
 bool grRendererConsoleShown(const grRenderer *r);
 
+// VERTEX INFO OVERLAY: -------------------------------------------------------
+//
+// A scrollable panel in the bottom-left corner showing the
+// grRendererSetVertexLabels DATA string of the last vertex picked via
+// GR_ACTION_PICK_VERTEX (or selected from the vertex-list overlay below).
+// Draws nothing when no vertex is picked, the picked vertex has a NULL /
+// empty label, no labels are set, or the panel is hidden via
+// grRendererShowVertexInfo(false). Visible by default; there is no built-in
+// key toggle (unlike the stats / vertex-list / console overlays).
+
+/** Shows or hides the vertex-info overlay panel. Visible by default.
+ *  Hiding suppresses the panel unconditionally -- even when labels are set
+ *  and a vertex is currently picked. Does not clear the picked-vertex
+ *  state or the label array; showing again restores the panel for whatever
+ *  is currently picked. Survives grRendererSetGraph (like
+ *  grRendererShowVertexList / grRendererShowCaption). */
+void grRendererShowVertexInfo(grRenderer *r, bool show);
+
+/** Returns whether the vertex-info overlay panel is currently enabled
+ *  (independent of whether a vertex is picked or any label text is set). */
+bool grRendererVertexInfoShown(const grRenderer *r);
+
 // VERTEX LIST OVERLAY: -------------------------------------------------------
 //
-// A scrollable panel listing vertices as "Vertex N" (N is the parent-graph
-// vertex id), with a search bar across the top. With no highlight active
+// A scrollable panel listing vertices as "Vertex N" (N is the local vertex
+// index -- see grRendererSetGraph's INDEXING CONVENTION), with a search bar
+// across the top. With no highlight active
 // (see HIGHLIGHTS above), the list holds every currently-visible vertex;
 // while a highlight is active, it holds only the highlighted vertices --
 // e.g. clicking a vertex via GR_ACTION_PICK_VERTEX narrows the list to that

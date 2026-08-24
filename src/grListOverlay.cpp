@@ -6,7 +6,8 @@
  * The list shows every currently-visible vertex, or, while a highlight is
  * active (grRendererSetHighlight / GR_ACTION_PICK_VERTEX / GR_ACTION_PICK_FACE
  * / grConsole's "find"), only the highlighted vertices -- read straight off
- * the gviz::layout::EmbeddedGraph's highlight subgraph, the same source
+ * r->highlight (grRenderer's own highlight state; gviz::layout::EmbeddedGraph
+ * no longer carries one -- see grInternal.h), the same source
  * applyColorLayers (grRenderer.cpp) uses to color them. The search bar
  * further narrows that set with a fuzzy match against each vertex's DATA
  * string from grRendererSetVertexLabels; it never reads gviz's graph loader
@@ -177,15 +178,16 @@ static void listOverlayRefreshFilter(grRenderer *r) {
 
   bool hasQuery = r->listSearchInputLen > 0;
   const gviz::Subgraph *highlight =
-      (r->highlightActive && r->graph->HasHighlight())
-          ? r->graph->GetHighlight()
-          : NULL;
+      (r->highlightActive && r->highlight.has_value()) ? &*r->highlight : NULL;
 
   if (!hasQuery) {
     // No search text: keep natural order, no scoring needed.
-    if (highlight) {
+    if (highlight && r->structureView) {
+      // *highlight iterates raw ids; listFilteredIds (like every other
+      // by-index part of this API) is LOCAL-indexed -- see
+      // grRendererSetGraph's INDEXING CONVENTION.
       for (size_t u : *highlight)
-        r->listFilteredIds.push_back((uint32_t)u);
+        r->listFilteredIds.push_back((uint32_t)r->structureView->RawToLocal(u));
     } else {
       for (size_t i = 0; i < r->topo.nodeCount; i++)
         r->listFilteredIds.push_back(r->topo.nodeIds[i]);
@@ -195,12 +197,13 @@ static void listOverlayRefreshFilter(grRenderer *r) {
 
   std::vector<grListMatch> matches;
 
-  if (highlight) {
+  if (highlight && r->structureView) {
     for (size_t u : *highlight) {
-      const char *label = listVertexLabel(r, u);
+      uint32_t local = (uint32_t)r->structureView->RawToLocal(u);
+      const char *label = listVertexLabel(r, local);
       int score;
       if (label && fuzzyMatch(r->listSearchInput, label, &score))
-        matches.push_back({(uint32_t)u, score});
+        matches.push_back({local, score});
     }
   } else {
     for (size_t i = 0; i < r->topo.nodeCount; i++) {
@@ -343,7 +346,7 @@ void grListOverlayBuild(grRenderer *r, double fbw, double fbh) {
   // grStats.c -- only A-Z, 0-9, and ".-+:/_"), so a "(n) *" style indicator
   // would silently drop those characters and leave blank gaps; "FILTERED"
   // spelled out avoids the whole class of punctuation the font can't draw.
-  bool filtered = r->highlightActive && r->graph && r->graph->HasHighlight();
+  bool filtered = r->highlightActive && r->highlight.has_value();
   char title[64];
   snprintf(title, sizeof(title), "VERTICES: %zu%s",
           r->listFilteredIds.size(), filtered ? " FILTERED" : "");

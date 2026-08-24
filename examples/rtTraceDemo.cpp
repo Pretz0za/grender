@@ -42,6 +42,7 @@
  *   scroll   - zoom
  */
 
+#include "Graphs.hpp"
 #include "grender/grender.h"
 
 #include "gviz.hpp"
@@ -51,6 +52,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <optional>
 #include <string>
 #include <utility>
@@ -738,7 +740,7 @@ int main(int argc, char **argv) {
   const char *screenshotPath = argc > 1 ? argv[1] : nullptr;
   int stepsBeforeScreenshot = argc > 2 ? atoi(argv[2]) : -1;
 
-  Graph tree = BuildDemoTree();
+  Graph tree = gviz::graphs::BuildRandomConnectedGraph(50, 0, time(NULL), true);
   tree.BuildLayout();
 
   std::optional<ReingoldTilfordTrace> trace;
@@ -781,22 +783,23 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < tree.Size(); i++)
     display.AddVertex();
 
+  // gviz::layout::EmbeddedGraph (bare, no algorithm) no longer takes a
+  // Subgraph at all -- it's now a plain vertexCount+dimension buffer,
+  // entirely decoupled from any structure (see EmbeddedGraph.hpp's class
+  // doc). `sg` is kept alive separately and handed to grRendererSetGraph so
+  // grender can still draw edges from `display`'s live structure.
   Subgraph sg = Subgraph::CreateVertexInduced(display);
   for (size_t v = 0; v < display.Size(); v++)
     sg.ShowVertex(v);
-  EmbeddedGraph stage(std::move(sg), 2);
+  EmbeddedGraph stage(display.Size(), 2);
 
   grRendererDesc desc;
   grRendererDescInit(&desc);
   desc.title = "grender - Reingold-Tilford walkthrough (N/Space = step)";
-  desc.clearColor = GR_COLOR(0.06f, 0.07f, 0.10f, 1.0f);
   desc.nodeStyle.radius = 16.0f;
-  desc.nodeStyle.fillColor = GR_COLOR(0.62f, 0.80f, 0.92f, 1.0f);
-  desc.nodeStyle.strokeColor = GR_COLOR(0.08f, 0.10f, 0.14f, 1.0f);
+  // desc.nodeStyle.strokeColor = GR_COLOR(0.08f, 0.10f, 0.14f, 1.0f);
   desc.nodeStyle.strokeWidth = 2.5f;
-  desc.nodeStyle.roundedSquare = true;
-  desc.nodeStyle.cornerRadiusFraction = 0.4f;
-  desc.edgeStyle.color = GR_COLOR(0.55f, 0.62f, 0.72f, 0.65f);
+  // desc.edgeStyle.color = GR_COLOR(0.55f, 0.62f, 0.72f, 0.65f);
   desc.edgeStyle.width = 2.0f;
 
   grRenderer *r = grRendererCreate(&desc);
@@ -804,7 +807,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "renderer creation failed\n");
     return 1;
   }
-  if (grRendererSetGraph(r, stage, &display) < 0) {
+  if (grRendererSetGraph(r, sg, stage, &display) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     return 1;

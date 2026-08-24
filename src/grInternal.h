@@ -9,6 +9,8 @@
 #include <webgpu/webgpu.h>
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,102 @@ template <typename T> const T *grPtr(const T &v) noexcept { return &v; }
 typedef struct GLFWwindow GLFWwindow;
 
 // ------------------------------------------------------------------------------
+// Structural type erasure over gviz::GraphLike
+// ------------------------------------------------------------------------------
+//
+// gviz::layout::EmbeddedGraph -- the one type every embedder publicly
+// inherits, and the only type grender's rendering path is meant to be
+// agnostic to which embedder produced -- carries no structural information
+// of its own anymore (see EmbeddedGraph.hpp): no Structure(), no
+// OutNeighbors/InNeighbors, no highlight. Every concrete embedder is now a
+// class template over `gviz::GraphLike G` (typically gviz::Graph or
+// gviz::Subgraph) and owns its own `G structure_`, reachable only through a
+// *typed* Structure() accessor (or, for the non-templated Graph-only
+// embedders -- Planar, ReingoldTilford, SchnyderWood -- not reachable from
+// the embedder at all; the caller's own retained Graph& is the only route).
+//
+// grender's whole design assumes one non-template entry point
+// (grRendererSetGraph) can attach *any* embedded graph. Since G is now a
+// compile-time parameter, that entry point has to become a template itself
+// (see grender.h) -- but everything downstream of it (grTopology.cpp,
+// picking, highlight, the vertex-list overlay, ...) should stay ordinary,
+// non-template code, exactly as before. grGraphStructure is the local type
+// erasure that makes that possible: a small abstract interface over exactly
+// what those consumers need (vertex count, directedness, raw<->local
+// translation, adjacency), implemented once per G by the template below and
+// stored as a single owned pointer on grRenderer.
+//
+// "Local index" here always means the SAME index space as
+// gviz::layout::EmbeddedGraph::Positions() -- [0, structure->VertexCount())
+// -- since that's what grender uploads to the GPU every frame. "Raw" means
+// G's own native vertex handle (Graph::Size()'s dense range for Graph;
+// the parent graph's own, generally non-contiguous, ids for Subgraph). This
+// is also grender's whole public API's indexing convention now (see
+// grRendererSetGraph's doc comment): every by-index part of that API
+// (grRendererSetNodeColors, picking results, grRendererSetAccentVertex,
+// grRendererGetEdges, ...) is LOCAL-indexed, matching Positions() exactly,
+// which happens to be a strictly better fit than the old "parent-graph id"
+// convention for a Subgraph-backed embedding (no more sizing per-vertex GPU
+// arrays to the parent graph's id range just to address a handful of
+// sparsely-scattered view vertices).
+class grGraphStructure {
+public:
+  virtual ~grGraphStructure() = default;
+
+  /** Number of vertices in the view -- == the attached embedding's
+   *  PositionCount(). Every local index below is < this. */
+  virtual size_t VertexCount() const = 0;
+
+  virtual bool IsDirected() const = 0;
+
+  /** Native handle -> local index. Unchecked: @p raw must be a handle the
+   *  structure actually has. */
+  virtual size_t RawToLocal(size_t raw) const = 0;
+
+  /** Local index -> native handle. Unchecked: @p local must be <
+   *  VertexCount(). */
+  virtual size_t LocalToRaw(size_t local) const = 0;
+
+  /** Appends the LOCAL indices of @p local's neighbors to @p out (does not
+   *  clear it first). Unchecked: @p local must be < VertexCount(). */
+  virtual void NeighborsLocal(size_t local, std::vector<uint32_t> &out) const = 0;
+};
+
+/** Concrete grGraphStructure over a specific GraphLike @p G, built once from
+ *  a non-owning reference to the caller's own structure (see
+ *  grRendererSetGraph<G>'s doc comment for why grender never copies or owns
+ *  it) plus a gviz::DenseIndex<G> grender builds itself. That index is
+ *  guaranteed to match the attached embedder's own internal DenseIndex<G>
+ *  exactly, since gviz::DenseIndex's bijection is a pure, deterministic
+ *  function of @p G's vertex range (see DenseIndex.hpp) and grRendererSetGraph
+ *  is always called with a reference to the very same structure object the
+ *  embedder itself was built over (either literally the embedder's own
+ *  Structure(), or the caller's own Graph& that a non-templated embedder
+ *  like Planar holds a reference to rather than a move-in copy of). */
+template <gviz::GraphLike G>
+class grGraphStructureImpl : public grGraphStructure {
+public:
+  explicit grGraphStructureImpl(G &structure)
+      : structure_(structure), index_(structure) {}
+
+  size_t VertexCount() const override { return index_.Size(); }
+  bool IsDirected() const override {
+    return gviz::GraphLikeIsDirected(structure_);
+  }
+  size_t RawToLocal(size_t raw) const override { return index_.ToLocal(raw); }
+  size_t LocalToRaw(size_t local) const override { return index_.ToRaw(local); }
+  void NeighborsLocal(size_t local, std::vector<uint32_t> &out) const override {
+    size_t raw = index_.ToRaw(local);
+    for (size_t nb : structure_.Neighbors(raw))
+      out.push_back((uint32_t)index_.ToLocal(nb));
+  }
+
+private:
+  G &structure_;
+  gviz::DenseIndex<G> index_;
+};
+
+// ------------------------------------------------------------------------------
 // Camera
 // ------------------------------------------------------------------------------
 
@@ -50,6 +148,12 @@ typedef struct grCamera {
   double pitch;    /**< Radians above the XY plane (3D only). */
   double distance; /**< Eye distance from target (3D); also drives 2D zoom:
                         pixelsPerWorld = viewportHeight / distance. */
+  double roll;     /**< Radians of rotation about the view/forward axis:
+                        rotates the right/up basis so panning, zooming, and
+                        unprojection all stay correct relative to the rolled
+                        view. In 2D this is the only way the view rotates; in
+                        3D it rolls the perspective camera about its look
+                        direction independently of yaw/pitch. */
 } grCamera;
 
 /** Per-frame camera-derived values consumed by the shaders and by picking. */
@@ -65,6 +169,11 @@ typedef struct grCameraFrame {
 void grCameraInit2D(grCamera *cam);
 void grCameraInit3D(grCamera *cam);
 void grCameraOrbit(grCamera *cam, double dYaw, double dPitch);
+/** Rolls the view by @p dAngle radians about its forward axis (in 2D this is
+ *  the view's only rotation; in 3D it rolls the perspective camera about its
+ *  look direction, independent of grCameraOrbit's yaw/pitch). Positive is
+ *  counter-clockwise on screen. */
+void grCameraRoll(grCamera *cam, double dAngle);
 void grCameraZoom(grCamera *cam, double factor);
 /** Pans by a screen-space delta in pixels, keeping content under the cursor. */
 void grCameraPanPixels(grCamera *cam, double dxPx, double dyPx,
@@ -86,28 +195,51 @@ void grCameraFitBox(grCamera *cam, const double bmin[3], const double bmax[3],
 
 /**
  * CPU-side mirror of the graph structure, rebuilt only when the caller reports
- * a structural change. Arrays are owned by the topology.
+ * a structural change. Arrays are owned by the topology. Doubles as grender's
+ * own local substitute for the synced out/in adjacency snapshot
+ * gviz::layout::EmbeddedGraph used to maintain (OutNeighbors/InNeighbors,
+ * removed along with Sync() -- see EmbeddedGraph.hpp): outOffsets/outNbrs
+ * (and inOffsets/inNbrs, directed graphs only) cover EVERY local vertex,
+ * not just the currently visible ones, so vertex-pick highlighting
+ * (grenderActionPickVertex) can walk a vertex's neighbors without going back
+ * to gviz. Every id in this struct is a LOCAL index (see grGraphStructure's
+ * doc comment above), not a raw/native handle.
  */
 typedef struct grTopology {
-  uint32_t *nodeIds; /**< Instance -> parent-graph vertex id. */
+  uint32_t *nodeIds; /**< Draw instance -> local vertex index, visible only. */
   size_t nodeCount;
-  uint32_t *edges;   /**< Flat (u, v) pairs of parent-graph vertex ids. */
+  uint32_t *edges;   /**< Flat (u, v) pairs of local vertex indices. */
   size_t edgeCount;
-  /** Whether the attached graph's parent gviz::Graph is directed. When true,
-   *  each (u, v) pair in edges is stored as (from, to) rather than the
-   *  u < v-deduplicated pairs used for undirected graphs, and the edge
-   *  pipeline draws an arrowhead at v. */
+  /** Whether the attached structure is directed. When true, each (u, v) pair
+   *  in edges is stored as (from, to) rather than the u < v-deduplicated
+   *  pairs used for undirected graphs, and the edge pipeline draws an
+   *  arrowhead at v. */
   bool directed;
+
+  // Full adjacency CSR, LOCAL-indexed, sized over every vertex in the
+  // structure (VertexCount() + 1 offsets) regardless of draw-mask
+  // visibility -- see the class doc.
+  std::vector<uint32_t> outOffsets, outNbrs;
+  std::vector<uint32_t> inOffsets, inNbrs; // directed only; empty otherwise
+
+  size_t vertexCount = 0; // == outOffsets.size() - 1 when built, else 0
 } grTopology;
 
 /**
- * Extracts visible vertices and edges from @p graph through the gviz public
- * API. Undirected edges are emitted once (u < v); directed edges as stored.
+ * Extracts the full adjacency CSR (outOffsets/outNbrs, inOffsets/inNbrs) from
+ * @p structure, then visible vertices and edges (filtered through @p
+ * embedding's draw mask) from it. Undirected edges are emitted once (u < v);
+ * directed edges as stored.
  *
  * @return 0 on success, -1 on allocation failure.
  */
-int grTopologyExtract(grTopology *topo, gviz::layout::EmbeddedGraph &graph);
+int grTopologyExtract(grTopology *topo, grGraphStructure &structure,
+                      gviz::layout::EmbeddedGraph &embedding);
 void grTopologyRelease(grTopology *topo);
+
+/** Total degree (out + in, if directed) of local vertex @p v as the drawn
+ *  structure defines it, read from @p topo's own CSR. */
+uint32_t grTopologyVertexDegree(const grTopology *topo, size_t v);
 
 // ------------------------------------------------------------------------------
 // Stats overlay (charts for gviz::layout::StatSeries recorded by the embedder)
@@ -208,8 +340,9 @@ typedef struct grVertexOverlayLayout {
 /**
  * Computes the vertex-info panel's bounds and re-wraps its text into
  * r->vertexOverlayLines (of grVertexOverlayLine), without touching
- * r->statsPrims. @p out->visible is false (all other fields zeroed) if no
- * vertex is currently picked or it has no label.
+ * r->statsPrims. @p out->visible is false (all other fields zeroed) if the
+ * panel is hidden (grRendererShowVertexInfo), no vertex is currently
+ * picked, or it has no label.
  */
 void grVertexOverlayComputeLayout(struct grRenderer *r, double fbw,
                                   double fbh, grVertexOverlayLayout *out);
@@ -562,16 +695,6 @@ void grPlatformTextureMapMenuRefresh(struct grRenderer *r);
 // Renderer
 // ------------------------------------------------------------------------------
 
-/**
- * Centers the camera on vertex @p vertexId and zooms in to comfortably frame
- * a neighborhood around it, sized relative to the graph's current bounding
- * box (see GR_FOCUS_EXTENT_FRACTION in grRenderer.cpp) via grCameraFitBox --
- * shared by the C key (processInput in grRenderer.cpp) and grConsole.cpp's
- * "find" command so both behave identically. No-op if @p vertexId is out of
- * range or no vertex position data has been uploaded yet.
- */
-void grRendererFocusVertex(struct grRenderer *r, size_t vertexId);
-
 typedef struct grKeyBinding {
   int key;
   const char *actionName;
@@ -622,14 +745,17 @@ typedef struct grGlobalsUBO {
                        bit4: edge weight-width, bit5: directed (draw
                        arrowheads), bit6: node shape is rounded-square
                        instead of circle (see grNodeStyle::roundedSquare),
-                       bit7: per-edge dashed (see grRendererSetEdgeDashed). */
+                       bit7: per-edge dashed (see grRendererSetEdgeDashed),
+                       bit8: node degree-scale (see
+                       grRendererSetNodeDegreeScale). */
   float nodeFill[4];
   float nodeStroke[4];
   /** x: radius, y: strokeWidth, z: sizeMode (0 px / 1 world), w: proj11. */
   float nodeParams[4];
   /** x: minPixelRadius, y: maxPixelRadius (0 disables each), z: corner
    *  radius fraction (grNodeStyle::cornerRadiusFraction, read only when
-   *  bit6 of flags is set), w: unused. */
+   *  bit6 of flags is set), w: node degree-scale factor (read only when
+   *  bit8 of flags is set; see grRendererSetNodeDegreeScale). */
   float nodeSizeLimits[4];
   float edgeColor[4];
   /** x: width, y: sizeMode, z: maxDegree (degree-alpha),
@@ -664,13 +790,28 @@ struct grRenderer {
 
   // graph data
   gviz::layout::EmbeddedGraph *graph = nullptr; /**< Not owned. */
-  /** Not owned. Backs @ref graph's Structure() for the operations that need
-   *  raw parent-graph access (EnsureLayout/GetEdgeWeight/planar face
-   *  queries) that gviz::Subgraph deliberately never exposes -- see
-   *  grRendererSetGraph's doc comment. NULL is tolerated everywhere it's
-   *  read: the features that need it just no-op (return/find nothing)
-   *  instead of crashing. */
+  /** Type-erased view over whatever gviz::GraphLike structure @p graph's
+   *  embedder was built over -- see grGraphStructure's doc comment above and
+   *  grRendererSetGraph<G>'s. Owned; rebuilt (not merely cleared) by every
+   *  grRendererSetGraph call. Null only before the first attach. */
+  std::unique_ptr<grGraphStructure> structureView;
+  /** Not owned. Backs the raw-graph-only operations (EnsureLayout,
+   *  GetEdgeWeight, planar face queries) that gviz::Subgraph deliberately
+   *  never exposes -- see grRendererSetGraph's doc comment. NULL is
+   *  tolerated everywhere it's read: the features that need it just no-op
+   *  (return/find nothing) instead of crashing. Automatically equal to the
+   *  attached structure itself when that structure is a gviz::Graph (see
+   *  grRendererSetGraph<G>). */
   gviz::Graph *backingGraph = nullptr;
+  /** The active highlight, if any (grRendererSetHighlight/SetHighlightCycle),
+   *  a full subgraph over @ref backingGraph. Lives here now, not on the
+   *  attached embedding -- gviz::layout::EmbeddedGraph no longer carries a
+   *  highlight at all (selection/highlight state is presentation state, and
+   *  the base class now knows nothing about GraphLike structure to begin
+   *  with) -- see grRendererSetHighlight's doc comment. Raw/native-id
+   *  addressed, like any gviz::Subgraph; translate through structureView
+   *  when painting local-indexed GPU colors from it (see applyColorLayers). */
+  std::optional<gviz::Subgraph> highlight;
   grTopology topo;
   bool topoDirty;
   uint64_t drawMaskRevision;
@@ -697,10 +838,10 @@ struct grRenderer {
   /** hasNodeColors/hasEdgeColors track whether nodeColorsBuf/edgeColorsBuf
    *  (the buffers actually bound for drawing, i.e. the shader flags in
    *  writeGlobals) currently hold per-element colors -- this is the
-   *  *composited* result (client base layer with any active highlight
-   *  painted over it), not necessarily a verbatim copy of what the client
-   *  last uploaded. See hasClientNodeColors/hasClientEdgeColors below for
-   *  the persistent base layer, and applyColorLayers for how the two
+   *  *composited* result (client base layer with any active highlight and
+   *  accent painted over it), not necessarily a verbatim copy of what the
+   *  client last uploaded. See hasClientNodeColors/hasClientEdgeColors below
+   *  for the persistent base layer, and applyColorLayers for how the layers
    *  combine. */
   bool hasNodeColors, hasNodeSizes, hasEdgeColors, hasNodeDegrees;
   bool hasEdgeWeights;
@@ -746,10 +887,16 @@ struct grRenderer {
   bool highlightActive;
   uint32_t highlightNodeRgba;
   uint32_t highlightEdgeRgba;
+  /** Single-vertex accent painted above base colors and highlight
+   *  (grRendererSetAccentVertex). accentVertexId is a parent-graph id, or
+   *  -1 when none. Cleared with the highlight and on SetGraph; see the
+   *  public doc for full lifetime. */
+  int64_t accentVertexId;
+  uint32_t accentVertexRgba;
   /** True when nodeColorsBuf/edgeColorsBuf need to be recomputed from the
-   *  client base layer + active highlight by applyColorLayers: set on
-   *  highlight set/clear, client base-layer changes, and capacity/topology
-   *  changes. Checked and cleared once per frame. */
+   *  client base layer + active highlight + accent by applyColorLayers: set
+   *  on highlight/accent set/clear, client base-layer changes, and
+   *  capacity/topology changes. Checked and cleared once per frame. */
   bool colorsDirty;
 
   // style
@@ -758,6 +905,14 @@ struct grRenderer {
   grEdgeStyle edgeStyle;
   bool edgeDegreeAlpha;
   bool edgeWeightWidth;
+  /** Shader-side degree-based node sizing (grRendererSetNodeDegreeScale):
+   *  when nodeDegreeScale is true and degrees are present, each node's
+   *  world radius is nodeStyle.radius * (1 + nodeDegreeScaleFactor *
+   *  sqrt(degree)) instead of the plain global default -- still overridden
+   *  per-vertex by grRendererSetNodeSizes where set, same precedence as
+   *  the plain default. Off by default. */
+  bool nodeDegreeScale;
+  float nodeDegreeScaleFactor;
 
   // stats overlay
   bool statsVisible;
@@ -798,6 +953,11 @@ struct grRenderer {
   size_t vertexLabelsCount;
   int64_t pickedVertexId; /**< Parent-graph id of the last vertex picked via
                                GR_ACTION_PICK_VERTEX, or -1 if none. */
+  bool vertexInfoVisible; /**< Master show/hide for the panel
+                               (grRendererShowVertexInfo); true by default.
+                               Independent of whether a vertex is picked or
+                               labels are set -- when false, nothing is drawn
+                               even if both are present. */
   bool vertexOverlayDirty;
   double vertexOverlayScrollPx; /**< Scroll offset into the wrapped label
                                       text, in pixels; reset to 0 whenever a
@@ -868,6 +1028,10 @@ struct grRenderer {
   // camera + input
   grCamera camera;
   grCameraFrame cameraFrame;
+  int orbitKey = -1;        /**< GLFW key held to continuously orbit the
+                                  camera, or -1 if unbound. See
+                                  grRendererSetOrbitKey. */
+  double orbitRadPerSec = 0.0;
   double contentScale;       /**< Framebuffer px per window point. */
   double viewportHeightPx;   /**< Cached each frame (processInput); lets
                                   action handlers convert a node's pixel

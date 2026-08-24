@@ -64,6 +64,7 @@
  */
 
 #include "grender/grender.h"
+#include "grender/grStepProfiling.h"
 
 #include "gviz.hpp"
 
@@ -85,21 +86,19 @@
 #define TEXMAP_SCATTER_PERIOD_SECS 2.5
 
 /*
- * SpringTutte::Begun() only ever latches true (via Begin()/FixOuterFace())
- * and has no public way back to false -- the old C demo reset this by
- * writing tutte.begun = 0 directly on the shared struct, a capability the
- * ported class deliberately doesn't expose (see SpringTutte.hpp: "there is
- * no partially-begun state to protect against"). This demo tracks its own
- * `relaxing` flag instead, driving the scatter-vs-relax branch itself; the
- * underlying embedder stays "begun" forever after the first fix, but
- * FixOuterFace() supports being called again to re-pin a different
- * boundary, so re-picking a face after a reset still works correctly even
- * though the class's own Begun() no longer round-trips to false.
+ * SpringTutte::Begun() only ever latches true (via SetBoundary()/
+ * FixConvexPolygon()) and has no public way back to false. This demo tracks
+ * its own `relaxing` flag instead, driving the scatter-vs-relax branch
+ * itself; the underlying embedder stays "begun" forever after the first
+ * fix, but FixConvexPolygon() supports being called again to re-pin a
+ * different boundary, so re-picking a face after a reset still works
+ * correctly even though the class's own Begun() no longer round-trips to
+ * false.
  */
 typedef struct TexMapDemoState {
   grRenderer *r = nullptr;
   gviz::Graph *graph = nullptr;
-  gviz::layout::SpringTutte *tutte = nullptr;
+  gviz::layout::SpringTutte<gviz::Subgraph> *tutte = nullptr;
   grTextureMap *tm = nullptr;
   gviz::layout::FaceEnumerator *enumerator = nullptr;
   size_t currentFaceIndex = 0;
@@ -178,7 +177,7 @@ static void actionStiffnessUp(gviz::layout::EmbeddedGraph &eg, void *userData,
                               const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  auto *tutte = (gviz::layout::SpringTutte *)userData;
+  auto *tutte = (gviz::layout::SpringTutte<gviz::Subgraph> *)userData;
   tutte->Configure(tutte->Stiffness() * TEXMAP_SPRING_PARAM_STEP_FACTOR, 0);
   printf("stiffness: %.2f\n", tutte->Stiffness());
 }
@@ -186,7 +185,7 @@ static void actionStiffnessDown(gviz::layout::EmbeddedGraph &eg, void *userData,
                                 const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  auto *tutte = (gviz::layout::SpringTutte *)userData;
+  auto *tutte = (gviz::layout::SpringTutte<gviz::Subgraph> *)userData;
   tutte->Configure(tutte->Stiffness() / TEXMAP_SPRING_PARAM_STEP_FACTOR, 0);
   printf("stiffness: %.2f\n", tutte->Stiffness());
 }
@@ -194,7 +193,7 @@ static void actionDampingUp(gviz::layout::EmbeddedGraph &eg, void *userData,
                             const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  auto *tutte = (gviz::layout::SpringTutte *)userData;
+  auto *tutte = (gviz::layout::SpringTutte<gviz::Subgraph> *)userData;
   tutte->Configure(0, tutte->Damping() * TEXMAP_SPRING_PARAM_STEP_FACTOR);
   printf("damping: %.2f\n", tutte->Damping());
 }
@@ -202,7 +201,7 @@ static void actionDampingDown(gviz::layout::EmbeddedGraph &eg, void *userData,
                               const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
-  auto *tutte = (gviz::layout::SpringTutte *)userData;
+  auto *tutte = (gviz::layout::SpringTutte<gviz::Subgraph> *)userData;
   tutte->Configure(0, tutte->Damping() / TEXMAP_SPRING_PARAM_STEP_FACTOR);
   printf("damping: %.2f\n", tutte->Damping());
 }
@@ -222,15 +221,23 @@ static void actionReset(gviz::layout::EmbeddedGraph &eg, void *userData,
   ds->scatterElapsed = 0.0;
 }
 
-// Bound to 'B' in place of the embedder's own "springTutte.fixOuterFace"
-// action so this demo can also flip its own `relaxing` flag on success (see
-// TexMapDemoState's doc comment).
+// SpringTutte no longer has FixOuterFace() (it dropped all planarity/
+// highlight-derived boundary logic -- see SpringTutte.hpp's class doc: only
+// SetBoundary()/FixConvexPolygon(), both taking an explicit vertex list, now
+// establish a boundary). This demo already tracks the picked face's own
+// vertex list (ds->currentFaceIndex into ds->enumerator->Faces()), so it
+// pins that directly via FixConvexPolygon instead of relying on the
+// embedder reading back a highlight it no longer has.
 static void actionFixOuterFace(gviz::layout::EmbeddedGraph &eg, void *userData,
                                const gviz::layout::ActionPayload &payload) {
   (void)eg;
   (void)payload;
   TexMapDemoState *ds = (TexMapDemoState *)userData;
-  if (ds->tutte->FixOuterFace())
+  std::vector<std::vector<size_t>> &faces = ds->enumerator->Faces();
+  if (ds->currentFaceIndex >= faces.size())
+    return;
+  if (ds->tutte->FixConvexPolygon(faces[ds->currentFaceIndex],
+                                  TEXMAP_SCATTER_BOX_EXTENT))
     ds->relaxing = true;
 }
 
@@ -320,34 +327,21 @@ int main(int argc, char **argv) {
 
   gviz::layout::FaceEnumerator enumerator(graph, sg);
 
-  std::optional<gviz::layout::SpringTutte> tutteOpt;
+  // SpringTutte<G> no longer takes a Graph& (it dropped the Planar.hpp
+  // dependency entirely -- see SpringTutte.hpp's class doc) and no longer
+  // has Begin(): there is no more auto-planarity-check/auto-boundary-pin to
+  // run up front, so construction goes straight from the Subgraph to
+  // FixConvexPolygon (called later, from actionFixOuterFace, once the user
+  // -- or screenshot mode -- has picked a face).
+  std::optional<gviz::layout::SpringTutte<gviz::Subgraph>> tutteOpt;
   try {
-    tutteOpt.emplace(graph, std::move(sg), 2);
+    tutteOpt.emplace(std::move(sg), 2);
   } catch (const std::exception &e) {
     fprintf(stderr, "spring-Tutte init failed: %s\n", e.what());
     return 1;
   }
-  gviz::layout::SpringTutte &tutte = *tutteOpt;
+  gviz::layout::SpringTutte<gviz::Subgraph> &tutte = *tutteOpt;
   tutte.Configure(20, 0.5);
-
-  // FixOuterFace() requires IsPlanarEmbedded() to already be true, but that
-  // protected flag can only be set from inside the EmbeddedGraph hierarchy
-  // (see EmbeddedGraph.hpp's SetPlanarEmbedded doc) -- the free-standing
-  // ApplyPlanarRotation() call above operates on the raw Graph/Subgraph and
-  // has no standing to set it (see Planar.hpp's file-level note on why
-  // gvizPlanarApplyRotationToEmbedding wasn't ported as a free function).
-  // Only Begin() can flip it, but Begin() also immediately pins an arbitrary
-  // (largest-face) boundary and seeds interior vertices -- so it's run here,
-  // once, purely to satisfy that precondition; every frame until the user
-  // fixes their own chosen boundary (ds.relaxing == false below), the
-  // scatter-phase loop unconditionally overwrites every vertex's position,
-  // so Begin()'s own initial pin is never actually visible.
-  try {
-    tutte.Begin();
-  } catch (const std::exception &e) {
-    fprintf(stderr, "spring-Tutte begin failed: %s\n", e.what());
-    return 1;
-  }
 
   TexMapDemoState ds;
   ds.tutte = &tutte;
@@ -389,7 +383,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (grRendererSetGraph(r, tutte, &graph) < 0) {
+  if (grRendererSetGraph(r, tutte.Structure(), tutte, &graph) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     return 1;
@@ -452,7 +446,10 @@ int main(int argc, char **argv) {
     // Skip the interactive scatter/pick phase: highlight the first
     // enumerated face and fix it immediately so relaxation can auto-run.
     demoCycleFace(&ds);
-    if (ds.tutte->FixOuterFace())
+    std::vector<std::vector<size_t>> &faces = enumerator.Faces();
+    if (ds.currentFaceIndex < faces.size() &&
+        ds.tutte->FixConvexPolygon(faces[ds.currentFaceIndex],
+                                   TEXMAP_SCATTER_BOX_EXTENT))
       ds.relaxing = true;
     else
       fprintf(stderr,
@@ -482,7 +479,9 @@ int main(int argc, char **argv) {
     } else if (autoStep && !tutte.Converged()) {
       double dt = grRendererDeltaTime(r);
       for (size_t i = 0; i < 20; i++) {
+        GR_PROF_STEP_BEGIN();
         tutte.Step(dt);
+        GR_PROF_STEP_END();
       }
     }
 

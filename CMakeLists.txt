@@ -25,8 +25,27 @@ endif()
 option(GRENDER_BUILD_EXAMPLES "Build grender example apps" ON)
 option(GRENDER_ENABLE_PROFILING
     "Time every rendered frame and print avg/p50/p95/p99/max on exit" OFF)
+option(GRENDER_ENABLE_STEP_PROFILING
+    "Time every gviz embedder Step() call in the example apps and print avg/min/max on exit" OFF)
+option(GRENDER_FORCE_O3
+    "Compile grender and gviz with -O3 regardless of CMAKE_BUILD_TYPE" OFF)
 set(GRENDER_GVIZ_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../gviz" CACHE PATH
     "Path to the gviz repository (provides gviz public headers and the gviz library)")
+
+if(GRENDER_FORCE_O3)
+    # Directory-scoped, so it covers grender, every example, and (applied
+    # before gviz's add_subdirectory() below) gviz itself uniformly -- same
+    # reasoning as the EMSCRIPTEN exception-handling flags further down.
+    # Added via add_compile_options rather than overwriting CMAKE_CXX_FLAGS,
+    # so it lands after CMAKE_CXX_FLAGS_<CONFIG> on the compiler command
+    # line and its -O3 wins regardless of CMAKE_BUILD_TYPE (Debug's -O0
+    # included).
+    if(MSVC)
+        add_compile_options(/O2)
+    else()
+        add_compile_options(-O3)
+    endif()
+endif()
 
 if(EMSCRIPTEN)
     # Both gviz and grender lean on C++ exceptions for error handling
@@ -155,6 +174,14 @@ if(GRENDER_ENABLE_PROFILING)
     target_compile_definitions(grender PRIVATE GRENDER_ENABLE_PROFILING)
 endif()
 
+if(GRENDER_ENABLE_STEP_PROFILING)
+    # PUBLIC, not PRIVATE like GRENDER_ENABLE_PROFILING above: step timing is
+    # measured at the Step() call sites in the example apps themselves (see
+    # include/grender/grStepProfiling.h), not inside the library, so the
+    # define has to propagate to every target that links grender.
+    target_compile_definitions(grender PUBLIC GRENDER_ENABLE_STEP_PROFILING)
+endif()
+
 if(APPLE)
     target_sources(grender PRIVATE src/grSurfaceCocoa.mm src/grMenuCocoa.mm)
     target_link_libraries(grender PRIVATE "-framework AppKit")
@@ -273,11 +300,6 @@ if(GRENDER_BUILD_EXAMPLES AND TARGET gviz AND NOT EMSCRIPTEN)
     add_executable(millionDemo examples/millionDemo.cpp)
     target_link_libraries(millionDemo PRIVATE grender gviz)
 
-    add_executable(datasetDemo examples/datasetDemo.cpp)
-    target_compile_definitions(datasetDemo PRIVATE
-        GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
-    target_link_libraries(datasetDemo PRIVATE grender gviz)
-
     add_executable(treeDemo examples/treeDemo.cpp)
     target_link_libraries(treeDemo PRIVATE grender gviz)
 
@@ -291,6 +313,11 @@ if(GRENDER_BUILD_EXAMPLES AND TARGET gviz AND NOT EMSCRIPTEN)
     target_compile_definitions(forceEmbedderDemo PRIVATE
         GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
     target_link_libraries(forceEmbedderDemo PRIVATE grender gviz)
+
+    add_executable(kamadaKawaiDemo examples/kamadaKawaiDemo.cpp)
+    target_compile_definitions(kamadaKawaiDemo PRIVATE
+        GRENDER_GVIZ_DATA_DIR="${GRENDER_GVIZ_DIR}/data")
+    target_link_libraries(kamadaKawaiDemo PRIVATE grender gviz)
 
     add_executable(textureMapDemo examples/textureMapDemo.cpp)
     target_link_libraries(textureMapDemo PRIVATE grender gviz)

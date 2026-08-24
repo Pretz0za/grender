@@ -32,6 +32,7 @@ static const char GR_WGSL_SOURCE[] =
     "const FLAG_DIRECTED         : u32 = 32u;\n"
     "const FLAG_NODE_ROUNDED_SQUARE : u32 = 64u;\n"
     "const FLAG_EDGE_DASHED      : u32 = 128u;\n"
+    "const FLAG_NODE_DEGREE_SCALE : u32 = 256u;\n"
     "\n"
     // Arrowhead size relative to the edge's own drawn half-width, so a
     // thicker edge (wider edgeStyle.width or a weight-scaled edge) grows a
@@ -113,6 +114,9 @@ static const char GR_WGSL_SOURCE[] =
     "  var clip = G.viewProj * vec4f(getPos(id), 1.0);\n"
     "\n"
     "  var radius = G.nodeParams.x;\n"
+    "  if ((G.flags & FLAG_NODE_DEGREE_SCALE) != 0u) {\n"
+    "    radius = radius * (1.0 + G.nodeSizeLimits.w * sqrt(f32(nodeDegrees[id])));\n"
+    "  }\n"
     "  if ((G.flags & FLAG_NODE_SIZES) != 0u) { radius = nodeSizes[id]; }\n"
     "  var radiusPx = radius;\n"
     "  if (G.nodeParams.z > 0.5) {\n"
@@ -213,6 +217,9 @@ static const char GR_WGSL_SOURCE[] =
     // arrowhead's tip lands just outside the destination node's drawn
     // circle instead of underneath it (nodes draw on top of edges in 2D).
     "    var nodeRadiusAtB = G.nodeParams.x;\n"
+    "    if ((G.flags & FLAG_NODE_DEGREE_SCALE) != 0u) {\n"
+    "      nodeRadiusAtB = nodeRadiusAtB * (1.0 + G.nodeSizeLimits.w * sqrt(f32(nodeDegrees[b])));\n"
+    "    }\n"
     "    if ((G.flags & FLAG_NODE_SIZES) != 0u) { nodeRadiusAtB = nodeSizes[b]; }\n"
     "    if (G.nodeParams.z > 0.5) {\n"
     "      tipPullback = nodeRadiusAtB * pxPerWorld(clipB.w);\n"

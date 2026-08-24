@@ -13,12 +13,14 @@
  *   scroll - zoom
  */
 
+#include "Graphs.hpp"
 #include "grender/grender.h"
 
 #include "gviz.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <optional>
 
 static size_t karyTreeVertexCount(size_t branching, size_t depth) {
@@ -56,18 +58,21 @@ static gviz::Graph buildKaryTree(size_t branching, size_t depth) {
 }
 
 int main(int argc, char **argv) {
-  size_t branching = argc > 1 ? (size_t)atoi(argv[1]) : 2;
-  size_t depth = argc > 2 ? (size_t)atoi(argv[2]) : 7;
-  const char *screenshotPath = argc > 3 ? argv[3] : NULL;
+  // size_t branching = argc > 1 ? (size_t)atoi(argv[1]) : 2;
+  // size_t depth = argc > 2 ? (size_t)atoi(argv[2]) : 7;
+  // const char *screenshotPath = argc > 3 ? argv[3] : NULL;
+ size_t N = 500;
 
-  if (branching == 0) {
-    fprintf(stderr, "branching must be >= 1\n");
-    return 1;
-  }
-
+  // if (branching == 0) {
+  //   fprintf(stderr, "branching must be >= 1\n");
+  //   return 1;
+  // }
+  //
   gviz::Graph graph(true, 1);
   try {
-    graph = buildKaryTree(branching, depth);
+
+	graph = gviz::graphs::BuildRandomConnectedGraph(N, 0, time(NULL), /*directed=*/true);
+    // graph = buildKaryTree(branching, depth);
   } catch (const std::exception &e) {
     fprintf(stderr, "tree construction failed: %s\n", e.what());
     return 1;
@@ -87,16 +92,14 @@ int main(int argc, char **argv) {
   double rootPos[2] = {0.0, 0.0};
   tree->Embed(0, rootPos);
 
-  fprintf(stderr, "embedded %zu-ary tree depth %zu (%zu vertices)\n", branching,
-          depth, graph.Size());
+  // fprintf(stderr, "embedded %zu-ary tree depth %zu (%zu vertices)\n", branching,
+  //         depth, graph.Size());
   fflush(stderr);
 
   grRendererDesc desc;
   grRendererDescInit(&desc);
   desc.title = "grender - Reingold-Tilford tree";
   desc.nodeStyle.radius = 4.0f;
-  desc.nodeStyle.fillColor = GR_COLOR(0.55f, 0.82f, 0.65f, 1.0f);
-  desc.edgeStyle.color = GR_COLOR(0.45f, 0.60f, 0.55f, 0.55f);
   desc.edgeStyle.width = 1.5f;
 
   grRenderer *r = grRendererCreate(&desc);
@@ -104,7 +107,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "renderer creation failed\n");
     return 1;
   }
-  if (grRendererSetGraph(r, *tree, &graph) < 0) {
+  if (grRendererSetGraph(r, graph, *tree) < 0) {
     fprintf(stderr, "graph attach failed\n");
     grRendererDestroy(r);
     return 1;
@@ -115,13 +118,6 @@ int main(int argc, char **argv) {
   size_t frames = 0;
   while (grRendererFrame(r)) {
     frames++;
-    if (screenshotPath && frames == 30) {
-      if (grRendererSaveScreenshot(r, screenshotPath) == 0)
-        printf("screenshot saved to %s\n", screenshotPath);
-      else
-        fprintf(stderr, "screenshot failed\n");
-      grRendererRequestClose(r);
-    }
   }
 
   grRendererDestroy(r);

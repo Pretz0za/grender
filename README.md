@@ -80,11 +80,7 @@ All examples require a built `gviz` target from gviz.
 ./build/treeDemo              # Reingold-Tilford tree layout (binary, depth 7)
 ./build/treeDemo 3 5          # 3-ary tree, depth 5
 ./build/millionDemo           # 1M-vertex online position-update stress test
-./build/datasetDemo human-jung-2015 2   # GRIP on a gviz data/ graph
 ```
-
-`datasetDemo` needs the gviz `data/` tree; CMake passes
-`GRENDER_GVIZ_DATA_DIR` automatically when gviz is built as a subdirectory.
 
 ## Working with gviz
 
@@ -226,7 +222,6 @@ src/grMenuCocoa.mm          macOS menu bar (Charts submenu, ...)
 src/grPlatformMenu.cpp      non-macOS no-op menu stub
 examples/gripDemo.cpp       live GRIP embedding with bound actions
 examples/treeDemo.cpp       Reingold-Tilford tree layout (gviz::layout::ReingoldTilford)
-examples/datasetDemo.cpp    GRIP on graphs from gviz data/
 examples/millionDemo.cpp    1M-vertex online-update stress test
 examples/tutteDemo.cpp      live Tutte embedding; optional object overlay
 ```

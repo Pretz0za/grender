@@ -84,10 +84,13 @@ struct AppState {
   std::unique_ptr<gviz::Graph> pending;
 
   Kind kind = Kind::None;
-  std::optional<gviz::layout::GRIP> grip;
-  std::optional<gviz::layout::ForceAtlas> forceAtlas;
-  std::optional<gviz::layout::Tutte> tutte;
-  std::optional<gviz::layout::SpringTutte> springTutte;
+  // Every templated embedder here is always built over gviz::Subgraph (see
+  // each webRun*() below: gviz::Subgraph::CreateFull(*g.pending)) -- the
+  // only GraphLike this app ever needs.
+  std::optional<gviz::layout::GRIP<gviz::Subgraph>> grip;
+  std::optional<gviz::layout::ForceAtlas<gviz::Subgraph>> forceAtlas;
+  std::optional<gviz::layout::Tutte<gviz::Subgraph>> tutte;
+  std::optional<gviz::layout::SpringTutte<gviz::Subgraph>> springTutte;
   std::optional<gviz::layout::ReingoldTilford> reingoldTilford;
 
   bool autoRun = false;
@@ -363,10 +366,10 @@ int webRunGRIP(int dimension, int diameter, int knnCapacity, int statsEnabled,
     g.lastError = "no graph staged";
     return -1;
   }
-  std::optional<gviz::layout::GRIP> next;
+  std::optional<gviz::layout::GRIP<gviz::Subgraph>> next;
   try {
     gviz::Subgraph sg = gviz::Subgraph::CreateFull(*g.pending);
-    gviz::layout::GRIP::Config config;
+    gviz::layout::GRIP<gviz::Subgraph>::Config config;
     if (knnCapacity > 0)
       config.knnCapacity = (size_t)knnCapacity;
     config.statsEnabled = statsEnabled != 0;
@@ -374,7 +377,7 @@ int webRunGRIP(int dimension, int diameter, int knnCapacity, int statsEnabled,
                  (size_t)dimension, config);
     next->ConfigureK((size_t)std::max(placementKMax, 0),
                      (size_t)std::max(refinementKMax, 0),
-                     static_cast<gviz::layout::GRIP::KPolicy>(
+                     static_cast<gviz::layout::GRIP<gviz::Subgraph>::KPolicy>(
                          std::clamp(kPolicy, 0, 4)));
     next->Begin();
   } catch (const std::exception &e) {
@@ -397,7 +400,8 @@ int webRunGRIP(int dimension, int diameter, int knnCapacity, int statsEnabled,
   // count. Moving to the next layer is exclusively a user action, whether
   // auto-run is on or off.
   g.autoRun = false;
-  if (grRendererSetGraph(g.renderer, *g.grip, g.graph.get()) < 0) {
+  if (grRendererSetGraph(g.renderer, g.grip->Structure(), *g.grip,
+                        g.graph.get()) < 0) {
     g.lastError = "renderer attach failed";
     return -1;
   }
@@ -419,7 +423,7 @@ int webRunForceAtlas(int model, double gravityK, double edgeLength,
     g.lastError = "no graph staged";
     return -1;
   }
-  std::optional<gviz::layout::ForceAtlas> next;
+  std::optional<gviz::layout::ForceAtlas<gviz::Subgraph>> next;
   try {
     gviz::Subgraph sg = gviz::Subgraph::CreateFull(*g.pending);
     std::unique_ptr<gviz::layout::ForceModel> fm =
@@ -445,7 +449,8 @@ int webRunForceAtlas(int model, double gravityK, double edgeLength,
   g.forceAtlas.emplace(std::move(*next));
   g.kind = Kind::ForceAtlas;
   g.autoRun = true;
-  if (grRendererSetGraph(g.renderer, *g.forceAtlas, g.graph.get()) < 0) {
+  if (grRendererSetGraph(g.renderer, g.forceAtlas->Structure(), *g.forceAtlas,
+                        g.graph.get()) < 0) {
     g.lastError = "renderer attach failed";
     return -1;
   }
@@ -463,13 +468,24 @@ int webRunTutte(double epsilon, int gaussSeidel) {
     return -1;
   }
   gviz::Graph *gp = g.pending.get();
-  std::optional<gviz::layout::Tutte> next;
+  std::optional<gviz::layout::Tutte<gviz::Subgraph>> next;
   try {
     gviz::Subgraph sg = gviz::Subgraph::CreateFull(*gp);
-    next.emplace(*gp, std::move(sg), 2,
-                 epsilon > 0 ? epsilon : gviz::layout::Tutte::kDefaultEpsilon);
+    // Tutte<G> no longer tests planarity or auto-picks a boundary itself
+    // (see Tutte.hpp's class doc: SetBoundary()/FixConvexPolygon() are the
+    // only way now) -- do that combinatorial setup here, once, the same way
+    // tutteDemo.cpp does natively: install a rotation system, pick the
+    // largest face as a reasonable default outer boundary, then pin it on a
+    // convex polygon.
+    gviz::layout::ApplyPlanarRotation(*gp, sg);
+    std::vector<size_t> boundary = gviz::layout::LargestFaceBoundary(*gp, sg);
+    next.emplace(std::move(sg), 2,
+                 epsilon > 0 ? epsilon
+                             : gviz::layout::Tutte<gviz::Subgraph>::kDefaultEpsilon);
     next->SetGaussSeidelEnabled(gaussSeidel != 0);
-    next->Begin();
+    if (!next->FixConvexPolygon(boundary, /*radius=*/200.0))
+      throw std::runtime_error("failed to pin an outer boundary (need >= 3 "
+                               "boundary vertices)");
   } catch (const std::exception &e) {
     g.lastError = e.what();
     return -1;
@@ -479,13 +495,12 @@ int webRunTutte(double epsilon, int gaussSeidel) {
   g.tutte.emplace(std::move(*next));
   g.kind = Kind::Tutte;
   g.autoRun = true;
-  if (grRendererSetGraph(g.renderer, *g.tutte, g.graph.get()) < 0) {
+  if (grRendererSetGraph(g.renderer, g.tutte->Structure(), *g.tutte,
+                        g.graph.get()) < 0) {
     g.lastError = "renderer attach failed";
     return -1;
   }
   grRendererBindKey(g.renderer, 'R', "tutte.step");
-  grRendererBindKey(g.renderer, 'B', "tutte.fixOuterFace");
-  grRendererBindMouse(g.renderer, GR_MOUSE_BUTTON_RIGHT, GR_ACTION_PICK_FACE);
   FinishAttach(Kind::Tutte);
   g.lastError.clear();
   return 0;
@@ -498,14 +513,20 @@ int webRunSpringTutte(double epsilon, double stiffness, double damping) {
     return -1;
   }
   gviz::Graph *gp = g.pending.get();
-  std::optional<gviz::layout::SpringTutte> next;
+  std::optional<gviz::layout::SpringTutte<gviz::Subgraph>> next;
   try {
     gviz::Subgraph sg = gviz::Subgraph::CreateFull(*gp);
-    next.emplace(*gp, std::move(sg), 2,
+    // See webRunTutte's comment: SpringTutte<G> dropped the same
+    // planarity/auto-boundary machinery Tutte<G> did.
+    gviz::layout::ApplyPlanarRotation(*gp, sg);
+    std::vector<size_t> boundary = gviz::layout::LargestFaceBoundary(*gp, sg);
+    next.emplace(std::move(sg), 2,
                  epsilon > 0 ? epsilon
-                             : gviz::layout::SpringTutte::kDefaultEpsilon);
+                             : gviz::layout::SpringTutte<gviz::Subgraph>::kDefaultEpsilon);
     next->Configure(stiffness, damping);
-    next->Begin();
+    if (!next->FixConvexPolygon(boundary, /*radius=*/200.0))
+      throw std::runtime_error("failed to pin an outer boundary (need >= 3 "
+                               "boundary vertices)");
   } catch (const std::exception &e) {
     g.lastError = e.what();
     return -1;
@@ -515,13 +536,12 @@ int webRunSpringTutte(double epsilon, double stiffness, double damping) {
   g.springTutte.emplace(std::move(*next));
   g.kind = Kind::SpringTutte;
   g.autoRun = true;
-  if (grRendererSetGraph(g.renderer, *g.springTutte, g.graph.get()) < 0) {
+  if (grRendererSetGraph(g.renderer, g.springTutte->Structure(), *g.springTutte,
+                        g.graph.get()) < 0) {
     g.lastError = "renderer attach failed";
     return -1;
   }
   grRendererBindKey(g.renderer, 'R', "springTutte.step");
-  grRendererBindKey(g.renderer, 'B', "springTutte.fixOuterFace");
-  grRendererBindMouse(g.renderer, GR_MOUSE_BUTTON_RIGHT, GR_ACTION_PICK_FACE);
   FinishAttach(Kind::SpringTutte);
   g.lastError.clear();
   return 0;
@@ -554,7 +574,8 @@ int webRunReingoldTilford(int root) {
   g.reingoldTilford.emplace(std::move(*next));
   g.kind = Kind::ReingoldTilford;
   g.autoRun = false; // one-shot, nothing to auto-advance
-  if (grRendererSetGraph(g.renderer, *g.reingoldTilford, g.graph.get()) < 0) {
+  if (grRendererSetGraph(g.renderer, *g.graph, *g.reingoldTilford,
+                        g.graph.get()) < 0) {
     g.lastError = "renderer attach failed";
     return -1;
   }
@@ -647,7 +668,8 @@ EMSCRIPTEN_KEEPALIVE void webGripConfigureK(int placementKMax,
   if (g.kind == Kind::GRIP && g.grip)
     g.grip->ConfigureK(
         (size_t)std::max(placementKMax, 0), (size_t)std::max(refinementKMax, 0),
-        static_cast<gviz::layout::GRIP::KPolicy>(std::clamp(kPolicy, 0, 4)));
+        static_cast<gviz::layout::GRIP<gviz::Subgraph>::KPolicy>(
+            std::clamp(kPolicy, 0, 4)));
 }
 EMSCRIPTEN_KEEPALIVE int webGripLayerCount() {
   return (g.kind == Kind::GRIP && g.grip) ? (int)g.grip->LayerCount() : -1;
@@ -689,10 +711,13 @@ EMSCRIPTEN_KEEPALIVE void webTutteSetGaussSeidel(int enabled) {
   if (g.kind == Kind::Tutte && g.tutte)
     g.tutte->SetGaussSeidelEnabled(enabled != 0);
 }
-EMSCRIPTEN_KEEPALIVE void webTutteFixOuterFace() {
-  if (g.kind == Kind::Tutte && g.tutte)
-    g.tutte->FixOuterFace();
-}
+// Tutte<G> no longer has FixOuterFace() (see webRunTutte's comment) -- the
+// JS-facing symbol stays (so an older page build doesn't fail to link) but
+// is now a no-op; re-picking a live boundary from the UI isn't wired up in
+// this pass (would need the same explicit-face-list plumbing textureMapDemo
+// uses for its own boundary re-pick, which this app's UI doesn't currently
+// track).
+EMSCRIPTEN_KEEPALIVE void webTutteFixOuterFace() {}
 EMSCRIPTEN_KEEPALIVE int webTutteConverged() {
   return (g.kind == Kind::Tutte && g.tutte) ? (g.tutte->Converged() ? 1 : 0)
                                             : -1;
@@ -707,10 +732,8 @@ EMSCRIPTEN_KEEPALIVE void webSpringTutteConfigure(double stiffness,
   if (g.kind == Kind::SpringTutte && g.springTutte)
     g.springTutte->Configure(stiffness, damping);
 }
-EMSCRIPTEN_KEEPALIVE void webSpringTutteFixOuterFace() {
-  if (g.kind == Kind::SpringTutte && g.springTutte)
-    g.springTutte->FixOuterFace();
-}
+// See webTutteFixOuterFace's comment: SpringTutte<G> dropped the same API.
+EMSCRIPTEN_KEEPALIVE void webSpringTutteFixOuterFace() {}
 EMSCRIPTEN_KEEPALIVE int webSpringTutteConverged() {
   return (g.kind == Kind::SpringTutte && g.springTutte)
              ? (g.springTutte->Converged() ? 1 : 0)

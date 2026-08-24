@@ -1,6 +1,7 @@
 # CMake out-of-tree build directory
 /build/
 /build-wasm/
+/build_verify/
 
 # Vendored dependencies (populated once via scripts/setup-deps.sh)
 /third-party/wgpu-native/
