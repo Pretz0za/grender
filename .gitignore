@@ -1,9 +1,13 @@
 # CMake out-of-tree build directory
 /build/
+/build-wasm/
+/build_verify/
 
 # Vendored dependencies (populated once via scripts/setup-deps.sh)
 /third-party/wgpu-native/
 /third-party/glfw/
+/third-party/imgui/
+/third-party/implot/
 
 # Editor / language-server cache
 .cache/
@@ -19,5 +23,7 @@
 *.so
 *.dylib
 *.dll
+
+wasm/
 
 CLAUDE.md

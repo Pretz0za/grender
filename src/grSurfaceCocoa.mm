@@ -15,11 +15,11 @@ WGPUSurface grPlatformCreateSurface(WGPUInstance instance, GLFWwindow *window) {
 
   return wgpuInstanceCreateSurface(
       instance,
-      &(const WGPUSurfaceDescriptor){
+      grPtr(WGPUSurfaceDescriptor{
           .nextInChain =
-              (WGPUChainedStruct *)&(WGPUSurfaceSourceMetalLayer){
+              (WGPUChainedStruct *)grPtr(WGPUSurfaceSourceMetalLayer{
                   .chain = {.sType = WGPUSType_SurfaceSourceMetalLayer},
                   .layer = metalLayer,
-              },
-      });
+              }),
+      }));
 }

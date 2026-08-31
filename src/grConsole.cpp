@@ -3,9 +3,12 @@
  * three things -- the current input line, the last command's result message,
  * and open/closed state -- and nothing else persists between commands, so
  * there is no session/mode machinery to keep in sync with the rest of the
- * renderer. Text input (grConsoleProcessInput) and drawing (grConsoleBuild)
- * are kept separate from what commands actually *do*: every command is a
- * small static handler below, dispatched by name out of GR_CONSOLE_COMMANDS.
+ * renderer. Text input AND drawing are both just one ImGui::InputText call
+ * (grConsoleBuild) -- ImGui owns the caret/selection/history state, grender
+ * only owns the underlying char buffer (r->consoleInput) and what happens
+ * when Enter is pressed. That's kept separate from what commands actually
+ * *do*: every command is a small static handler below, dispatched by name
+ * out of GR_CONSOLE_COMMANDS.
  *
  * To add a new command: write a `static void cmdFoo(grRenderer *r, int argc,
  * char **argv, grConsoleResult *out)` below and add one row to
@@ -16,9 +19,7 @@
 
 #include "grInternal.h"
 
-#include "ds/gvizGraph.h"
-#include "ds/gvizSubgraph.h"
-
+#include <cfloat>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,13 +68,18 @@ static void consoleFail(grConsoleResult *out, const char *fmt, ...) {
 static void cmdFind(grRenderer *r, int argc, char **argv,
                     grConsoleResult *out) {
   if (argc != 2) {
-    // No angle brackets: the console's bitmap font (GR_FONT in grStats.c)
-    // has no glyph for '<'/'>', which would otherwise silently leave gaps.
     consoleFail(out, "usage: find id");
     return;
   }
   if (!r->graph) {
     consoleFail(out, "no graph attached");
+    return;
+  }
+  if (!r->backingGraph) {
+    // Vertex selection needs raw parent-graph access (EnsureLayout) that
+    // gviz::Subgraph deliberately never exposes -- see grRendererSetGraph's
+    // doc comment on backingGraph.
+    consoleFail(out, "no backing graph attached");
     return;
   }
 
@@ -84,7 +90,7 @@ static void cmdFind(grRenderer *r, int argc, char **argv,
     return;
   }
 
-  size_t vertexCount = gvizEmbeddedGraphPositionCount(r->graph);
+  size_t vertexCount = r->graph->PositionCount();
   if ((size_t)id >= vertexCount) {
     consoleFail(out, "no vertex %ld (graph has %zu)", id, vertexCount);
     return;
@@ -100,22 +106,23 @@ static void cmdFind(grRenderer *r, int argc, char **argv,
 
   grRendererClearHighlight(r);
 
-  const gvizSubgraph *structure = gvizEmbeddedGraphStructure(r->graph);
-  /* See grHighlightCopySubgraph: refresh the shared layout on demand so the
-   * full-subgraph pick works on graphs that grew since the last use. */
-  if (gvizGraphEnsureLayout((gvizGraph *)structure->g) < 0) {
+  try {
+    /* See grHighlightCopySubgraph: refresh the shared layout on demand so
+     * the full-subgraph pick works on graphs that grew since the last use. */
+    r->backingGraph->EnsureLayout();
+    gviz::Subgraph pick = gviz::Subgraph::CreateEmpty(*r->backingGraph);
+    // (size_t)id is a local index (this command's own contract, matching
+    // the rest of grender's public API -- see grRendererSetGraph's INDEXING
+    // CONVENTION); Subgraph::ShowVertex needs the backing graph's raw id.
+    size_t raw = r->structureView ? r->structureView->LocalToRaw((size_t)id)
+                                  : (size_t)id;
+    pick.ShowVertex(raw);
+    pick.Rebuild();
+    grRendererSetHighlight(r, pick, GR_RGBA8(255, 210, 80, 255), 0);
+  } catch (const std::exception &) {
     consoleFail(out, "internal error selecting vertex %ld", id);
     return;
   }
-  gvizSubgraph pick = gvizSubgraphCreateEmpty(structure->g);
-  if (!pick.g) {
-    consoleFail(out, "internal error selecting vertex %ld", id);
-    return;
-  }
-  gvizSubgraphShowVertex(&pick, (size_t)id);
-  gvizSubgraphRebuild(&pick);
-  grRendererSetHighlight(r, &pick, GR_RGBA8(255, 210, 80, 255), 0);
-  gvizSubgraphRelease(&pick);
 
   grRendererFocusVertex(r, (size_t)id);
 
@@ -183,7 +190,7 @@ void grConsoleRun(grRenderer *r, const char *line) {
 }
 
 // ------------------------------------------------------------------------------
-// Open/close + input
+// Open/close
 // ------------------------------------------------------------------------------
 
 void grConsoleOpen(grRenderer *r) {
@@ -191,7 +198,6 @@ void grConsoleOpen(grRenderer *r) {
     return;
   r->consoleOpen = true;
   r->consoleInput[0] = '\0';
-  r->consoleInputLen = 0;
   r->consoleMessage[0] = '\0';
   r->consoleMessageIsError = false;
 }
@@ -200,101 +206,46 @@ void grConsoleClose(grRenderer *r) {
   if (!r)
     return;
   r->consoleOpen = false;
-  // The overlay rebuild that draws the console panel only runs every frame
-  // while it's open (see statsOverlayNeedsRebuild); force one more so the
-  // panel doesn't linger on screen as a stale primitive after this frame.
-  r->statsOverlayDirty = true;
-}
-
-/** Appends @p cp to the input line if it's printable ASCII (the bitmap font,
- *  see grOverlayCharHasGlyph, can't draw anything else) and there's room. */
-static void consoleAppendChar(grRenderer *r, uint32_t cp) {
-  if (cp < 32 || cp > 126)
-    return;
-  if (r->consoleInputLen + 1 < sizeof(r->consoleInput)) {
-    r->consoleInput[r->consoleInputLen++] = (char)cp;
-    r->consoleInput[r->consoleInputLen] = '\0';
-  }
-}
-
-void grConsoleProcessInput(grRenderer *r) {
-  // Drained as one queue, in delivery order, rather than as separate key and
-  // char queues -- see grPendingConsoleEvent for why: it's what makes "type
-  // '3', then press Enter" within the same frame apply in that order.
-  const grPendingConsoleEvent *events = r->pendingConsoleEvents.arr;
-  for (size_t i = 0; i < r->pendingConsoleEvents.count; i++) {
-    const grPendingConsoleEvent *ev = &events[i];
-    if (ev->isChar) {
-      consoleAppendChar(r, (uint32_t)ev->code);
-      continue;
-    }
-    switch (ev->code) {
-    case GR_KEY_ENTER:
-      grConsoleRun(r, r->consoleInput);
-      r->consoleInput[0] = '\0';
-      r->consoleInputLen = 0;
-      break;
-    case GR_KEY_ESCAPE:
-      grConsoleClose(r);
-      break;
-    case GR_KEY_BACKSPACE:
-      if (r->consoleInputLen > 0)
-        r->consoleInput[--r->consoleInputLen] = '\0';
-      break;
-    default:
-      break;
-    }
-  }
-  r->pendingConsoleEvents.count = 0;
 }
 
 // ------------------------------------------------------------------------------
-// Drawing
+// Drawing + input (both are just one ImGui::InputText call -- see the file
+// header comment)
 // ------------------------------------------------------------------------------
 
 void grConsoleBuild(grRenderer *r, double fbw, double fbh) {
   if (!r->consoleOpen)
     return;
 
-  double s = r->contentScale > 0.0 ? r->contentScale : 1.0;
-  const double margin = 12.0 * s;
-  const double pad = 10.0 * s;
-  const double fontPx = 1.4 * s;
-  const double lineH = GR_FONT_ROWS * fontPx + 4.0 * s;
-  bool hasMessage = r->consoleMessage[0] != '\0';
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
+                           ImGuiWindowFlags_NoResize |
+                           ImGuiWindowFlags_NoSavedSettings |
+                           ImGuiWindowFlags_NoMove;
+  ImGui::SetNextWindowPos(ImVec2(20.0f, (float)fbh - 20.0f), ImGuiCond_Always,
+                          ImVec2(0.0f, 1.0f));
+  ImGui::SetNextWindowSize(ImVec2((float)fbw - 40.0f, 0.0f), ImGuiCond_Always);
+  ImGui::Begin("##Console", nullptr, flags);
 
-  double panelH = pad * 2.0 + lineH * (hasMessage ? 2.0 : 1.0);
-  double x0 = margin, x1 = fbw - margin;
-  double y1 = fbh - margin, y0 = y1 - panelH;
-  if (x1 <= x0 || y0 < 0.0)
-    return;
+  // Grabs keyboard focus the frame the console opens (and every frame after,
+  // if nothing has stolen it -- SetKeyboardFocusHere before the widget is
+  // the standard "always-focused single input" idiom) so a user can type a
+  // command immediately without an extra click, matching the old renderer's
+  // "console owns all input while open" behavior.
+  if (ImGui::IsWindowAppearing())
+    ImGui::SetKeyboardFocusHere();
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  if (ImGui::InputText("##input", r->consoleInput, sizeof(r->consoleInput),
+                       ImGuiInputTextFlags_EnterReturnsTrue)) {
+    grConsoleRun(r, r->consoleInput);
+    r->consoleInput[0] = '\0';
+    ImGui::SetKeyboardFocusHere(-1); // keep focus in the input box after Enter
+  }
 
-  const uint32_t bgColor = GR_RGBA8(15, 17, 22, 235);
-  const uint32_t frameColor = GR_RGBA8(101, 197, 255, 130);
-  const uint32_t promptColor = GR_RGBA8(101, 197, 255, 255);
-  const uint32_t textColor = GR_RGBA8(235, 235, 240, 255);
-  const uint32_t cursorColor = GR_RGBA8(235, 235, 240, 210);
-  const uint32_t okColor = GR_RGBA8(126, 217, 130, 255);
-  const uint32_t errColor = GR_RGBA8(255, 118, 118, 255);
+  if (r->consoleMessage[0] != '\0') {
+    ImVec4 color = r->consoleMessageIsError ? ImVec4(1.0f, 0.46f, 0.46f, 1.0f)
+                                            : ImVec4(0.49f, 0.85f, 0.51f, 1.0f);
+    ImGui::TextColored(color, "%s", r->consoleMessage);
+  }
 
-  grOverlayPushRect(r, x0, y0, x1, y1, bgColor);
-  grOverlayPushFrame(r, x0, y0, x1, y1, 1.0 * s, frameColor);
-
-  // ">" has no glyph in the tiny bitmap font (see GR_FONT in grStats.c), so
-  // it would silently draw nothing; ":" is both available and a reasonably
-  // conventional command-line prompt.
-  double promptW = GR_FONT_ADVANCE * fontPx * 2.0; // ": "
-  double tx = x0 + pad, ty = y0 + pad;
-  grOverlayPushText(r, tx, ty, fontPx, promptColor, ":");
-  grOverlayPushText(r, tx + promptW, ty, fontPx, textColor, r->consoleInput);
-
-  double cursorX =
-      tx + promptW + grOverlayTextWidth(r->consoleInput, fontPx);
-  grOverlayPushRect(r, cursorX, ty, cursorX + 1.5 * s, ty + GR_FONT_ROWS * fontPx,
-                    cursorColor);
-
-  if (hasMessage)
-    grOverlayPushText(r, x0 + pad, ty + lineH, fontPx,
-                      r->consoleMessageIsError ? errColor : okColor,
-                      r->consoleMessage);
+  ImGui::End();
 }

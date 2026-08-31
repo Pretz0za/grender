@@ -32,11 +32,11 @@ WGPUBuffer grMakeStorageBuffer(grRenderer *r, const void *data, size_t bytes,
                                const char *label) {
   size_t bufSize = bytes < 4 ? 4 : (bytes + 3) & ~(size_t)3;
   WGPUBuffer buf = wgpuDeviceCreateBuffer(
-      r->device, &(const WGPUBufferDescriptor){
+      r->device, grPtr(WGPUBufferDescriptor{
                      .label = {label, WGPU_STRLEN},
                      .size = bufSize,
                      .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst,
-                 });
+                 }));
   if (buf && data && bytes)
     wgpuQueueWriteBuffer(r->queue, buf, 0, data, bytes);
   return buf;
@@ -47,14 +47,14 @@ static int createObjPipelines(grRenderer *r) {
 
   ov->shaderModule = wgpuDeviceCreateShaderModule(
       r->device,
-      &(const WGPUShaderModuleDescriptor){
+      grPtr(WGPUShaderModuleDescriptor{
           .label = {"grender obj shaders", WGPU_STRLEN},
           .nextInChain =
-              (WGPUChainedStruct *)&(WGPUShaderSourceWGSL){
+              (WGPUChainedStruct *)grPtr(WGPUShaderSourceWGSL{
                   .chain = {.sType = WGPUSType_ShaderSourceWGSL},
                   .code = {GR_WGSL_OBJ_SOURCE, WGPU_STRLEN},
-              },
-      });
+              }),
+      }));
   if (!ov->shaderModule)
     return -1;
 
@@ -88,18 +88,18 @@ static int createObjPipelines(grRenderer *r) {
   };
 
   ov->bindGroupLayout = wgpuDeviceCreateBindGroupLayout(
-      r->device, &(const WGPUBindGroupLayoutDescriptor){
+      r->device, grPtr(WGPUBindGroupLayoutDescriptor{
                      .label = {"grender obj bgl", WGPU_STRLEN},
                      .entryCount = 7,
                      .entries = entries,
-                 });
+                 }));
   ov->pipelineLayout = wgpuDeviceCreatePipelineLayout(
-      r->device, &(const WGPUPipelineLayoutDescriptor){
+      r->device, grPtr(WGPUPipelineLayoutDescriptor{
                      .label = {"grender obj layout", WGPU_STRLEN},
                      .bindGroupLayoutCount = 1,
                      .bindGroupLayouts =
                          (const WGPUBindGroupLayout[]){ov->bindGroupLayout},
-                 });
+                 }));
   if (!ov->bindGroupLayout || !ov->pipelineLayout)
     return -1;
 
@@ -128,23 +128,23 @@ static int createObjPipelines(grRenderer *r) {
   };
   ov->bgPipeline = wgpuDeviceCreateRenderPipeline(
       r->device,
-      &(const WGPURenderPipelineDescriptor){
+      grPtr(WGPURenderPipelineDescriptor{
           .label = {"grender obj bg", WGPU_STRLEN},
           .layout = ov->pipelineLayout,
           .vertex = {.module = ov->shaderModule,
                      .entryPoint = {"vsObjBg", WGPU_STRLEN}},
           .fragment =
-              &(const WGPUFragmentState){
+              grPtr(WGPUFragmentState{
                   .module = ov->shaderModule,
                   .entryPoint = {"fsObjBg", WGPU_STRLEN},
                   .targetCount = 1,
                   .targets = &colorTarget,
-              },
+              }),
           .primitive = {.topology = WGPUPrimitiveTopology_TriangleList,
                         .cullMode = WGPUCullMode_None},
           .depthStencil = &bgDepth,
           .multisample = {.count = 1, .mask = 0xFFFFFFFF},
-      });
+      }));
 
   const WGPUDepthStencilState meshDepth = {
       .format = WGPUTextureFormat_Depth24Plus,
@@ -157,34 +157,34 @@ static int createObjPipelines(grRenderer *r) {
   };
   ov->meshPipeline = wgpuDeviceCreateRenderPipeline(
       r->device,
-      &(const WGPURenderPipelineDescriptor){
+      grPtr(WGPURenderPipelineDescriptor{
           .label = {"grender obj mesh", WGPU_STRLEN},
           .layout = ov->pipelineLayout,
           .vertex = {.module = ov->shaderModule,
                      .entryPoint = {"vsObj", WGPU_STRLEN}},
           .fragment =
-              &(const WGPUFragmentState){
+              grPtr(WGPUFragmentState{
                   .module = ov->shaderModule,
                   .entryPoint = {"fsObj", WGPU_STRLEN},
                   .targetCount = 1,
                   .targets = &colorTarget,
-              },
+              }),
           // Arbitrary/unknown winding from input files: don't cull faces.
           .primitive = {.topology = WGPUPrimitiveTopology_TriangleList,
                         .cullMode = WGPUCullMode_None},
           .depthStencil = &meshDepth,
           .multisample = {.count = 1, .mask = 0xFFFFFFFF},
-      });
+      }));
 
   if (!ov->bgPipeline || !ov->meshPipeline)
     return -1;
 
   ov->uniformBuf = wgpuDeviceCreateBuffer(
-      r->device, &(const WGPUBufferDescriptor){
+      r->device, grPtr(WGPUBufferDescriptor{
                      .label = {"grender obj globals", WGPU_STRLEN},
                      .size = sizeof(grObjOverlayUBO),
                      .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
-                 });
+                 }));
   return ov->uniformBuf ? 0 : -1;
 }
 
@@ -202,7 +202,7 @@ static int ensureObjDummyResources(grRenderer *r) {
   if (!ov->dummyTexture) {
     ov->dummyTexture = wgpuDeviceCreateTexture(
         r->device,
-        &(const WGPUTextureDescriptor){
+        grPtr(WGPUTextureDescriptor{
             .label = {"grender obj dummy tex", WGPU_STRLEN},
             .usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
             .dimension = WGPUTextureDimension_2D,
@@ -210,24 +210,24 @@ static int ensureObjDummyResources(grRenderer *r) {
             .format = WGPUTextureFormat_RGBA8Unorm,
             .mipLevelCount = 1,
             .sampleCount = 1,
-        });
+        }));
     if (ov->dummyTexture) {
       ov->dummyView = wgpuTextureCreateView(ov->dummyTexture, NULL);
       const uint8_t whitePixel[4] = {255, 255, 255, 255};
       wgpuQueueWriteTexture(
           r->queue,
-          &(const WGPUTexelCopyTextureInfo){
-              .texture = ov->dummyTexture, .mipLevel = 0, .origin = {0, 0, 0}},
+          grPtr(WGPUTexelCopyTextureInfo{
+              .texture = ov->dummyTexture, .mipLevel = 0, .origin = {0, 0, 0}}),
           whitePixel, sizeof(whitePixel),
-          &(const WGPUTexelCopyBufferLayout){
-              .offset = 0, .bytesPerRow = 4, .rowsPerImage = 1},
-          &(const WGPUExtent3D){1, 1, 1});
+          grPtr(WGPUTexelCopyBufferLayout{
+              .offset = 0, .bytesPerRow = 4, .rowsPerImage = 1}),
+          grPtr(WGPUExtent3D{1, 1, 1}));
     }
   }
 
   if (!ov->dummySampler)
     ov->dummySampler = wgpuDeviceCreateSampler(
-        r->device, &(const WGPUSamplerDescriptor){
+        r->device, grPtr(WGPUSamplerDescriptor{
                        .label = {"grender obj dummy sampler", WGPU_STRLEN},
                        .addressModeU = WGPUAddressMode_ClampToEdge,
                        .addressModeV = WGPUAddressMode_ClampToEdge,
@@ -236,7 +236,7 @@ static int ensureObjDummyResources(grRenderer *r) {
                        .minFilter = WGPUFilterMode_Nearest,
                        .mipmapFilter = WGPUMipmapFilterMode_Nearest,
                        .maxAnisotropy = 1,
-                   });
+                   }));
 
   return (ov->dummyUvBuf && ov->dummyTexture && ov->dummyView &&
           ov->dummySampler)
@@ -272,12 +272,12 @@ static int rebuildObjBindGroup(grRenderer *r) {
       {.binding = 6, .textureView = view},
   };
   ov->bindGroup = wgpuDeviceCreateBindGroup(
-      r->device, &(const WGPUBindGroupDescriptor){
+      r->device, grPtr(WGPUBindGroupDescriptor{
                      .label = {"grender obj bind group", WGPU_STRLEN},
                      .layout = ov->bindGroupLayout,
                      .entryCount = 7,
                      .entries = bgEntries,
-                 });
+                 }));
   ov->bindGroupDirty = false;
   return ov->bindGroup ? 0 : -1;
 }
@@ -383,23 +383,23 @@ void grObjOverlayEncode(grRenderer *r, WGPUCommandEncoder encoder,
 
   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(
       encoder,
-      &(const WGPURenderPassDescriptor){
+      grPtr(WGPURenderPassDescriptor{
           .colorAttachmentCount = 1,
           .colorAttachments =
-              &(const WGPURenderPassColorAttachment){
+              grPtr(WGPURenderPassColorAttachment{
                   .view = colorTarget,
                   .loadOp = WGPULoadOp_Load,
                   .storeOp = WGPUStoreOp_Store,
                   .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
-              },
+              }),
           .depthStencilAttachment =
-              &(const WGPURenderPassDepthStencilAttachment){
+              grPtr(WGPURenderPassDepthStencilAttachment{
                   .view = depthView,
                   .depthLoadOp = WGPULoadOp_Clear,
                   .depthStoreOp = WGPUStoreOp_Discard,
                   .depthClearValue = 1.0f,
-              },
-      });
+              }),
+      }));
 
   wgpuRenderPassEncoderSetViewport(pass, (float)x0, (float)y0, (float)size,
                                    (float)size, 0.0f, 1.0f);

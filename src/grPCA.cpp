@@ -1,6 +1,12 @@
 #include "grInternal.h"
 
+// LAPACKE/OpenBLAS provide the >3D eigensolve. Not available on wasm (and
+// not needed there yet -- no wasm-targeting demo uses a >3D embedding), so
+// that path is compiled out under Emscripten rather than dragging in a
+// wasm build of LAPACK for dead code. See grPCAProjectTo3 below.
+#ifndef __EMSCRIPTEN__
 #include <lapacke.h>
+#endif
 
 #include <math.h>
 #include <string.h>
@@ -59,6 +65,10 @@ int grPCAProjectTo3(const double *src, size_t n, size_t srcDim, float *dst,
   if (n < 2 || srcDim > GR_PCA_MAX_SRC_DIM)
     return -1;
 
+#ifdef __EMSCRIPTEN__
+  (void)basisOut, (void)basisIn;
+  return -1; // >3D PCA needs LAPACK, unsupported on wasm (see #include above)
+#else
   double mean[GR_PCA_MAX_SRC_DIM];
   memset(mean, 0, sizeof(double) * srcDim);
 
@@ -120,4 +130,5 @@ int grPCAProjectTo3(const double *src, size_t n, size_t srcDim, float *dst,
     }
   }
   return 0;
+#endif
 }

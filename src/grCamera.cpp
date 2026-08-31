@@ -11,6 +11,8 @@ void grCameraInit2D(grCamera *cam) {
   memset(cam, 0, sizeof(*cam));
   cam->perspective = false;
   cam->distance = 100.0;
+  cam->yaw = -M_PI / 2.0;
+  cam->pitch = M_PI / 6.0;
 }
 
 void grCameraInit3D(grCamera *cam) {
@@ -32,6 +34,8 @@ void grCameraOrbit(grCamera *cam, double dYaw, double dPitch) {
     cam->pitch = -GR_MAX_PITCH;
 }
 
+void grCameraRoll(grCamera *cam, double dAngle) { cam->roll += dAngle; }
+
 void grCameraZoom(grCamera *cam, double factor) {
   cam->distance *= factor;
   if (cam->distance < GR_MIN_DISTANCE)
@@ -42,8 +46,9 @@ void grCameraZoom(grCamera *cam, double factor) {
 static void cameraBasis(const grCamera *cam, double right[3], double up[3],
                         double forward[3]) {
   if (!cam->perspective) {
-    right[0] = 1.0, right[1] = 0.0, right[2] = 0.0;
-    up[0] = 0.0, up[1] = 1.0, up[2] = 0.0;
+    double cr = cos(cam->roll), sr = sin(cam->roll);
+    right[0] = cr, right[1] = sr, right[2] = 0.0;
+    up[0] = -sr, up[1] = cr, up[2] = 0.0;
     forward[0] = 0.0, forward[1] = 0.0, forward[2] = -1.0;
     return;
   }
@@ -60,6 +65,18 @@ static void cameraBasis(const grCamera *cam, double right[3], double up[3],
   up[0] = right[1] * forward[2] - right[2] * forward[1];
   up[1] = right[2] * forward[0] - right[0] * forward[2];
   up[2] = right[0] * forward[1] - right[1] * forward[0];
+
+  // Roll spins right/up within their own plane (about the forward axis), so
+  // the right x up == -forward invariant above still holds afterward.
+  if (cam->roll != 0.0) {
+    double cr = cos(cam->roll), sr = sin(cam->roll);
+    double r0[3] = {right[0], right[1], right[2]};
+    double u0[3] = {up[0], up[1], up[2]};
+    for (int i = 0; i < 3; i++) {
+      right[i] = r0[i] * cr + u0[i] * sr;
+      up[i] = -r0[i] * sr + u0[i] * cr;
+    }
+  }
 }
 
 void grCameraPanPixels(grCamera *cam, double dxPx, double dyPx,
@@ -190,8 +207,9 @@ void grCameraUnproject(const grCamera *cam, const grCameraFrame *frame,
   if (!cam->perspective) {
     double aspect = viewportWPx / (viewportHPx > 0 ? viewportHPx : 1.0);
     double halfH = cam->distance / 2.0;
-    *worldX = cam->target[0] + nx * halfH * aspect;
-    *worldY = cam->target[1] + ny * halfH;
+    double sx = nx * halfH * aspect, sy = ny * halfH;
+    *worldX = cam->target[0] + right[0] * sx + up[0] * sy;
+    *worldY = cam->target[1] + right[1] * sx + up[1] * sy;
     return;
   }
 

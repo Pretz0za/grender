@@ -2,10 +2,10 @@
  * Texture mapping: derives (u, v) texture coordinates for the object
  * overlay's mesh from where a live 2D Tutte-embedded graph's vertices land
  * relative to a movable image rectangle in embedding space. Relies on
- * gvizGraphLoadFromObjFile (gviz side) and grObjMeshLoad (this side) parsing
+ * gviz::io::LoadFromObjFile (gviz side) and grObjMeshLoad (this side) parsing
  * '.obj' 'v' lines in identical file order, so embedding vertex i and mesh
- * vertex i are always the same physical vertex; see grObjMesh.c for the mesh
- * side of that contract.
+ * vertex i are always the same physical vertex; see grObjMesh.cpp for the
+ * mesh side of that contract.
  *
  * This file is the sole translation unit that defines
  * STB_IMAGE_IMPLEMENTATION; every other translation unit that needs
@@ -77,14 +77,15 @@ static void texMapReleaseGpu(grTextureMap *tm) {
   tm->imageSampler = NULL;
 }
 
-grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
+grTextureMap *grRendererLoadTextureMap(grRenderer *r,
+                                       gviz::layout::EmbeddedGraph &graph,
                                        const char *objPath,
                                        const char *imagePath) {
-  if (!r || !r->device || !graph || !objPath || !imagePath) {
+  if (!r || !r->device || !objPath || !imagePath) {
     GR_LOG("grRendererLoadTextureMap: missing argument\n");
     return NULL;
   }
-  if (gvizEmbeddedGraphDim(graph) != 2) {
+  if (graph.Dim() != 2) {
     GR_LOG("grRendererLoadTextureMap: embedding must be 2D\n");
     return NULL;
   }
@@ -100,10 +101,10 @@ grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
   size_t faceCount = ov->mesh.faceCount;
   size_t triangleCount = indexCount / 3;
 
-  if (vertexCount != gvizEmbeddedGraphPositionCount(graph)) {
+  if (vertexCount != graph.PositionCount()) {
     GR_LOG("grRendererLoadTextureMap: mesh vertex count %zu != embedding "
           "vertex count %zu\n",
-          vertexCount, gvizEmbeddedGraphPositionCount(graph));
+          vertexCount, graph.PositionCount());
     grObjOverlayClear(r);
     return NULL;
   }
@@ -122,7 +123,7 @@ grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
 
   tm->imageTexture = wgpuDeviceCreateTexture(
       r->device,
-      &(const WGPUTextureDescriptor){
+      grPtr(WGPUTextureDescriptor{
           .label = {"grender texmap image", WGPU_STRLEN},
           .usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
           .dimension = WGPUTextureDimension_2D,
@@ -130,29 +131,29 @@ grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
           .format = WGPUTextureFormat_RGBA8Unorm,
           .mipLevelCount = 1,
           .sampleCount = 1,
-      });
+      }));
   if (tm->imageTexture)
     tm->imageView = wgpuTextureCreateView(tm->imageTexture, NULL);
   if (tm->imageTexture && tm->imageView) {
     wgpuQueueWriteTexture(
         r->queue,
-        &(const WGPUTexelCopyTextureInfo){
+        grPtr(WGPUTexelCopyTextureInfo{
             .texture = tm->imageTexture,
             .mipLevel = 0,
             .origin = {0, 0, 0},
-        },
+        }),
         pixels, (size_t)w * (size_t)h * 4,
-        &(const WGPUTexelCopyBufferLayout){
+        grPtr(WGPUTexelCopyBufferLayout{
             .offset = 0,
             .bytesPerRow = (uint32_t)w * 4,
             .rowsPerImage = (uint32_t)h,
-        },
-        &(const WGPUExtent3D){(uint32_t)w, (uint32_t)h, 1});
+        }),
+        grPtr(WGPUExtent3D{(uint32_t)w, (uint32_t)h, 1}));
   }
   stbi_image_free(pixels);
 
   tm->imageSampler = wgpuDeviceCreateSampler(
-      r->device, &(const WGPUSamplerDescriptor){
+      r->device, grPtr(WGPUSamplerDescriptor{
                      .label = {"grender texmap sampler", WGPU_STRLEN},
                      .addressModeU = WGPUAddressMode_ClampToEdge,
                      .addressModeV = WGPUAddressMode_ClampToEdge,
@@ -163,7 +164,7 @@ grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
                      .lodMinClamp = 0.0f,
                      .lodMaxClamp = 32.0f,
                      .maxAnisotropy = 1,
-                 });
+                 }));
 
   if (!tm->imageTexture || !tm->imageView || !tm->imageSampler) {
     GR_LOG("grRendererLoadTextureMap: failed to create GPU image resources\n");
@@ -183,10 +184,10 @@ grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
     return NULL;
   }
 
-  tm->uvStaging = malloc(sizeof(float) * 2 * vertexCount);
-  tm->insideStaging = malloc(sizeof(uint32_t) * vertexCount);
-  tm->faceValidStaging = malloc(sizeof(uint32_t) * faceCount);
-  tm->triValidStaging = malloc(sizeof(uint32_t) * triangleCount);
+  tm->uvStaging = (float *)malloc(sizeof(float) * 2 * vertexCount);
+  tm->insideStaging = (uint32_t *)malloc(sizeof(uint32_t) * vertexCount);
+  tm->faceValidStaging = (uint32_t *)malloc(sizeof(uint32_t) * faceCount);
+  tm->triValidStaging = (uint32_t *)malloc(sizeof(uint32_t) * triangleCount);
   if (!tm->uvStaging || !tm->insideStaging || !tm->faceValidStaging ||
       !tm->triValidStaging) {
     GR_LOG("grRendererLoadTextureMap: staging allocation failed\n");
@@ -196,7 +197,7 @@ grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
     return NULL;
   }
 
-  const double *pos = gvizEmbeddedGraphPositions(graph);
+  const double *pos = graph.Positions().data();
   double bmin[2] = {INFINITY, INFINITY};
   double bmax[2] = {-INFINITY, -INFINITY};
   for (size_t i = 0; i < vertexCount; i++) {
@@ -235,7 +236,7 @@ grTextureMap *grRendererLoadTextureMap(grRenderer *r, gvizEmbeddedGraph *graph,
   tm->imgCenter[1] = tm->initCenter[1] = cy;
   tm->imgHalfExtent[0] = tm->initHalfExtent[0] = halfW;
   tm->imgHalfExtent[1] = tm->initHalfExtent[1] = halfH;
-  tm->graph = graph;
+  tm->graph = &graph;
   tm->imageW = w;
   tm->imageH = h;
   tm->active = true;
@@ -256,14 +257,14 @@ static int ensureImageQuadPipeline(grRenderer *r, grTextureMap *tm) {
 
   tm->imgQuadShaderModule = wgpuDeviceCreateShaderModule(
       r->device,
-      &(const WGPUShaderModuleDescriptor){
+      grPtr(WGPUShaderModuleDescriptor{
           .label = {"grender texmap image shaders", WGPU_STRLEN},
           .nextInChain =
-              (WGPUChainedStruct *)&(WGPUShaderSourceWGSL){
+              (WGPUChainedStruct *)grPtr(WGPUShaderSourceWGSL{
                   .chain = {.sType = WGPUSType_ShaderSourceWGSL},
                   .code = {GR_WGSL_TEXMAP_IMAGE_SOURCE, WGPU_STRLEN},
-              },
-      });
+              }),
+      }));
   if (!tm->imgQuadShaderModule)
     return -1;
 
@@ -281,19 +282,19 @@ static int ensureImageQuadPipeline(grRenderer *r, grTextureMap *tm) {
                    .multisampled = false}},
   };
   tm->imgQuadBindGroupLayout = wgpuDeviceCreateBindGroupLayout(
-      r->device, &(const WGPUBindGroupLayoutDescriptor){
+      r->device, grPtr(WGPUBindGroupLayoutDescriptor{
                      .label = {"grender texmap image bgl", WGPU_STRLEN},
                      .entryCount = 3,
                      .entries = entries,
-                 });
+                 }));
   tm->imgQuadPipelineLayout = wgpuDeviceCreatePipelineLayout(
       r->device,
-      &(const WGPUPipelineLayoutDescriptor){
+      grPtr(WGPUPipelineLayoutDescriptor{
           .label = {"grender texmap image layout", WGPU_STRLEN},
           .bindGroupLayoutCount = 1,
           .bindGroupLayouts =
               (const WGPUBindGroupLayout[]){tm->imgQuadBindGroupLayout},
-      });
+      }));
   if (!tm->imgQuadBindGroupLayout || !tm->imgQuadPipelineLayout)
     return -1;
 
@@ -323,33 +324,33 @@ static int ensureImageQuadPipeline(grRenderer *r, grTextureMap *tm) {
   };
   tm->imgQuadPipeline = wgpuDeviceCreateRenderPipeline(
       r->device,
-      &(const WGPURenderPipelineDescriptor){
+      grPtr(WGPURenderPipelineDescriptor{
           .label = {"grender texmap image", WGPU_STRLEN},
           .layout = tm->imgQuadPipelineLayout,
           .vertex = {.module = tm->imgQuadShaderModule,
                      .entryPoint = {"vsTexMapImage", WGPU_STRLEN}},
           .fragment =
-              &(const WGPUFragmentState){
+              grPtr(WGPUFragmentState{
                   .module = tm->imgQuadShaderModule,
                   .entryPoint = {"fsTexMapImage", WGPU_STRLEN},
                   .targetCount = 1,
                   .targets = &colorTarget,
-              },
+              }),
           .primitive = {.topology = WGPUPrimitiveTopology_TriangleList,
                         .cullMode = WGPUCullMode_None},
           .depthStencil = &depthState,
           .multisample = {.count = 1, .mask = 0xFFFFFFFF},
-      });
+      }));
   if (!tm->imgQuadPipeline)
     return -1;
 
   tm->imgQuadUniformBuf = wgpuDeviceCreateBuffer(
       r->device,
-      &(const WGPUBufferDescriptor){
+      grPtr(WGPUBufferDescriptor{
           .label = {"grender texmap image globals", WGPU_STRLEN},
           .size = sizeof(grTexMapImageUBO),
           .usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst,
-      });
+      }));
   if (!tm->imgQuadUniformBuf)
     return -1;
 
@@ -361,12 +362,12 @@ static int ensureImageQuadPipeline(grRenderer *r, grTextureMap *tm) {
       {.binding = 2, .textureView = tm->imageView},
   };
   tm->imgQuadBindGroup = wgpuDeviceCreateBindGroup(
-      r->device, &(const WGPUBindGroupDescriptor){
+      r->device, grPtr(WGPUBindGroupDescriptor{
                      .label = {"grender texmap image bind group", WGPU_STRLEN},
                      .layout = tm->imgQuadBindGroupLayout,
                      .entryCount = 3,
                      .entries = bgEntries,
-                 });
+                 }));
   return tm->imgQuadBindGroup ? 0 : -1;
 }
 
@@ -470,7 +471,7 @@ void grTextureMapUpdate(grRenderer *r) {
   // are unused by the render path but kept as pure, unit-tested CPU logic
   // (see examples/textureMapUnitTest.c) in case a per-triangle mode is
   // wanted again later.
-  const double *pos = gvizEmbeddedGraphPositions(tm->graph);
+  const double *pos = tm->graph->Positions().data();
   grTextureMapComputeUV(pos, vertexCount, tm->imgCenter, tm->imgHalfExtent,
                         tm->uvStaging, tm->insideStaging);
 

@@ -4,15 +4,16 @@ A GPU renderer for [gviz](../gviz) embedded graphs, built on WebGPU
 ([wgpu-native](https://github.com/gfx-rs/wgpu-native)) and GLFW.
 
 grender lives strictly on the consumer side of the gviz abstraction barrier:
-it reads embedded graphs only through the public `gvizEmbeddedGraph` /
-`gvizSubgraph` API and never depends on which embedding algorithm produced the
-positions.
+it reads embedded graphs only through the public `gviz::layout::EmbeddedGraph`
+/ `gviz::Subgraph` API and never depends on which embedding algorithm produced
+the positions. Both grender and gviz are C++20.
 
 ## Design
 
-- **Embedder-agnostic** (spec 1): the only input is a `gvizEmbeddedGraph*`.
-  Structure comes from its subgraph, geometry from its position buffer, and
-  interactivity from its action registry. 2D and 3D embeddings are supported.
+- **Embedder-agnostic** (spec 1): the only input is a
+  `gviz::layout::EmbeddedGraph&`. Structure comes from its subgraph, geometry
+  from its position buffer, and interactivity from its action registry. 2D
+  and 3D embeddings are supported.
 - **Scales to millions of elements** (spec 2): a frame is exactly **two
   instanced draw calls** (one for all edges, one for all nodes), regardless of
   graph size. There are no per-vertex CPU draw calls and no CPU-side geometry:
@@ -27,12 +28,13 @@ positions.
   (adding/removing/hiding vertices or edges) require a call to
   `grRendererGraphStructureChanged`.
 - **Creator-defined actions** (spec 4): the creator of an embedded graph
-  registers named handlers on it via `gvizEmbeddedGraphAddAction` (e.g. the
+  registers named handlers on it via `EmbeddedGraph::AddAction` (e.g. the
   GRIP embedder registers `"grip.refineRound"` and `"grip.nextStage"`).
   The application binds inputs to names with
   `grRendererBindKey(r, 'R', "grip.refineRound")`; the renderer fills a
-  `gvizActionPayload` (cursor position in embedding coordinates, modifiers,
-  frame delta time) and dispatches. Neither side knows about the other.
+  `gviz::layout::ActionPayload` (cursor position in embedding coordinates,
+  modifiers, frame delta time) and dispatches. Neither side knows about the
+  other.
 
 ## Why WebGPU / wgpu-native
 
@@ -41,7 +43,7 @@ positions.
 - Runs natively on Metal/Vulkan/D3D12 with no OpenGL emulation layers.
 - The same API is implemented by browsers and Emscripten, so a future web
   build can reuse the renderer core unchanged; only the platform layer
-  (window/surface creation, currently GLFW + `grSurfaceCocoa.m`) is swapped.
+  (window/surface creation, currently GLFW + `grSurfaceCocoa.mm`) is swapped.
 - Prebuilt static libraries live under `third-party/` - no Rust toolchain
   required.
 
@@ -63,14 +65,14 @@ cmake --build build -j
 
 See **Example apps** below for runnable demos.
 
-Requirements: CMake >= 3.20, a C11 compiler, OpenBLAS in `$HOME/lib` (needed by
-grender for 4D PCA projection), and the gviz repo as a sibling directory (or
-set `-DGRENDER_GVIZ_DIR=/path/to/gviz`). Network access is only needed when
-running `scripts/setup-deps.sh`.
+Requirements: CMake >= 3.20, a C++20 compiler, OpenBLAS in `$HOME/lib` (needed
+by grender for 4D PCA projection), and the gviz repo as a sibling directory
+(or set `-DGRENDER_GVIZ_DIR=/path/to/gviz`). Network access is only needed
+when running `scripts/setup-deps.sh`.
 
 ### Example apps
 
-All examples require a built `graphvis` target from gviz.
+All examples require a built `gviz` target from gviz.
 
 ```sh
 ./build/gripDemo              # live GRIP on a Möbius mesh (default 24×48, 3D)
@@ -78,79 +80,80 @@ All examples require a built `graphvis` target from gviz.
 ./build/treeDemo              # Reingold-Tilford tree layout (binary, depth 7)
 ./build/treeDemo 3 5          # 3-ary tree, depth 5
 ./build/millionDemo           # 1M-vertex online position-update stress test
-./build/datasetDemo human-jung-2015 2   # GRIP on a gviz data/ graph
 ```
-
-`datasetDemo` needs the gviz `data/` tree; CMake passes
-`GRENDER_GVIZ_DATA_DIR` automatically when gviz is built as a subdirectory.
 
 ## Working with gviz
 
-grender only consumes the public gviz API (`gvizEmbeddedGraph`,
-`gvizSubgraph`, …). Embedding algorithms live in the sibling
+grender only consumes the public gviz API (`gviz::layout::EmbeddedGraph`,
+`gviz::Subgraph`, …). Embedding algorithms live in the sibling
 [`gviz`](../gviz) repo and are linked into the example apps via the
-`graphvis` static library. **Do not modify gviz embedder code from grender
+`gviz` shared library. **Do not modify gviz embedder code from grender
 unless you are intentionally fixing or extending gviz itself.**
 
-### Data structures: use gviz's, never reimplement
+### Data structures: use gviz's / the standard library, never reimplement
 
-gviz ships generic, reusable data structures under `ds/` (`gvizArray`,
-`gvizGraph`, `gvizSubgraph`, `gvizDeque`, `gvizBitArray`, `gvizTree`, ...) and
-grender already links against them. In particular, **any growable/dynamic
-array in grender must be a `gvizArray`** (`#include "ds/gvizArray.h"`) — never
-a hand-rolled `malloc`/`realloc`-doubling loop. This applies just as much to
-grender-internal state (pending input queues, key/mouse bindings, staging
-buffers, ...) as to anything that touches gviz graphs directly. Before adding
-a new container of any kind, check whether gviz already provides it; the goal
-is one implementation of each data structure in the combined codebase, not
-one per call site.
+gviz's own data structures (`gviz::Graph`, `gviz::Subgraph`, `gviz::BitSet`,
+`gviz::QuadTree`, ...) are real C++ classes under its `include/`, and
+grender already links against them. grender-internal dynamic state (pending
+input queues, key/mouse bindings, staging buffers, ...) is plain
+`std::vector<T>` — never a hand-rolled `malloc`/`realloc`-doubling loop.
+Before adding a new container of any kind, check whether gviz or the
+standard library already provides it; the goal is one implementation of each
+data structure in the combined codebase, not one per call site.
 
 ### Graph layout before subgraphs
 
-`gvizSubgraphCreateFull` returns an **empty** subgraph (null graph pointer)
+`gviz::Subgraph::CreateFull`/`CreateEmpty` **throw `gviz::NoLayoutError`**
 when the parent graph has no built layout. Every example follows the same
 order:
 
-```c
-gvizGraph graph = ...;          // build vertices and edges first
-gvizGraphBuildLayout(&graph);   // required — builds the shared edge layout
-gvizSubgraph sg = gvizSubgraphCreateFull(&graph);
+```cpp
+gviz::Graph graph(/*directed=*/false);   // build vertices and edges first
+graph.BuildLayout();                     // required — builds the shared edge layout
+gviz::Subgraph sg = gviz::Subgraph::CreateFull(graph);
 ```
 
-Skipping `gvizGraphBuildLayout` silently produces an invalid subgraph; embedder
-init and rendering will then crash or fail. Rebuild the layout after any
-structural change to vertices or edges (add/remove), then recreate affected
-subgraphs.
+Skipping `BuildLayout()` throws instead of silently producing an invalid
+subgraph. Rebuild the layout after any structural change to vertices or
+edges (add/remove), then recreate affected subgraphs. A vertex-induced
+subgraph (`gviz::Subgraph::CreateVertexInduced(graph)`) never throws and
+needs no built layout at all — prefer it for anything dynamic (see gviz's
+own `CLAUDE.md` on `Subgraph`'s two kinds).
 
 ### Embedder-specific notes
 
 | embedder | header | graph requirements | dimensions |
 | -------- | ------ | ------------------ | ---------- |
-| GRIP | `embedders/gvizGRIPEmbedder.h` | any graph; undirected is fine | 2, 3, or 4 |
-| Reingold-Tilford tree | `embedders/gvizEmbeddedTree.h` | **directed tree** rooted at the chosen vertex (`gvizGraphInit(..., 1)`) | 2 only |
-| (manual positions) | `embedders/gvizEmbeddedGraph.h` | any | 2, 3, or 4 |
+| `gviz::layout::GRIP` | `GRIP.hpp` | any graph; undirected is fine | 2, 3, or 4 |
+| `gviz::layout::ReingoldTilford` | `ReingoldTilford.hpp` | **directed tree**, rooted (constructor throws `gviz::NotATreeError` otherwise) | 2 only |
+| `gviz::layout::ForceAtlas` | `ForceAtlas.hpp` | any graph, directed OK | 2 only |
+| `gviz::layout::Tutte` / `SpringTutte` | `Tutte.hpp` / `SpringTutte.hpp` | planar (`Begin()` throws `gviz::PlanarNotPlanarError` otherwise) | 2 only |
+| (manual positions) | `EmbeddedGraph.hpp` | any | 2, 3, or 4 |
 
 Tree layout workflow (`treeDemo`):
 
-```c
-gvizEmbeddedTree tree = {0};
-gvizEmbeddedTreeRTInit(&tree, sg, root);
-gvizEmbeddedTreeCalculateOffsets(&tree, root, 0);
+```cpp
+gviz::layout::ReingoldTilford tree(graph, root);  // throws gviz::NotATreeError if not a rooted directed tree
+tree.CalculateOffsets(root, 0);
 double pos[2] = {0.0, 0.0};
-gvizEmbeddedTreeEmbed(&tree, root, pos);
-grRendererSetGraph(r, (gvizEmbeddedGraph *)&tree);  // tree embeds gvizEmbeddedGraph
+tree.Embed(root, pos);
+grRendererSetGraph(r, tree, &graph);   // tree publicly inherits gviz::layout::EmbeddedGraph
 ```
-
-`gvizEmbeddedTreeRTInit` calls `gvizGraphIsTree` and returns `-1` if the graph
-is not a directed tree (undirected graphs return `-2` from the tree check).
 
 ### Attaching an embedded graph to grender
 
-- Pass any embedder state cast to `gvizEmbeddedGraph*` (the embedder struct
-  must have `gvizEmbeddedGraph` as its first member).
+- Pass any embedder object directly — every embedder (`ForceAtlas`, `GRIP`,
+  `Tutte`, `SpringTutte`, `ReingoldTilford`, `Planar`) publicly inherits
+  `gviz::layout::EmbeddedGraph`, so no cast is needed.
+- Pass the backing `gviz::Graph*` too (`grRendererSetGraph`'s second,
+  optional parameter) if you want the highlight/pick/console features that
+  need raw parent-graph access (`EnsureLayout`, `GetEdgeWeight`, planar face
+  queries) — `gviz::Subgraph` deliberately never exposes its parent graph on
+  its own, so grender needs it passed in explicitly. Those features simply
+  no-op without it.
 - Call `grRendererGraphStructureChanged(r)` only when vertices/edges are
   added, removed, or hidden/shown — not for position-only updates.
-- Register embedder actions with `gvizEmbeddedGraphAddAction` and bind keys
+- Register embedder actions with `EmbeddedGraph::AddAction` and bind keys
   with `grRendererBindKey`; the renderer dispatches without knowing the
   embedder type.
 - 4D embeddings are PCA-projected to 3D inside grender each frame.
@@ -176,12 +179,12 @@ install them elsewhere. To upgrade wgpu-native, bump the version in
 
 ## API sketch
 
-```c
+```cpp
 grRendererDesc desc;
 grRendererDescInit(&desc);
 grRenderer *r = grRendererCreate(&desc);
 
-grRendererSetGraph(r, embeddedGraph);            // any gviz embedder output
+grRendererSetGraph(r, embeddedGraph, &graph);    // any gviz embedder output
 grRendererBindKey(r, 'R', "grip.refineRound");   // creator-defined action
 
 while (grRendererFrame(r)) {
@@ -203,25 +206,24 @@ right-drag/shift-drag to pan), scroll to zoom, `F` to fit the graph.
 
 ```
 include/grender/grender.h   public API (the only header consumers include)
-src/grRenderer.c            device setup, frame loop, input, GPU buffers
-src/grCamera.c              2D ortho + 3D orbit camera, picking math
-src/grTopology.c            the only code that reads gviz structure
-src/grStats.c               stats overlay: chart layout, text, primitive list
-src/grVertexOverlay.c       vertex-info overlay: label word-wrap, scroll panel
-src/grListOverlay.c         vertex list overlay: fuzzy search over vertex data
-src/grConsole.c             command console: input line, built-in commands
-src/grPCA.c                 4D -> 3D PCA projection (OpenBLAS)
-src/grObjMesh.c             .obj mesh parsing for the object overlay
-src/grObjOverlay.c          object overlay: own pipelines, camera, render pass
+src/grRenderer.cpp          device setup, frame loop, input, GPU buffers
+src/grCamera.cpp            2D ortho + 3D orbit camera, picking math
+src/grTopology.cpp          the only code that reads gviz structure
+src/grStats.cpp             stats overlay: chart layout, text, primitive list
+src/grVertexOverlay.cpp     vertex-info overlay: label word-wrap, scroll panel
+src/grListOverlay.cpp       vertex list overlay: fuzzy search over vertex data
+src/grConsole.cpp           command console: input line, built-in commands
+src/grPCA.cpp               4D -> 3D PCA projection (OpenBLAS)
+src/grObjMesh.cpp           .obj mesh parsing for the object overlay
+src/grObjOverlay.cpp        object overlay: own pipelines, camera, render pass
 src/grShaders.h             WGSL (instanced nodes/edges, vertex pulling)
-src/grSurfaceCocoa.m        macOS CAMetalLayer surface glue
-src/grMenuCocoa.m           macOS menu bar (Charts submenu, ...)
-src/grPlatformMenu.c        non-macOS no-op menu stub
-examples/gripDemo.c         live GRIP embedding with bound actions
-examples/treeDemo.c       Reingold-Tilford tree layout (gvizEmbeddedTree)
-examples/datasetDemo.c    GRIP on graphs from gviz data/
-examples/millionDemo.c      1M-vertex online-update stress test
-examples/tutteDemo.c        live Tutte embedding; optional object overlay
+src/grSurfaceCocoa.mm       macOS CAMetalLayer surface glue
+src/grMenuCocoa.mm          macOS menu bar (Charts submenu, ...)
+src/grPlatformMenu.cpp      non-macOS no-op menu stub
+examples/gripDemo.cpp       live GRIP embedding with bound actions
+examples/treeDemo.cpp       Reingold-Tilford tree layout (gviz::layout::ReingoldTilford)
+examples/millionDemo.cpp    1M-vertex online-update stress test
+examples/tutteDemo.cpp      live Tutte embedding; optional object overlay
 ```
 
 `grRendererSaveScreenshot` renders the current scene offscreen and writes a
