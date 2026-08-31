@@ -1,5 +1,8 @@
 #include "grInternal.h"
 #include "grShaders.h"
+#include <cstdint>
+#include <cstdio>
+#include <memory>
 
 #ifndef __EMSCRIPTEN__
 #include <webgpu/wgpu.h> // wgpu-native extensions (wgpuDevicePoll)
@@ -1152,7 +1155,7 @@ int grRendererSetGraph(grRenderer *r, G &structure,
   r->fitRequested = true;
   return 0;
 }
-
+//
 // Explicit instantiation: gviz::Graph and gviz::Subgraph are the only two
 // GraphLike types gviz currently ships (see GraphLike.hpp) -- same
 // two-instantiation convention gviz's own embedder .cpp files use for their
@@ -1163,8 +1166,8 @@ template int grRendererSetGraph<gviz::Graph>(grRenderer *, gviz::Graph &,
                                              gviz::layout::EmbeddedGraph &,
                                              gviz::Graph *);
 template int grRendererSetGraph<gviz::Subgraph>(grRenderer *, gviz::Subgraph &,
-                                                 gviz::layout::EmbeddedGraph &,
-                                                 gviz::Graph *);
+                                                gviz::layout::EmbeddedGraph &,
+                                                gviz::Graph *);
 
 size_t grRendererVertexCount(const grRenderer *r) {
   return r && r->structureView ? r->structureView->VertexCount() : 0;
@@ -1290,6 +1293,56 @@ int grRendererSetNodeColors(grRenderer *r, const uint32_t *rgba8,
   r->hasClientNodeColors = true;
   r->colorsDirty = true;
   return 0;
+}
+
+const char *getColorField(const char *data) {
+  // TODO: maybe a better impl
+  const char *out = strstr(data, "color\":");
+  if (!out) {
+    return nullptr;
+  }
+  // return nullptr;
+  return out + 9;
+}
+
+static uint32_t hexNibble(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return 0;
+}
+
+// color is 8 hex digits, RRGGBBAA (e.g. "2ECC71FF"). GR_RGBA8 packs R in the
+// low byte and A in the high byte, the opposite order from the string, so
+// each channel is parsed separately rather than folded into one 32-bit int.
+uint32_t parseColorString(const char *color) {
+  uint32_t r = (hexNibble(color[0]) << 4) | hexNibble(color[1]);
+  uint32_t g = (hexNibble(color[2]) << 4) | hexNibble(color[3]);
+  uint32_t b = (hexNibble(color[4]) << 4) | hexNibble(color[5]);
+  uint32_t a = (hexNibble(color[6]) << 4) | hexNibble(color[7]);
+  return GR_RGBA8(r, g, b, a);
+}
+
+int grRendererParseVertexColors(grRenderer *r) {
+  if (!r->backingGraph || !r->structureView)
+    return -1;
+
+  size_t n = r->structureView->VertexCount();
+  uint32_t colors[n];
+  for (size_t local = 0; local < n; local++) {
+    // NOTE: stringified json only
+    const char *data = r->vertexLabels[local];
+    const char *colorString = getColorField(data);
+
+    if (!colorString)
+      colors[local] = colorToRgba8(&r->nodeStyle.fillColor);
+    else
+      colors[local] = parseColorString(colorString);
+  }
+  return grRendererSetNodeColors(r, colors, n);
 }
 
 int grRendererSetNodeSizes(grRenderer *r, const float *radii, size_t count) {
@@ -1914,14 +1967,15 @@ grenderActionPickVertex(gviz::layout::EmbeddedGraph &eg, void *userData,
     // comment in grInternal.h), the same structure grTopologyExtract draws
     // edges from, so the highlight can never include an edge that isn't on
     // screen.
-    bool shiftIn = r->structureView->IsDirected() &&
-                   (payload.iarg & GR_MOD_SHIFT) != 0;
+    bool shiftIn =
+        r->structureView->IsDirected() && (payload.iarg & GR_MOD_SHIFT) != 0;
     if (shiftIn) {
       for (uint32_t k = r->topo.inOffsets[nearest];
            k < r->topo.inOffsets[nearest + 1]; k++) {
         size_t rawU = r->structureView->LocalToRaw(r->topo.inNbrs[k]);
         pick.ShowVertex(rawU);
-        highlightShowBoundaryEdge(pick, rawU, rawNearest); // edge is u -> nearest
+        highlightShowBoundaryEdge(pick, rawU,
+                                  rawNearest); // edge is u -> nearest
       }
     } else {
       for (uint32_t k = r->topo.outOffsets[nearest];
@@ -2113,10 +2167,12 @@ static void processInput(grRenderer *r, double fbw, double fbh) {
   glfwGetCursorPos(r->window, &cx, &cy);
   double cxPx = cx * r->contentScale, cyPx = cy * r->contentScale;
 
-  bool leftDown = !wantMouse && glfwGetMouseButton(r->window,
-                                    GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-  bool rightDown = !wantMouse && glfwGetMouseButton(r->window,
-                                     GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+  bool leftDown =
+      !wantMouse &&
+      glfwGetMouseButton(r->window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+  bool rightDown =
+      !wantMouse &&
+      glfwGetMouseButton(r->window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
   bool shiftDown = glfwGetKey(r->window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
                    glfwGetKey(r->window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
 

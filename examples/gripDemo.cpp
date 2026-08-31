@@ -566,6 +566,11 @@ int main(int argc, char **argv) {
   }
   grRendererSetVertexLabels(r, vertexLabels.data(), vertexLabelCount);
 
+  // TODO: add a flag to choose whether to parse colors or not
+  if (true) {
+	grRendererParseVertexColors(r);
+  }
+
   grRendererBindKey(r, 'R', "grip.refineRound");
   grRendererBindKey(r, 'N', "grip.nextStage");
   grRendererBindKey(r, GR_KEY_SPACE, "demo.toggleAuto");

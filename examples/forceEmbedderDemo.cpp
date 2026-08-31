@@ -38,10 +38,11 @@
  *   h/l    - decrease/increase ideal edge length
  *   j/k    - decrease/increase gravity k
  *   N/M    - decrease/increase Barnes-Hut theta
- *   O      - toggle overlap prevention (off at start; enable once the layout settles)
- *   [/]    - decrease/increase radius base (r(v) = base * (1 + perDegree*sqrt(degree(v))); scaling base preserves relative radius differences between vertices)
- *   F      - fit view
- *   S      - toggle stats overlay
+ *   O      - toggle overlap prevention (off at start; enable once the layout
+ * settles)
+ *   [/]    - decrease/increase radius base (r(v) = base * (1 +
+ * perDegree*sqrt(degree(v))); scaling base preserves relative radius
+ * differences between vertices) F      - fit view S      - toggle stats overlay
  *   drag   - pan
  *   scroll - zoom
  *
@@ -60,19 +61,22 @@
  *                                 support anymore; this flag now errors out
  *                                 (see the file header comment)
  *   -m, --model {linlog|fr}       force model (default linlog)
- *   -o, --screenshot PATH         save a .ppm screenshot after settling and exit
- *       --degree-alpha            fade edges by max endpoint degree (default off)
+ *   -o, --screenshot PATH         save a .ppm screenshot after settling and
+ * exit
+ *       --degree-alpha            fade edges by max endpoint degree (default
+ * off)
  *       --no-degree-alpha         disable degree-based edge opacity
  *   -w, --edge-width WIDTH        base edge thickness (default 1.5); with
  *                                 --edge-weight-width, this is the thickness
  *                                 drawn for an average-weight edge
- *       --edge-weight-width       scale edge thickness by edge weight (default off)
+ *       --edge-weight-width       scale edge thickness by edge weight (default
+ * off)
  *       --no-edge-weight-width    disable weight-based edge thickness
  *   -h, --help                    print this help and exit
  */
 
-#include "grender/grender.h"
 #include "grender/grStepProfiling.h"
+#include "grender/grender.h"
 
 #include "gviz.hpp"
 
@@ -168,12 +172,14 @@ static void actionEdgeLengthUp(gviz::layout::EmbeddedGraph &eg, void *userData,
   printf("edge length: %f\n", cfg->edgeLength);
 }
 
-static void actionEdgeLengthDown(gviz::layout::EmbeddedGraph &eg, void *userData,
+static void actionEdgeLengthDown(gviz::layout::EmbeddedGraph &eg,
+                                 void *userData,
                                  const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
   auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
-  cfg->edgeLength = fmax(cfg->edgeLength - DEMO_EDGE_LENGTH_STEP, DEMO_EDGE_LENGTH_MIN);
+  cfg->edgeLength =
+      fmax(cfg->edgeLength - DEMO_EDGE_LENGTH_STEP, DEMO_EDGE_LENGTH_MIN);
   fa.Configure(cfg->edgeLength, 0);
   printf("edge length: %f\n", cfg->edgeLength);
 }
@@ -210,20 +216,23 @@ static void actionRadiusBaseUp(gviz::layout::EmbeddedGraph &eg, void *userData,
   printf("radius base: %f\n", cfg->radiusBase);
 }
 
-static void actionRadiusBaseDown(gviz::layout::EmbeddedGraph &eg, void *userData,
+static void actionRadiusBaseDown(gviz::layout::EmbeddedGraph &eg,
+                                 void *userData,
                                  const gviz::layout::ActionPayload &payload) {
   (void)payload;
   DemoConfig *cfg = (DemoConfig *)userData;
   auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
-  cfg->radiusBase = fmax(cfg->radiusBase - DEMO_RADIUS_BASE_STEP, DEMO_RADIUS_BASE_MIN);
+  cfg->radiusBase =
+      fmax(cfg->radiusBase - DEMO_RADIUS_BASE_STEP, DEMO_RADIUS_BASE_MIN);
   fa.ConfigureRadius(cfg->radiusBase, cfg->radiusPerDegree);
   cfg->nodeStyle.radius = (float)cfg->radiusBase;
   grRendererSetNodeStyle(cfg->r, &cfg->nodeStyle);
   printf("radius base: %f\n", cfg->radiusBase);
 }
 
-static void actionToggleOverlapPrevention(gviz::layout::EmbeddedGraph &eg, void *userData,
-                                          const gviz::layout::ActionPayload &payload) {
+static void
+actionToggleOverlapPrevention(gviz::layout::EmbeddedGraph &eg, void *userData,
+                              const gviz::layout::ActionPayload &payload) {
   (void)userData;
   (void)payload;
   auto &fa = static_cast<ForceAtlas<gviz::Subgraph> &>(eg);
@@ -256,7 +265,8 @@ static int fileExists(const char *path) {
  * @return the loaded graph, or std::nullopt if neither file exists or
  * loading failed.
  */
-static std::optional<gviz::Graph> loadNamedGraph(const char *name, bool directed) {
+static std::optional<gviz::Graph> loadNamedGraph(const char *name,
+                                                 bool directed) {
   char path[1024];
 
   snprintf(path, sizeof(path), "%s/%s/data.gexf", GRENDER_GVIZ_DATA_DIR, name);
@@ -298,7 +308,8 @@ static void printUsage(const char *prog) {
       "  -n, --vertices N            number of vertices for a random graph\n"
       "                              (default 200; ignored with -g/--graph)\n"
       "  -s, --seed SEED             RNG seed (default: time-based)\n"
-      "  -e, --edge-connectivity C   extra-edge probability in [0, 1] (default 0;\n"
+      "  -e, --edge-connectivity C   extra-edge probability in [0, 1] (default "
+      "0;\n"
       "                              ignored with -g/--graph)\n"
       "  -g, --graph NAME            load <gviz-data>/NAME/data.gexf or\n"
       "                              data.edges instead of a random graph\n"
@@ -308,15 +319,20 @@ static void printUsage(const char *prog) {
       "  -G, --grow                  REMOVED -- gviz has no dynamic-graph-\n"
       "                              growth support anymore; errors out\n"
       "  -m, --model {linlog|fr}     force model (default linlog)\n"
-      "  -o, --screenshot PATH       save a .ppm screenshot after settling and exit\n"
-      "      --degree-alpha          fade edges by max endpoint degree (default off)\n"
+      "  -o, --screenshot PATH       save a .ppm screenshot after settling and "
+      "exit\n"
+      "      --degree-alpha          fade edges by max endpoint degree "
+      "(default off)\n"
       "      --no-degree-alpha       disable degree-based edge opacity\n"
       "  -w, --edge-width WIDTH      base edge thickness (default 1.5); with\n"
-      "                              --edge-weight-width, this is the thickness\n"
+      "                              --edge-weight-width, this is the "
+      "thickness\n"
       "                              drawn for an average-weight edge\n"
-      "      --edge-weight-width     scale edge thickness by edge weight (default off)\n"
+      "      --edge-weight-width     scale edge thickness by edge weight "
+      "(default off)\n"
       "      --no-edge-weight-width  disable weight-based edge thickness\n"
-      "      --no-barnes-hut         exact O(V^2) repulsion instead of the Barnes-Hut\n"
+      "      --no-barnes-hut         exact O(V^2) repulsion instead of the "
+      "Barnes-Hut\n"
       "                              approximation (default: Barnes-Hut on)\n"
       "  -h, --help                  print this help and exit\n"
       "\n"
@@ -326,7 +342,8 @@ static void printUsage(const char *prog) {
       "  h/l    - decrease/increase ideal edge length\n"
       "  j/k    - decrease/increase gravity k\n"
       "  N/M    - decrease/increase Barnes-Hut theta\n"
-      "  O      - toggle overlap prevention (off at start; enable once the layout settles)\n"
+      "  O      - toggle overlap prevention (off at start; enable once the "
+      "layout settles)\n"
       "  [/]    - decrease/increase radius base\n"
       "  F      - fit view\n"
       "  S      - toggle stats overlay\n"
@@ -464,7 +481,8 @@ int main(int argc, char **argv) {
     if (!graphOpt)
       return 1;
   } else {
-    graphOpt = gviz::graphs::BuildRandomConnectedGraph(N, edgeConnectivity, seed);
+    graphOpt =
+        gviz::graphs::BuildRandomConnectedGraph(N, edgeConnectivity, seed);
   }
   gviz::Graph &graph = *graphOpt;
 
@@ -505,14 +523,15 @@ int main(int argc, char **argv) {
   fe->AddAction("demo.edgeLengthDown", actionEdgeLengthDown, &cfg);
   fe->AddAction("demo.thetaUp", actionThetaUp, &cfg);
   fe->AddAction("demo.thetaDown", actionThetaDown, &cfg);
-  fe->AddAction("demo.toggleOverlapPrevention", actionToggleOverlapPrevention, NULL);
+  fe->AddAction("demo.toggleOverlapPrevention", actionToggleOverlapPrevention,
+                NULL);
   fe->AddAction("demo.radiusBaseUp", actionRadiusBaseUp, &cfg);
   fe->AddAction("demo.radiusBaseDown", actionRadiusBaseDown, &cfg);
 
   grRendererDesc desc;
   grRendererDescInit(&desc);
-  desc.title =
-      "grender - Force Embedder (R: step, space: auto, h/l: edge len, j/k: gravity, N/M: theta, O: overlap)";
+  desc.title = "grender - Force Embedder (R: step, space: auto, h/l: edge len, "
+               "j/k: gravity, N/M: theta, O: overlap)";
   desc.nodeStyle.radius = (float)cfg.radiusBase;
   desc.nodeStyle.sizeMode = GR_SIZE_WORLD;
   /* World-space radius keeps nodes correctly sized relative to the layout at
@@ -553,16 +572,20 @@ int main(int argc, char **argv) {
   // grRendererSetGraph's INDEXING CONVENTION); translate to the graph's own
   // raw id first.
   size_t vertexLabelCount = fe->PositionCount();
-  std::vector<const char *> vertexLabels(vertexLabelCount ? vertexLabelCount : 1);
+  std::vector<const char *> vertexLabels(vertexLabelCount ? vertexLabelCount
+                                                          : 1);
   for (size_t i = 0; i < vertexLabelCount; i++) {
     void *data = graph.GetVertexData(grRendererLocalToRaw(r, i));
-    vertexLabels[i] = data ? static_cast<const std::string *>(data)->c_str() : NULL;
+    vertexLabels[i] =
+        data ? static_cast<const std::string *>(data)->c_str() : NULL;
   }
   grRendererSetVertexLabels(r, vertexLabels.data(), vertexLabelCount);
 
   cfg.r = r;
   cfg.nodeStyle = desc.nodeStyle;
   grRendererSetNodeDegreeScale(r, true, (float)cfg.radiusPerDegree);
+  grRendererParseVertexColors(r);
+
 
   /* --degree-alpha / --edge-weight-width / degree-scaled node sizes need no
    * uploads here: with the flags set above, the renderer derives degrees
@@ -589,7 +612,7 @@ int main(int argc, char **argv) {
 
   while (grRendererFrame(r)) {
     if (autoStep) {
-      for (size_t i = 0; i < 20; i++) {
+      for (size_t i = 0; i < 100; i++) {
         GR_PROF_STEP_BEGIN();
         fe->Step();
         GR_PROF_STEP_END();

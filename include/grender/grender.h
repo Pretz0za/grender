@@ -108,13 +108,13 @@ typedef struct grEdgeStyle {
 } grEdgeStyle;
 
 typedef struct grRendererDesc {
-  const char *title;   /**< Window title. NULL for a default. */
-  uint32_t width;      /**< Initial window width in screen points. */
-  uint32_t height;     /**< Initial window height in screen points. */
-  grColor clearColor;  /**< Background color. */
+  const char *title;  /**< Window title. NULL for a default. */
+  uint32_t width;     /**< Initial window width in screen points. */
+  uint32_t height;    /**< Initial window height in screen points. */
+  grColor clearColor; /**< Background color. */
   grNodeStyle nodeStyle;
   grEdgeStyle edgeStyle;
-  bool vsync;          /**< true: FIFO present (default), false: immediate. */
+  bool vsync; /**< true: FIFO present (default), false: immediate. */
   /**
    * When true, the edge shader scales each edge's alpha by the higher
    * degree of its endpoints so hub edges fade. The renderer derives and
@@ -255,12 +255,12 @@ extern "C" {
 
 /**
  * Notifies the renderer that the *structure* of the attached graph changed
-   * (vertices/edges added, removed, hidden or shown). Topology buffers are
-   * rebuilt lazily before the next frame. Pure position changes and draw-mask
-   * updates (via EmbeddedGraph::SetDrawMaskEdgePolicy and friends) never
-   * require this call.
-   */
-  void grRendererGraphStructureChanged(grRenderer *r);
+ * (vertices/edges added, removed, hidden or shown). Topology buffers are
+ * rebuilt lazily before the next frame. Pure position changes and draw-mask
+ * updates (via EmbeddedGraph::SetDrawMaskEdgePolicy and friends) never
+ * require this call.
+ */
+void grRendererGraphStructureChanged(grRenderer *r);
 
 // STYLING: --------------------------------------------------------------------
 
@@ -313,6 +313,7 @@ bool grRendererEdgeWeightWidth(const grRenderer *r);
  * @return 0 on success, -1 on failure.
  */
 int grRendererSetNodeColors(grRenderer *r, const uint32_t *rgba8, size_t count);
+int grRendererParseVertexColors(grRenderer *r);
 
 /** Per-node radii, same indexing rules as grRendererSetNodeColors. */
 int grRendererSetNodeSizes(grRenderer *r, const float *radii, size_t count);
@@ -413,7 +414,8 @@ int grRendererSetEdgeWeights(grRenderer *r, const float *weights, size_t count);
  *
  * @return 0 on success, -1 on failure.
  */
-int grRendererSetEdgeDashed(grRenderer *r, const uint32_t *dashed, size_t count);
+int grRendererSetEdgeDashed(grRenderer *r, const uint32_t *dashed,
+                            size_t count);
 
 /** Number of edges in the current topology buffer. */
 size_t grRendererEdgeCount(const grRenderer *r);
