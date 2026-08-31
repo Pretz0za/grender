@@ -227,7 +227,7 @@ static const char GR_WGSL_SOURCE[] =
 	"    color.a = 1.0;\n"
     "    let d = sqrt(f32(nodeDegrees[a]) * f32(nodeDegrees[b]));\n"
     "    let t = log2(d + 1.0) / log2(max(G.edgeParams.z, 1.0) + 1.0);\n"
-    "    color.a *= mix(1.0, 0.01, pow(t, 0.5));\n"
+    "    color.a *= mix(1.0, 0.01, pow(t, 0.1));\n"
     "  }\n"
     "  if ((G.flags & FLAG_EDGE_COLORS) != 0u) {\n"
     "    let ec = unpackColor(edgeColors[iid]);\n"

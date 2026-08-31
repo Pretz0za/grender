@@ -12,6 +12,8 @@
 #include "imgui_impl_wgpu.h"
 #include "implot.h"
 
+#include "grFontArabic.h" // grFontArabic_Amiri_compressed_data_base85
+
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -449,6 +451,33 @@ grRenderer *grRendererCreate(const grRendererDesc *descIn) {
   ImGui::CreateContext();
   ImPlot::CreateContext();
   ImGui::GetIO().IniFilename = NULL; // no imgui.ini: window layout is fixed
+
+  {
+    // Default font only covers ASCII, so any non-Latin vertex/edge label
+    // (e.g. Arabic) rasterizes as io.Fonts->FallbackChar ('?'). Merge in
+    // Amiri (SIL OFL, third-party/fonts/Amiri-OFL.txt) restricted to the
+    // Arabic glyph blocks so those codepoints have real glyphs. This does
+    // NOT do contextual letter-shaping or RTL reordering -- Dear ImGui's
+    // text renderer has no shaping/bidi engine -- so Arabic text will show
+    // as disconnected isolated-form glyphs in logical (left-to-right
+    // storage) order rather than properly joined/reversed script.
+    ImGuiIO &io = ImGui::GetIO();
+    io.Fonts->AddFontDefault();
+    static const ImWchar arabicRanges[] = {
+        0x0600, 0x06FF, // Arabic
+        0x0750, 0x077F, // Arabic Supplement
+        0x08A0, 0x08FF, // Arabic Extended-A
+        0xFB50, 0xFDFF, // Arabic Presentation Forms-A
+        0xFE70, 0xFEFF, // Arabic Presentation Forms-B
+        0,
+    };
+    ImFontConfig arabicConfig;
+    arabicConfig.MergeMode = true;
+    io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+        grFontArabic_Amiri_compressed_data_base85, 16.0f, &arabicConfig,
+        arabicRanges);
+  }
+
   ImGui_ImplGlfw_InitForOther(r->window, false);
 
 #ifdef __EMSCRIPTEN__
